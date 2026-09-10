@@ -9,6 +9,7 @@
     "author_url": "https://github.com/SixOrg",
     "level": 1,
     "v3": false,
+    "release": true,
     "history": {
       "0.14": "修复换种优选删除最高档位种子问题；日志增加删除明细",
       "0.13": "红字注释对齐与显示条件优化（仅换种模式显示）",
