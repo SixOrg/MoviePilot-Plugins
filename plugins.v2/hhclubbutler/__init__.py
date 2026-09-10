@@ -88,7 +88,7 @@ class HHClubButler(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
     # 插件版本
-    plugin_version = "0.19"
+    plugin_version = "0.20"
     # 插件作者
     plugin_author = "六个橙子"
     # 作者主页
@@ -767,9 +767,9 @@ class HHClubButler(_PluginBase):
                                                  + '</div>')
                                     },
                                     {
-                                        'component': 'VBtn',
-                                        'props': {'variant': 'text', 'color': 'primary',
-                                                  'size': 'small', 'text': '🔄 立即刷新'},
+                                        'component': 'div',
+                                        'html': '<a style="cursor:pointer;color:#42A5F5;'
+                                                 'text-decoration:none;white-space:nowrap;">🔄 立即刷新</a>',
                                         'events': {
                                             'click': {
                                                 'api': 'plugin/HHClubButler/refresh_overview',
@@ -934,11 +934,11 @@ class HHClubButler(_PluginBase):
         try:
             self._refresh_overview()
             if self._last_overview_ts > 0:
-                return {"success": True, "result": "概况已刷新"}
-            return {"success": False, "result": "概况刷新失败（站点或下载器不可用），保留上次数据"}
+                return {"success": True, "message": "概况已刷新", "data": None}
+            return {"success": False, "message": "概况刷新失败（站点或下载器不可用），保留上次数据", "data": None}
         except Exception as e:
             logger.error(f"立即刷新概况失败：{e}")
-            return {"success": False, "result": f"概况刷新失败：{e}"}
+            return {"success": False, "message": f"概况刷新失败：{e}", "data": None}
 
     # ============================================================
     # 核心逻辑
