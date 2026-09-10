@@ -1,0 +1,22 @@
+{
+  "HHClubButler": {
+    "name": "憨憨保种区管家",
+    "description": "自动化优选添加及换种工具",
+    "labels": "保种,优选,憨憨,管家",
+    "version": "0.14",
+    "icon": "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/hhclubbutler.png",
+    "author": "六个橙子",
+    "author_url": "https://github.com/SixOrg",
+    "level": 1,
+    "v3": false,
+    "history": {
+      "0.14": "修复换种优选删除最高档位种子问题；日志增加删除明细",
+      "0.13": "红字注释对齐与显示条件优化（仅换种模式显示）",
+      "0.12": "修复注释排版错位",
+      "0.11": "换种优选目标类型下增加红色提示注释",
+      "0.10": "优化日志展示删除内容明细",
+      "0.9": "换种优选重写（跨档升级、删除任务+文件）",
+      "0.1": "设置页顶部增加保种区概况卡片，UI 重构"
+    }
+  }
+}
