@@ -88,7 +88,7 @@ class HHClubButler(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
     # 插件版本
-    plugin_version = "0.18"
+    plugin_version = "0.19"
     # 插件作者
     plugin_author = "六个橙子"
     # 作者主页
@@ -254,7 +254,7 @@ class HHClubButler(_PluginBase):
         }, {
             "path": "/refresh_overview",
             "endpoint": self.api_refresh_overview,
-            "methods": ["POST"],
+            "methods": ["GET"],
             "auth": "apikey",
             "summary": "立即刷新概况",
             "description": "立即刷新保种概况数据（仅刷新数据，不优选/不推送/不删除）",
@@ -768,12 +768,12 @@ class HHClubButler(_PluginBase):
                                     },
                                     {
                                         'component': 'VBtn',
-                                        'props': {'variant': 'tonal', 'color': 'primary',
+                                        'props': {'variant': 'text', 'color': 'primary',
                                                   'size': 'small', 'text': '🔄 立即刷新'},
                                         'events': {
                                             'click': {
                                                 'api': 'plugin/HHClubButler/refresh_overview',
-                                                'method': 'post',
+                                                'method': 'get',
                                                 'params': {'apikey': settings.API_TOKEN}
                                             }
                                         }
@@ -815,30 +815,11 @@ class HHClubButler(_PluginBase):
                                  "4-5人": {"count": 0, "gb": 0.0}}}
         elements = [
             {
-                'component': 'VRow',
-                'props': {'class': 'd-flex justify-end align-center', 'no-gutters': True},
-                'content': [
-                    {
-                        'component': 'div',
-                        'html': ('<div style="font-size:10.5px;color:rgba(var(--v-theme-on-surface),.4);'
-                                 'margin-right:10px;white-space:nowrap;">'
-                                 + HHClubButler._overview_refresh_note(
-                                     self._last_overview_ts, self._overview_hours)
-                                 + '</div>')
-                    },
-                    {
-                        'component': 'VBtn',
-                        'props': {'variant': 'tonal', 'color': 'primary',
-                                  'size': 'small', 'text': '🔄 立即刷新'},
-                        'events': {
-                            'click': {
-                                'api': 'plugin/HHClubButler/refresh_overview',
-                                'method': 'post',
-                                'params': {'apikey': settings.API_TOKEN}
-                            }
-                        }
-                    }
-                ]
+                'component': 'div',
+                'props': {'style': 'text-align:right;font-size:10.5px;'
+                                   'color:rgba(var(--v-theme-on-surface),.4);'
+                                   'margin-bottom:6px;white-space:nowrap;'},
+                'text': HHClubButler._overview_refresh_note(self._last_overview_ts, self._overview_hours)
             },
             {
                 'component': 'div',
