@@ -88,7 +88,7 @@ class HHClubButler(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
     # 插件版本
-    plugin_version = "0.20"
+    plugin_version = "0.21"
     # 插件作者
     plugin_author = "六个橙子"
     # 作者主页
@@ -654,9 +654,30 @@ class HHClubButler(_PluginBase):
                               'text': f"最近运行状态：{self._last_result}"}
                 },
                 {
-                    'component': 'div',
-                    'props': {'style': 'margin-top:6px;font-size:10.5px;color:rgba(var(--v-theme-on-surface),.4);'},
-                    'text': HHClubButler._overview_refresh_note(self._last_overview_ts, self._overview_hours)
+                    'component': 'VRow',
+                    'props': {'class': 'd-flex justify-end align-center', 'no-gutters': True},
+                    'content': [
+                        {
+                            'component': 'div',
+                            'html': ('<div style="font-size:10.5px;color:rgba(var(--v-theme-on-surface),.4);'
+                                     'margin-right:10px;white-space:nowrap;">'
+                                     + HHClubButler._overview_refresh_note(
+                                         self._last_overview_ts, self._overview_hours)
+                                     + '</div>')
+                        },
+                        {
+                            'component': 'div',
+                            'html': '<a style="cursor:pointer;color:#42A5F5;'
+                                     'text-decoration:none;white-space:nowrap;">🔄 立即刷新</a>',
+                            'events': {
+                                'click': {
+                                    'api': 'plugin/HHClubButler/refresh_overview',
+                                    'method': 'get',
+                                    'params': {'apikey': settings.API_TOKEN}
+                                }
+                            }
+                        }
+                    ]
                 }
             ]
         }
@@ -734,9 +755,9 @@ class HHClubButler(_PluginBase):
         if last_ts and last_ts > 0:
             mins = max(0, int((time.time() - last_ts) / 60))
             if hours > 0:
-                return f"🔄 每 {hours:g} 小时自动刷新一次 · 上次更新 {mins} 分钟前"
+                return f"每 {hours:g} 小时自动刷新一次 · 上次更新 {mins} 分钟前"
             return f"上次更新 {mins} 分钟前"
-        return f"🔄 每 {hours:g} 小时自动刷新一次（距最近一次运行或定时更新后开始计时）"
+        return f"每 {hours:g} 小时自动刷新一次（距最近一次运行或定时更新后开始计时）"
 
     def get_page(self) -> List[dict]:
         """数据页：憨憨保种区管家概况卡片 + 最近运行状态"""
@@ -885,8 +906,11 @@ class HHClubButler(_PluginBase):
                 except Exception:
                     return
 
-    def _refresh_overview(self):
-        """静默刷新概况缓存（只读站点+下载器，不做任何优选/推送/删除）"""
+    def _refresh_overview(self, manual: bool = False):
+        """静默刷新概况缓存（只读站点+下载器，不做任何优选/推送/删除）
+
+        :param manual: True=手动触发（如点击立即刷新），日志措辞显示"手动刷新"
+        """
         try:
             logs = []
             cur = self._get_current_seeding(logs)
@@ -894,10 +918,10 @@ class HHClubButler(_PluginBase):
                 return
             self._last_overview = self._build_overview_from_current(cur)
             self._last_overview_ts = time.time()
-            logger.info(f"憨憨保种区管家概况已自动刷新："
+            logger.info(f"憨憨保种区管家概况已{'手动' if manual else '自动'}刷新："
                         f"{cur.get('count', 0)} 个 / {cur.get('total_gb', 0.0):.1f} GB")
         except Exception as e:
-            logger.error(f"概况自动刷新失败：{e}")
+            logger.error(f"概况{'手动' if manual else '自动'}刷新失败：{e}")
 
     def _get_overview_cached_or_refresh(self) -> dict:
         """概况读取：优先缓存；缓存缺失或超时(间隔+5分钟)时兜底现场刷新一次"""
@@ -932,7 +956,7 @@ class HHClubButler(_PluginBase):
     def api_refresh_overview(self):
         """立即刷新概况（仅刷新数据，不优选/不推送/不删除）"""
         try:
-            self._refresh_overview()
+            self._refresh_overview(manual=True)
             if self._last_overview_ts > 0:
                 return {"success": True, "message": "概况已刷新", "data": None}
             return {"success": False, "message": "概况刷新失败（站点或下载器不可用），保留上次数据", "data": None}
