@@ -86,9 +86,9 @@ class HHClubButler(_PluginBase):
     # 插件描述
     plugin_desc = "自动化优选添加及换种工具"
     # 插件图标
-    plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/hhclubbutler.png"
+    plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
     # 插件版本
-    plugin_version = "0.17"
+    plugin_version = "0.18"
     # 插件作者
     plugin_author = "六个橙子"
     # 作者主页
@@ -723,22 +723,9 @@ class HHClubButler(_PluginBase):
             f'<td style="text-align:left;font-size:10.5px;color:{ON60};">初始做种人数分布</td>'
             '</tr></table>'
         )
-        ts_line = ""
-        if last_ts and last_ts > 0:
-            mins = max(0, int((time.time() - last_ts) / 60))
-            if hours > 0:
-                ts_line = (
-                    f'<div style="margin-top:8px;font-size:10.5px;color:{ON40};">'
-                    f'🔄 每 {hours:g} 小时自动刷新一次 · 上次更新 {mins} 分钟前</div>'
-                )
-            else:
-                ts_line = (
-                    f'<div style="margin-top:8px;font-size:10.5px;color:{ON40};">'
-                    f'上次更新 {mins} 分钟前</div>'
-                )
         return (
             f'<div style="background:transparent;">'
-            f'{cells}{dist_title}{bar}{legend}{ts_line}</div>'
+            f'{cells}{dist_title}{bar}{legend}</div>'
         )
 
     @staticmethod
@@ -768,14 +755,17 @@ class HHClubButler(_PluginBase):
                         'props': {},
                         'content': [
                             {
-                                'component': 'div',
-                                'html': HHClubButler._overview_html(
-                                    overview, self._last_overview_ts, self._overview_hours)
-                            },
-                            {
                                 'component': 'VRow',
-                                'props': {'no-gutters': True},
+                                'props': {'class': 'd-flex justify-end align-center', 'no-gutters': True},
                                 'content': [
+                                    {
+                                        'component': 'div',
+                                        'html': ('<div style="font-size:10.5px;color:rgba(var(--v-theme-on-surface),.4);'
+                                                 'margin-right:10px;white-space:nowrap;">'
+                                                 + HHClubButler._overview_refresh_note(
+                                                     self._last_overview_ts, self._overview_hours)
+                                                 + '</div>')
+                                    },
                                     {
                                         'component': 'VBtn',
                                         'props': {'variant': 'tonal', 'color': 'primary',
@@ -784,11 +774,16 @@ class HHClubButler(_PluginBase):
                                             'click': {
                                                 'api': 'plugin/HHClubButler/refresh_overview',
                                                 'method': 'post',
-                                                'params': {}
+                                                'params': {'apikey': settings.API_TOKEN}
                                             }
                                         }
                                     }
                                 ]
+                            },
+                            {
+                                'component': 'div',
+                                'html': HHClubButler._overview_html(
+                                    overview, self._last_overview_ts, self._overview_hours)
                             },
                             {
                                 'component': 'VAlert',
@@ -819,6 +814,32 @@ class HHClubButler(_PluginBase):
                                  "2-3人": {"count": 0, "gb": 0.0},
                                  "4-5人": {"count": 0, "gb": 0.0}}}
         elements = [
+            {
+                'component': 'VRow',
+                'props': {'class': 'd-flex justify-end align-center', 'no-gutters': True},
+                'content': [
+                    {
+                        'component': 'div',
+                        'html': ('<div style="font-size:10.5px;color:rgba(var(--v-theme-on-surface),.4);'
+                                 'margin-right:10px;white-space:nowrap;">'
+                                 + HHClubButler._overview_refresh_note(
+                                     self._last_overview_ts, self._overview_hours)
+                                 + '</div>')
+                    },
+                    {
+                        'component': 'VBtn',
+                        'props': {'variant': 'tonal', 'color': 'primary',
+                                  'size': 'small', 'text': '🔄 立即刷新'},
+                        'events': {
+                            'click': {
+                                'api': 'plugin/HHClubButler/refresh_overview',
+                                'method': 'post',
+                                'params': {'apikey': settings.API_TOKEN}
+                            }
+                        }
+                    }
+                ]
+            },
             {
                 'component': 'div',
                 'html': HHClubButler._overview_html(
