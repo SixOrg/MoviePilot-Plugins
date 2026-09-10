@@ -88,7 +88,7 @@ class HHClubButler(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/hhclubbutler.png"
     # 插件版本
-    plugin_version = "0.16"
+    plugin_version = "0.17"
     # 插件作者
     plugin_author = "六个橙子"
     # 作者主页
@@ -124,6 +124,10 @@ class HHClubButler(_PluginBase):
     _running: bool = False
     _last_result: str = "尚未运行"
     _last_overview: dict = None
+    _last_overview_ts: float = 0.0
+    _overview_hours: float = 6.0
+    _overview_thread: Optional[threading.Thread] = None
+    _overview_stop: Optional[threading.Event] = None
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
@@ -174,6 +178,10 @@ class HHClubButler(_PluginBase):
         except (TypeError, ValueError):
             self._auto_clean_days = 0
         self._auto_clean_days = max(0.0, min(365.0, self._auto_clean_days))
+        # 概况自动刷新：固定每 6 小时一次（距最近一次运行/定时更新计时），
+        # 后台线程静默抓取，不优选/不推送/不删除
+        self._overview_hours = 6.0
+        self._start_overview_thread()
 
         # 配置生效日志：置于全部配置读取之后，按当前生效模式只显示对应目标值
         # （积分模式不显示体积目标，体积模式不显示积分目标，避免混显误会）
@@ -243,6 +251,13 @@ class HHClubButler(_PluginBase):
             "auth": "apikey",
             "summary": "最近运行结果",
             "description": "查看最近一次优选结果",
+        }, {
+            "path": "/refresh_overview",
+            "endpoint": self.api_refresh_overview,
+            "methods": ["POST"],
+            "auth": "apikey",
+            "summary": "立即刷新概况",
+            "description": "立即刷新保种概况数据（仅刷新数据，不优选/不推送/不删除）",
         }]
 
     def get_service(self) -> List[Dict[str, Any]]:
@@ -637,12 +652,17 @@ class HHClubButler(_PluginBase):
                     'component': 'VAlert',
                     'props': {'type': 'info', 'variant': 'tonal',
                               'text': f"最近运行状态：{self._last_result}"}
+                },
+                {
+                    'component': 'div',
+                    'props': {'style': 'margin-top:6px;font-size:10.5px;color:rgba(var(--v-theme-on-surface),.4);'},
+                    'text': HHClubButler._overview_refresh_note(self._last_overview_ts, self._overview_hours)
                 }
             ]
         }
 
     @staticmethod
-    def _overview_html(ov: dict) -> str:
+    def _overview_html(ov: dict, last_ts: float = 0.0, hours: float = 6.0) -> str:
         """憨憨保种区管家概况（单行4列·透明背景·档位配色堆积条·达标可得口径）"""
         if not ov or ov.get("count", 0) <= 0:
             return ('<div style="padding:12px 14px;border-radius:10px;'
@@ -703,16 +723,39 @@ class HHClubButler(_PluginBase):
             f'<td style="text-align:left;font-size:10.5px;color:{ON60};">初始做种人数分布</td>'
             '</tr></table>'
         )
+        ts_line = ""
+        if last_ts and last_ts > 0:
+            mins = max(0, int((time.time() - last_ts) / 60))
+            if hours > 0:
+                ts_line = (
+                    f'<div style="margin-top:8px;font-size:10.5px;color:{ON40};">'
+                    f'🔄 每 {hours:g} 小时自动刷新一次 · 上次更新 {mins} 分钟前</div>'
+                )
+            else:
+                ts_line = (
+                    f'<div style="margin-top:8px;font-size:10.5px;color:{ON40};">'
+                    f'上次更新 {mins} 分钟前</div>'
+                )
         return (
             f'<div style="background:transparent;">'
-            f'{cells}{dist_title}{bar}{legend}</div>'
+            f'{cells}{dist_title}{bar}{legend}{ts_line}</div>'
         )
+
+    @staticmethod
+    def _overview_refresh_note(last_ts: float = 0.0, hours: float = 6.0) -> str:
+        """概况刷新说明（设置页顶部卡片用）"""
+        if last_ts and last_ts > 0:
+            mins = max(0, int((time.time() - last_ts) / 60))
+            if hours > 0:
+                return f"🔄 每 {hours:g} 小时自动刷新一次 · 上次更新 {mins} 分钟前"
+            return f"上次更新 {mins} 分钟前"
+        return f"🔄 每 {hours:g} 小时自动刷新一次（距最近一次运行或定时更新后开始计时）"
 
     def get_page(self) -> List[dict]:
         """数据页：憨憨保种区管家概况卡片 + 最近运行状态"""
         overview = None
         try:
-            overview = self._build_seeding_overview([])
+            overview = self._get_overview_cached_or_refresh()
         except Exception as e:
             logger.error(f"获取憨憨保种区管家概况失败：{e}")
         return [
@@ -726,7 +769,26 @@ class HHClubButler(_PluginBase):
                         'content': [
                             {
                                 'component': 'div',
-                                'html': HHClubButler._overview_html(overview)
+                                'html': HHClubButler._overview_html(
+                                    overview, self._last_overview_ts, self._overview_hours)
+                            },
+                            {
+                                'component': 'VRow',
+                                'props': {'no-gutters': True},
+                                'content': [
+                                    {
+                                        'component': 'VBtn',
+                                        'props': {'variant': 'tonal', 'color': 'primary',
+                                                  'size': 'small', 'text': '🔄 立即刷新'},
+                                        'events': {
+                                            'click': {
+                                                'api': 'plugin/HHClubButler/refresh_overview',
+                                                'method': 'post',
+                                                'params': {}
+                                            }
+                                        }
+                                    }
+                                ]
                             },
                             {
                                 'component': 'VAlert',
@@ -748,7 +810,7 @@ class HHClubButler(_PluginBase):
         if key and key != "seeding":
             return None
         try:
-            overview = self._build_seeding_overview([])
+            overview = self._get_overview_cached_or_refresh()
         except Exception as e:
             logger.error(f"仪表盘概况获取失败：{e}")
             overview = {"count": 0, "total_gb": 0.0, "total_tb": 0.0,
@@ -759,7 +821,8 @@ class HHClubButler(_PluginBase):
         elements = [
             {
                 'component': 'div',
-                'html': HHClubButler._overview_html(overview)
+                'html': HHClubButler._overview_html(
+                    overview, self._last_overview_ts, self._overview_hours)
             }
         ]
         return (
@@ -777,6 +840,78 @@ class HHClubButler(_PluginBase):
                 self._scheduler = None
         except Exception as e:
             logger.error(f"停止插件服务失败：{e}")
+        try:
+            if self._overview_stop:
+                self._overview_stop.set()
+            if self._overview_thread and self._overview_thread.is_alive():
+                self._overview_thread.join(timeout=3)
+        except Exception as e:
+            logger.error(f"停止概况刷新线程失败：{e}")
+        finally:
+            self._overview_stop = None
+            self._overview_thread = None
+
+    def _start_overview_thread(self):
+        """启动概况自动刷新后台线程"""
+        try:
+            self._overview_stop = threading.Event()
+            self._overview_thread = threading.Thread(
+                target=self._overview_loop, daemon=True, name="HHClubButler-OverviewRefresh")
+            self._overview_thread.start()
+        except Exception as e:
+            logger.error(f"启动概况刷新线程失败：{e}")
+
+    def _overview_loop(self):
+        """按配置间隔（距最近一次更新）静默刷新概况缓存"""
+        while True:
+            try:
+                if self._overview_stop is None or self._overview_stop.is_set():
+                    return
+                hours = self._overview_hours
+                if hours <= 0:
+                    self._overview_stop.wait(3600)
+                    continue
+                wait = hours * 3600.0 - (time.time() - self._last_overview_ts)
+                if wait <= 0:
+                    self._refresh_overview()
+                    wait = hours * 3600.0
+                self._overview_stop.wait(min(wait, 3600.0))
+            except Exception:
+                try:
+                    if self._overview_stop is not None:
+                        self._overview_stop.wait(300)
+                except Exception:
+                    return
+
+    def _refresh_overview(self):
+        """静默刷新概况缓存（只读站点+下载器，不做任何优选/推送/删除）"""
+        try:
+            logs = []
+            cur = self._get_current_seeding(logs)
+            if not cur or cur.get("error"):
+                return
+            self._last_overview = self._build_overview_from_current(cur)
+            self._last_overview_ts = time.time()
+            logger.info(f"憨憨保种区管家概况已自动刷新："
+                        f"{cur.get('count', 0)} 个 / {cur.get('total_gb', 0.0):.1f} GB")
+        except Exception as e:
+            logger.error(f"概况自动刷新失败：{e}")
+
+    def _get_overview_cached_or_refresh(self) -> dict:
+        """概况读取：优先缓存；缓存缺失或超时(间隔+5分钟)时兜底现场刷新一次"""
+        try:
+            if (self._last_overview is None
+                    or (self._overview_hours > 0
+                        and time.time() - self._last_overview_ts > self._overview_hours * 3600 + 300)):
+                self._refresh_overview()
+        except Exception as e:
+            logger.error(f"概况读取失败：{e}")
+        return self._last_overview or {
+            "count": 0, "total_gb": 0.0, "total_tb": 0.0,
+            "total_bean": 0.0, "total_pt": 0.0,
+            "dist": {"0-1人": {"count": 0, "gb": 0.0},
+                     "2-3人": {"count": 0, "gb": 0.0},
+                     "4-5人": {"count": 0, "gb": 0.0}}}
 
     # ============================================================
     # API
@@ -791,6 +926,17 @@ class HHClubButler(_PluginBase):
     def api_result(self):
         """查看最近结果"""
         return {"result": self._last_result}
+
+    def api_refresh_overview(self):
+        """立即刷新概况（仅刷新数据，不优选/不推送/不删除）"""
+        try:
+            self._refresh_overview()
+            if self._last_overview_ts > 0:
+                return {"success": True, "result": "概况已刷新"}
+            return {"success": False, "result": "概况刷新失败（站点或下载器不可用），保留上次数据"}
+        except Exception as e:
+            logger.error(f"立即刷新概况失败：{e}")
+            return {"success": False, "result": f"概况刷新失败：{e}"}
 
     # ============================================================
     # 核心逻辑
@@ -862,6 +1008,7 @@ class HHClubButler(_PluginBase):
         # 缓存概况数据（设置页顶部卡片用，免二次抓取）
         try:
             self._last_overview = self._build_overview_from_current(current)
+            self._last_overview_ts = time.time()
         except Exception as e:
             logger.error(f"构建概况缓存失败：{e}")
 
