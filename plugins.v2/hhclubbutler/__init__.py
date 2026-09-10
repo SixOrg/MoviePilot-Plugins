@@ -88,7 +88,7 @@ class HHClubButler(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
     # 插件版本
-    plugin_version = "0.21"
+    plugin_version = "0.22"
     # 插件作者
     plugin_author = "六个橙子"
     # 作者主页
@@ -654,30 +654,9 @@ class HHClubButler(_PluginBase):
                               'text': f"最近运行状态：{self._last_result}"}
                 },
                 {
-                    'component': 'VRow',
-                    'props': {'class': 'd-flex justify-end align-center', 'no-gutters': True},
-                    'content': [
-                        {
-                            'component': 'div',
-                            'html': ('<div style="font-size:10.5px;color:rgba(var(--v-theme-on-surface),.4);'
-                                     'margin-right:10px;white-space:nowrap;">'
-                                     + HHClubButler._overview_refresh_note(
-                                         self._last_overview_ts, self._overview_hours)
-                                     + '</div>')
-                        },
-                        {
-                            'component': 'div',
-                            'html': '<a style="cursor:pointer;color:#42A5F5;'
-                                     'text-decoration:none;white-space:nowrap;">🔄 立即刷新</a>',
-                            'events': {
-                                'click': {
-                                    'api': 'plugin/HHClubButler/refresh_overview',
-                                    'method': 'get',
-                                    'params': {'apikey': settings.API_TOKEN}
-                                }
-                            }
-                        }
-                    ]
+                    'component': 'div',
+                    'props': {'style': 'margin-top:6px;font-size:10.5px;color:rgba(var(--v-theme-on-surface),.4);'},
+                    'text': HHClubButler._overview_refresh_note(self._last_overview_ts, self._overview_hours)
                 }
             ]
         }
