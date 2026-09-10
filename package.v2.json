@@ -3,7 +3,7 @@
     "name": "憨憨保种区管家",
     "description": "自动化优选添加及换种工具",
     "labels": "保种,优选,憨憨,管家",
-    "version": "0.16",
+    "version": "0.17",
     "icon": "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/hhclubbutler.png",
     "author": "六个橙子",
     "author_url": "https://github.com/SixOrg",
@@ -11,6 +11,7 @@
     "v3": true,
     "release": true,
     "history": {
+      "0.17": "概况自动刷新（默认每6小时，距最近一次运行/更新计时，仅刷新数据不优选不推送不删除）；数据页/仪表盘改读缓存减少站点访问；插件图标更新",
       "0.16": "推送失败种子记录与通知告警；日志按模式精简（积分/体积目标不混显）",
       "0.15": "插件图标改为网络地址，修复安装后图标不显示",
       "0.14": "修复换种优选删除最高档位种子问题；日志增加删除明细",
