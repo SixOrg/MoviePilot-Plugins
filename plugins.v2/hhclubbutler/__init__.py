@@ -86,9 +86,9 @@ class HHClubButler(_PluginBase):
     # 插件描述
     plugin_desc = "自动化优选添加及换种工具"
     # 插件图标
-    plugin_icon = "hhclubbutler.png"
+    plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/hhclubbutler.png"
     # 插件版本
-    plugin_version = "0.14"
+    plugin_version = "0.15"
     # 插件作者
     plugin_author = "六个橙子"
     # 作者主页
