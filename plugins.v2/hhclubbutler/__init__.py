@@ -88,7 +88,7 @@ class HHClubButler(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/hhclubbutler.png"
     # 插件版本
-    plugin_version = "0.15"
+    plugin_version = "0.16"
     # 插件作者
     plugin_author = "六个橙子"
     # 作者主页
@@ -131,7 +131,6 @@ class HHClubButler(_PluginBase):
         self._enabled = bool(config.get("enabled"))
         self._onlyonce = bool(config.get("onlyonce"))
         self._notify = bool(config.get("notify"))
-        logger.info(f"憨憨保种区管家配置生效：启用={self._enabled} 通知={self._notify} 模式={self._mode} 目标积分={self._target_pt} 目标体积={self._target_volume}")
         self._cron = config.get("cron") or "30 14 * * *"
         self._cookie = config.get("cookie") or ""
         self._site_url = (config.get("site_url") or "").rstrip("/")
@@ -175,6 +174,15 @@ class HHClubButler(_PluginBase):
         except (TypeError, ValueError):
             self._auto_clean_days = 0
         self._auto_clean_days = max(0.0, min(365.0, self._auto_clean_days))
+
+        # 配置生效日志：置于全部配置读取之后，按当前生效模式只显示对应目标值
+        # （积分模式不显示体积目标，体积模式不显示积分目标，避免混显误会）
+        if self._use_volume:
+            logger.info(f"憨憨保种区管家配置生效：启用={self._enabled} 通知={self._notify} "
+                        f"模式={self._mode} 目标体积={self._target_volume}")
+        else:
+            logger.info(f"憨憨保种区管家配置生效：启用={self._enabled} 通知={self._notify} "
+                        f"模式={self._mode} 目标积分={self._target_pt}")
 
         if self._onlyonce:
             self._onlyonce = False
@@ -908,8 +916,9 @@ class HHClubButler(_PluginBase):
                     logs.append(f"已过滤 {filtered} 个已在下载器的种子，实际推送 {len(picked)} 个")
         # 7. 推送新增种子
         ok_count = fail_count = 0
+        fail_list = []
         if picked:
-            ok_count, fail_count = self._push_seeds(picked, logs)
+            ok_count, fail_count, fail_list = self._push_seeds(picked, logs)
             for s in picked:
                 logger.info(f"优选新增种子: {s.get('title','')} | "
                             f"{s.get('size',0.0):.1f} GB | "
@@ -917,6 +926,13 @@ class HHClubButler(_PluginBase):
                             f"+{s.get('daily_pt',0.0):.1f} 积分")
         else:
             logs.append("无需新增下载")
+
+        # 推送失败记录与告警：run_log 汇总行 + 系统日志 error 级（便于排查）
+        if fail_list:
+            logs.append(f"❌ 推送失败 {len(fail_list)} 个：")
+            for f in fail_list:
+                logger.error(f"推送失败种子: {f['title']} | {f['reason']}")
+                logs.append(f"   {f['title']}（{f['reason']}）")
 
         # 7.5 自动清理超时未完成的下载任务（本站相关：tracker匹配/本站标签/保种区种子名三重识别）
         logger.info(f"自动清理配置：{self._auto_clean_days:g} 天（{'启用' if self._auto_clean_days > 0 else '未启用'}）")
@@ -941,7 +957,8 @@ class HHClubButler(_PluginBase):
             try:
                 notify = self._build_notify(mode_name, current, current_pt, current_gb,
                                             target, eff_target, picked, total_pt, total_gb,
-                                            filtered, ok_count, fail_count, result, cleaned)
+                                            filtered, ok_count, fail_count, fail_list,
+                                            result, cleaned)
                 self.post_message(
                     mtype=NotificationType.Plugin,
                     title=f"【憨憨保种区管家】{mode_name}优选完成",
@@ -957,7 +974,7 @@ class HHClubButler(_PluginBase):
                       current_gb: float, target: float, eff_target: float,
                       picked: list, total_pt: float, total_gb: float,
                       filtered: int, ok_count: int, fail_count: int,
-                      result: dict, cleaned: int = 0) -> list:
+                      fail_list: list, result: dict, cleaned: int = 0) -> list:
         """构造精简通知正文（手机阅读友好，去掉过程性日志）"""
         lines = ["──────────────"]
         lines.append(f"当前保种：{current.get('count', 0)} 个")
@@ -977,7 +994,13 @@ class HHClubButler(_PluginBase):
             if len(picked) > 5:
                 lines.append(f"  …等共 {len(picked)} 个")
             if fail_count:
-                lines.append(f"推送结果：成功 {ok_count} / 失败 {fail_count}")
+                lines.append(f"⚠️ 推送失败：{fail_count} 个（成功 {ok_count}）")
+                for f in fail_list[:5]:
+                    t = (f.get('title') or '').strip()
+                    t = t if len(t) <= 30 else t + "…"
+                    lines.append(f"  ✗ {t}（{f.get('reason','')}）")
+                if len(fail_list) > 5:
+                    lines.append(f"  …等共 {len(fail_list)} 个失败")
             else:
                 lines.append(f"推送成功：{ok_count}/{len(picked)}")
         else:
@@ -1532,18 +1555,21 @@ class HHClubButler(_PluginBase):
         except Exception as e:
             logs.append(f"获取下载器种子失败：{e}")
             return None
-
     def _push_seeds(self, seeds: list, logs: list):
-        """推送种子到下载器"""
+        """推送种子到下载器，返回 (成功数, 失败数, 失败明细列表)"""
         service = self._get_downloader_obj()
         if not service:
             logs.append("未配置有效的下载器，无法推送")
-            return
+            return 0, 0, []
         session = self._session()
         ok_count = 0
+        fail_list = []
         for s in seeds:
             href = s.get("href", "")
+            title = s.get("title", "")
             if not href:
+                fail_list.append({"title": title, "reason": "缺少下载链接"})
+                logs.append(f"❌ 缺少下载链接：{title}")
                 continue
             url = href if href.startswith("http") else f"{self._get_site_url()}/{href.lstrip('/')}"
             try:
@@ -1571,17 +1597,19 @@ class HHClubButler(_PluginBase):
                     )
                     if success:
                         ok_count += 1
-                        logs.append(f"✅ 已添加：{s['title'][:50]}")
+                        logs.append(f"✅ 已添加：{title}")
                     else:
-                        logs.append(f"❌ 添加失败：{s['title'][:50]}")
+                        fail_list.append({"title": title, "reason": "下载器拒绝添加（可能已存在相同任务）"})
+                        logs.append(f"❌ 添加失败：{title}")
                 else:
-                    logs.append(f"❌ 种子下载失败({r.status_code})：{s['title'][:50]}")
+                    fail_list.append({"title": title, "reason": f"种子文件下载失败(HTTP {r.status_code})"})
+                    logs.append(f"❌ 种子下载失败({r.status_code})：{title}")
             except Exception as e:
-                logs.append(f"❌ 推送异常：{s['title'][:50]} - {e}")
+                fail_list.append({"title": title, "reason": f"推送异常：{e}"})
+                logs.append(f"❌ 推送异常：{title} - {e}")
             time.sleep(1)
         logs.append(f"推送完成：成功 {ok_count}/{len(seeds)}")
-        return ok_count, len(seeds) - ok_count
-
+        return ok_count, len(seeds) - ok_count, fail_list
     def _delete_seeds(self, seeds: list, logs: list):
         """删除被换出的低效保种种子：任务与文件一起删除（释放硬盘空间）。
         匹配用归一化模糊匹配（与当前保种交集口径一致），防止格式差异漏删。"""
@@ -2046,8 +2074,7 @@ class HHClubButler(_PluginBase):
         keep_count = len(final) - len(add_seeds)
         logs.append(f"换种（按体积）上限 {cap:.0f} GB：构建 {len(final)} 个"
                     f"（保留当前 {keep_count} + 新增 {len(add_seeds)}），"
-                    f"删除 {len(del_seeds)} 个，最终体积 {total_gb:.1f} GB，"
-                    f"积分 {total_pt:.1f}")
+                    f"删除 {len(del_seeds)} 个，最终体积 {total_gb:.1f} GB")
         for s in add_seeds:
             logs.append(f"  + 新增: {s.get('title','')} | {s.get('size',0.0):.1f} GB | "
                         f"初始做种 {s.get('seeders','?')} 人 | +{s.get('daily_pt',0.0):.1f} 积分")
