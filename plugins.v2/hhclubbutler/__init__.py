@@ -88,7 +88,7 @@ class HHClubButler(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
     # 插件版本
-    plugin_version = "0.22"
+    plugin_version = "0.23"
     # 插件作者
     plugin_author = "六个橙子"
     # 作者主页
@@ -649,14 +649,15 @@ class HHClubButler(_PluginBase):
                     ]
                 },
                 {
-                    'component': 'VAlert',
-                    'props': {'type': 'info', 'variant': 'tonal',
-                              'text': f"最近运行状态：{self._last_result}"}
-                },
-                {
                     'component': 'div',
                     'props': {'style': 'margin-top:6px;font-size:10.5px;color:rgba(var(--v-theme-on-surface),.4);'},
                     'text': HHClubButler._overview_refresh_note(self._last_overview_ts, self._overview_hours)
+                            + '。左下角「查看数据」中可手动立即刷新。'
+                },
+                {
+                    'component': 'VAlert',
+                    'props': {'type': 'info', 'variant': 'tonal',
+                              'text': f"最近运行状态：{self._last_result}"}
                 }
             ]
         }
@@ -733,9 +734,14 @@ class HHClubButler(_PluginBase):
         """概况刷新说明（设置页顶部卡片用）"""
         if last_ts and last_ts > 0:
             mins = max(0, int((time.time() - last_ts) / 60))
+            if mins >= 60:
+                h, m = divmod(mins, 60)
+                ago = f"{h} 小时 {m} 分钟前" if m else f"{h} 小时前"
+            else:
+                ago = f"{mins} 分钟前"
             if hours > 0:
-                return f"每 {hours:g} 小时自动刷新一次 · 上次更新 {mins} 分钟前"
-            return f"上次更新 {mins} 分钟前"
+                return f"每 {hours:g} 小时自动刷新一次 · 上次更新 {ago}"
+            return f"上次更新 {ago}"
         return f"每 {hours:g} 小时自动刷新一次（距最近一次运行或定时更新后开始计时）"
 
     def get_page(self) -> List[dict]:
@@ -756,7 +762,7 @@ class HHClubButler(_PluginBase):
                         'content': [
                             {
                                 'component': 'VRow',
-                                'props': {'class': 'd-flex justify-end align-center', 'no-gutters': True},
+                                'props': {'class': 'd-flex justify-space-between align-center', 'no-gutters': True},
                                 'content': [
                                     {
                                         'component': 'div',
@@ -816,7 +822,7 @@ class HHClubButler(_PluginBase):
         elements = [
             {
                 'component': 'div',
-                'props': {'style': 'text-align:right;font-size:10.5px;'
+                'props': {'style': 'text-align:left;font-size:10.5px;'
                                    'color:rgba(var(--v-theme-on-surface),.4);'
                                    'margin-bottom:6px;white-space:nowrap;'},
                 'text': HHClubButler._overview_refresh_note(self._last_overview_ts, self._overview_hours)
