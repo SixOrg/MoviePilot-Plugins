@@ -88,7 +88,7 @@ class HHClubButler(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
     # 插件版本
-    plugin_version = "0.30"
+    plugin_version = "0.31"
     # 插件作者
     plugin_author = "六个橙子"
     # 作者主页
@@ -1024,29 +1024,36 @@ class HHClubButler(_PluginBase):
         in_flight_pt = 0.0
         in_flight_gb = 0.0
         if dl_all is None:
+            dl_norm_all = set()
             logs.append("⚠️ 下载器种子列表获取失败，在途与去重均无法判定，本次暂停推送新增以防重复")
         else:
             dl_done = self._get_downloader_seeds(logs, only_completed=True, any_tracker=True) or set()
-            in_flight_names = set(dl_all) - set(dl_done)
-            if in_flight_names:
+            # 归一化名集合：下载器任务名与保种区标题常有点/空格/括号差异（如 QB 点分隔 vs 站点空格），
+            # 必须归一化后再做差集与积分反查，否则在途积分/体积会全部落空（原始名查不到归一化 key）
+            dl_norm_all = {HHClubButler._norm_title(n) for n in dl_all}
+            dl_done_norm = {HHClubButler._norm_title(n) for n in dl_done}
+            in_flight_norms = dl_norm_all - dl_done_norm
+            if in_flight_norms:
                 pt_map = {}
                 gb_map = {}
                 for s in seeds_full:
                     nm = HHClubButler._norm_title(s.get("title") or "")
                     pt_map[nm] = s.get("daily_pt", 0.0)
                     gb_map[nm] = s.get("size", 0.0)
-                for nm in in_flight_names:
+                for nm in in_flight_norms:
                     in_flight_pt += pt_map.get(nm, 0.0)
                     in_flight_gb += gb_map.get(nm, 0.0)
-            logs.append(f"在途（下载中未完成）{len(in_flight_names)} 个，预计积分 {in_flight_pt:.1f}，"
+            logs.append(f"在途（下载中未完成）{len(in_flight_norms)} 个，预计积分 {in_flight_pt:.1f}，"
                         f"体积 {in_flight_gb:.1f} GB")
+            logger.info(f"憨憨保种区管家：在途（下载中未完成）{len(in_flight_norms)} 个，"
+                        f"预计积分 {in_flight_pt:.1f}，体积 {in_flight_gb:.1f} GB")
             # 候选剔除：已在下载器的种子（含在途）不再作为新增候选，从源头防重复推送
-            dl_norm_all = {HHClubButler._norm_title(n) for n in dl_all}
             before = len(seeds)
             seeds = [s for s in seeds if HHClubButler._norm_title(s.get("title") or "") not in dl_norm_all]
             removed = before - len(seeds)
             if removed:
                 logs.append(f"已剔除 {removed} 个已在下载器中的候选（含下载中），剩 {len(seeds)} 个")
+                logger.info(f"憨憨保种区管家：已剔除 {removed} 个已在下载器中的候选（含下载中），剩 {len(seeds)} 个")
 
         # 缓存概况数据（设置页顶部卡片用，免二次抓取）；降级运行不覆盖上次正常概况
         if not current.get("degraded"):
