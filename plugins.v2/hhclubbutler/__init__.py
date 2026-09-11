@@ -88,7 +88,7 @@ class HHClubButler(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
     # 插件版本
-    plugin_version = "0.25"
+    plugin_version = "0.26"
     # 插件作者
     plugin_author = "六个橙子"
     # 作者主页
@@ -1710,6 +1710,39 @@ class HHClubButler(_PluginBase):
         except Exception:
             return ""
 
+    @staticmethod
+    def _get_progress_ratio(t, dl_type: str = "") -> Optional[float]:
+        """返回归一化下载进度（0~1，下载完成=1.0）。兼容 qBittorrent 与 Transmission。
+
+        QB（qbittorrent-api）：progress 字段本身就是 0~1（完成=1.0），直接使用；
+        TR（transmission-rpc）：progress 字段是 0~100 百分比（完成=100.0），
+        需除以 100 归一化；部分版本 percent_done 已是 0~1，做双保险。
+        返回 None 表示无法取得进度（调用方按各自保守策略处理）。"""
+        try:
+            if isinstance(t, dict):
+                progress = t.get("progress")
+                if progress is None:
+                    progress = t.get("percent_done")
+            else:
+                progress = getattr(t, "progress", None)
+                if progress is None:
+                    progress = getattr(t, "percent_done", None)
+            if progress is None:
+                return None
+            try:
+                progress = float(progress)
+            except (TypeError, ValueError):
+                return None
+            dl = (dl_type or "").lower()
+            if "transmission" in dl or "tr_" in dl:
+                # TR 的 progress 为 0~100 百分比；若已是 0~1（部分版本）则无需换算
+                if progress > 1.0:
+                    progress = progress / 100.0
+            # QB 的 progress 本身就是 0~1，保持不变
+            return max(0.0, min(1.0, progress))
+        except Exception:
+            return None
+
     def _get_downloader_seeds(self, logs: list, only_completed: bool = True,
                               any_tracker: bool = False) -> Optional[set]:
         """获取下载器中种子名集合
@@ -1744,23 +1777,10 @@ class HHClubButler(_PluginBase):
                 if any_tracker or ("hhanclub" in tracker or "hhclub" in tracker
                                    or "hanclub" in tracker):
                     site_total += 1
-                    # 已完成判定：progress 必须为 1.0（100%）才算下载完成
+                    # 已完成判定：归一化进度必须为 1.0（100%）才算下载完成
+                    # （QB progress 0~1；TR progress 0~100，由 _get_progress_ratio 归一化）
                     if only_completed:
-                        progress = None
-                        try:
-                            if isinstance(t, dict):
-                                progress = t.get("progress")
-                            else:
-                                progress = getattr(t, "progress", None)
-                                if progress is None:
-                                    progress = getattr(t, "percent_done", None)
-                        except Exception:
-                            progress = None
-                        if progress is not None:
-                            try:
-                                progress = float(progress)
-                            except (TypeError, ValueError):
-                                progress = None
+                        progress = HHClubButler._get_progress_ratio(t, dl_type)
                         if progress is not None and progress < 1.0:
                             continue
                     try:
@@ -1925,6 +1945,11 @@ class HHClubButler(_PluginBase):
             logs.append("未配置有效的下载器，跳过未完成清理")
             logger.info("未完成清理：未配置有效的下载器，跳过")
             return 0
+        dl_type = ""
+        try:
+            dl_type = str(service.type or service.config.type or "")
+        except Exception:
+            pass
         try:
             torrents, error = service.instance.get_torrents()
             if error:
@@ -1955,14 +1980,15 @@ class HHClubButler(_PluginBase):
                 if isinstance(t, dict):
                     name = str(t.get("name") or "")
                     progress = t.get("progress")
-                    added = t.get("added_on") or t.get("added_time") or 0
+                    added = t.get("added_on") or t.get("added_time") or t.get("addedDate") or 0
                     tags = str(t.get("tags") or t.get("labels") or "")
                     tid = t.get("hash") or t.get("id")
                     raw_keys = list(t.keys()) if stat_probe < 3 else None
                 else:
                     name = str(getattr(t, "name", "") or "")
-                    progress = getattr(t, "progress", None)
-                    added = getattr(t, "added_on", 0) or getattr(t, "added_time", 0) or 0
+                    progress = HHClubButler._get_progress_ratio(t, dl_type)
+                    added = (getattr(t, "added_on", 0) or getattr(t, "added_time", 0)
+                             or getattr(t, "addedDate", 0) or 0)
                     tags = str(getattr(t, "tags", "") or getattr(t, "labels", "") or "")
                     tid = getattr(t, "hash", None) or getattr(t, "hashString", None) or getattr(t, "id", None)
                     raw_keys = None
@@ -1993,6 +2019,9 @@ class HHClubButler(_PluginBase):
                 progress = float(progress) if progress is not None else 1.0
             except (TypeError, ValueError):
                 progress = 1.0
+            # TR progress 为 0~100 百分比时的兜底归一化（正常已由 _get_progress_ratio 处理）
+            if progress > 1.0:
+                progress = progress / 100.0
             if progress >= 1.0:
                 stat_done += 1
                 continue  # 已下载完成的不动
