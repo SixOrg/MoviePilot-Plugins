@@ -88,7 +88,7 @@ class HHClubButler(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
     # 插件版本
-    plugin_version = "0.32"
+    plugin_version = "0.33"
     # 插件作者
     plugin_author = "六个橙子"
     # 作者主页
@@ -1028,6 +1028,14 @@ class HHClubButler(_PluginBase):
         current_gb = current.get("total_gb", 0.0)
         logs.append(f"当前保种：{current.get('count', 0)} 个，预计每日积分 {current_pt:.1f}，体积 {current_gb:.1f} GB")
 
+        # 2.4 v0.33：自动清理超时未完成的下载任务（本站相关：tracker匹配/本站标签/保种区种子名三重识别）。
+        # 置于在途计算与达标判断之前：①无论本次是否达标/推送，启用即执行（此前达标提前 return 会跳过清理）；
+        # ②清理后再算在途，被清理的超时任务不再虚计入在途，避免误判达标而不推
+        logger.info(f"自动清理配置：{self._auto_clean_days:g} 天（{'启用' if self._auto_clean_days > 0 else '未启用'}）")
+        cleaned = 0
+        if self._auto_clean_days > 0:
+            cleaned = self._clean_stale_downloads(logs, seeds, all_site_titles)
+
         # 2.5 v0.30：在途种子（下载中未完成）计算 + 候选剔除已在下载器的种子
         # 目的：①优选不再选中在途种子（防重复推送）；②达标评估计入在途（防过度推送）
         dl_all = self._get_downloader_seeds(logs, only_completed=False, any_tracker=True)
@@ -1162,12 +1170,6 @@ class HHClubButler(_PluginBase):
             for f in fail_list:
                 logger.error(f"推送失败种子: {f['title']} | {f['reason']}")
                 logs.append(f"   {f['title']}（{f['reason']}）")
-
-        # 7.5 自动清理超时未完成的下载任务（本站相关：tracker匹配/本站标签/保种区种子名三重识别）
-        logger.info(f"自动清理配置：{self._auto_clean_days:g} 天（{'启用' if self._auto_clean_days > 0 else '未启用'}）")
-        cleaned = 0
-        if self._auto_clean_days > 0:
-            cleaned = self._clean_stale_downloads(logs, seeds, all_site_titles)
 
         # 汇总（按实际推送的种子重算积分/体积——去重过滤后可能与优选结果不同）
         total_pt = sum(s.get("daily_pt", 0.0) for s in picked)
