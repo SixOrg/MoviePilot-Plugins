@@ -88,7 +88,7 @@ class HHClubButler(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
     # 插件版本
-    plugin_version = "0.28"
+    plugin_version = "0.29"
     # 插件作者
     plugin_author = "六个橙子"
     # 作者主页
@@ -899,7 +899,7 @@ class HHClubButler(_PluginBase):
         try:
             logs = []
             cur = self._get_current_seeding(logs)
-            if not cur or cur.get("error"):
+            if not cur or cur.get("error") or cur.get("degraded"):
                 return
             self._last_overview = self._build_overview_from_current(cur)
             self._last_overview_ts = time.time()
@@ -1016,12 +1016,13 @@ class HHClubButler(_PluginBase):
         current_gb = current.get("total_gb", 0.0)
         logs.append(f"当前保种：{current.get('count', 0)} 个，预计每日积分 {current_pt:.1f}，体积 {current_gb:.1f} GB")
 
-        # 缓存概况数据（设置页顶部卡片用，免二次抓取）
-        try:
-            self._last_overview = self._build_overview_from_current(current)
-            self._last_overview_ts = time.time()
-        except Exception as e:
-            logger.error(f"构建概况缓存失败：{e}")
+        # 缓存概况数据（设置页顶部卡片用，免二次抓取）；降级运行不覆盖上次正常概况
+        if not current.get("degraded"):
+            try:
+                self._last_overview = self._build_overview_from_current(current)
+                self._last_overview_ts = time.time()
+            except Exception as e:
+                logger.error(f"构建概况缓存失败：{e}")
 
         # 3. 计算目标（按积分/按体积 二选一）
         target = self._target_pt if not self._use_volume else self._target_volume
@@ -1390,8 +1391,8 @@ class HHClubButler(_PluginBase):
         # 1. 抓完成页
         completed = self._fetch_completed(logs)
         if not completed:
-            logs.append("完成页未获取到数据")
-            result["error"] = "完成页未获取到数据（站点Cookie失效或域名不可达）"
+            logs.append("完成页未获取到数据，本次按空保种降级处理，仅执行增量优选（不删除）")
+            result["degraded"] = "完成页未获取到数据（站点Cookie失效或域名不可达）"
             return result
         # 2. 取下载器做种种子
         dl_seeds = self._get_downloader_seeds(logs)
@@ -1427,7 +1428,7 @@ class HHClubButler(_PluginBase):
         result["seeds"] = matched
         logs.append(f"完成页 {len(completed)} 个 ∩ 下载器做种 {len(dl_names)} 个 = 当前保种 {len(matched)} 个")
         # 未匹配明细（前10条），便于定位名称格式差异
-        if matched and (len(matched) < min(len(completed), len(dl_names))):
+        if len(matched) < min(len(completed), len(dl_names)):
             miss_dl = sorted(dl_names - matched_dl)[:10]
             miss_c = [c["title"] for c in completed
                       if c["title"] not in matched_map][:10]
@@ -1436,9 +1437,9 @@ class HHClubButler(_PluginBase):
             if miss_c:
                 logs.append("未匹配（完成页侧）前10：" + " | ".join(miss_c))
         if not matched and completed and dl_names:
-            result["error"] = ("完成页与下载器交集为空（种子名匹配失败），"
-                               "为防止误推送已停止，请查看日志确认名称格式")
-            logs.append("❌ 交集为空且双方均有数据，判定为名称匹配异常")
+            logs.append("⚠️ 完成页与下载器交集为空（种子名匹配失败），"
+                        "本次按空保种降级处理，仅执行增量优选（不删除）")
+            result["degraded"] = "完成页与下载器交集为空（种子名匹配失败）"
         return result
 
     def _build_overview_from_current(self, cur: dict) -> dict:
@@ -1795,7 +1796,7 @@ class HHClubButler(_PluginBase):
                 logs.append(f"下载器全部种子 {len(names)} 个（含下载中/暂停/tracker缺失，用于推送去重）")
             if not any_tracker and site_total == 0:
                 logs.append("下载器未匹配到本站tracker种子（tracker字段缺失或格式异常），"
-                            "为避免误算已中止（下载器类型：%s）" % (dl_type or "未知"))
+                            "按空保种降级处理，仅执行增量优选（下载器类型：%s）" % (dl_type or "未知"))
                 try:
                     samples = []
                     for t in list(torrents)[:3]:
@@ -1806,7 +1807,7 @@ class HHClubButler(_PluginBase):
                         logs.append("tracker样例：" + " | ".join(samples))
                 except Exception:
                     pass
-                return None
+                return set()
             if not names:
                 if only_completed:
                     logs.append("下载器本站种子均未下载完成，当前无已完成做种种子，按0处理")
