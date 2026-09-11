@@ -88,7 +88,7 @@ class HHClubButler(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
     # 插件版本
-    plugin_version = "0.23"
+    plugin_version = "0.24"
     # 插件作者
     plugin_author = "六个橙子"
     # 作者主页
@@ -646,13 +646,13 @@ class HHClubButler(_PluginBase):
                             legend_col("2-3人", "center"),
                             legend_col("4-5人", "right"),
                         ]},
+                        {
+                            'component': 'div',
+                            'props': {'style': 'margin-top:8px;font-size:10.5px;color:rgba(var(--v-theme-on-surface),.4);'},
+                            'text': HHClubButler._overview_refresh_note(self._last_overview_ts, self._overview_hours)
+                                    + '。左下角「查看数据」中可手动立即刷新。'
+                        },
                     ]
-                },
-                {
-                    'component': 'div',
-                    'props': {'style': 'margin-top:6px;font-size:10.5px;color:rgba(var(--v-theme-on-surface),.4);'},
-                    'text': HHClubButler._overview_refresh_note(self._last_overview_ts, self._overview_hours)
-                            + '。左下角「查看数据」中可手动立即刷新。'
                 },
                 {
                     'component': 'VAlert',
