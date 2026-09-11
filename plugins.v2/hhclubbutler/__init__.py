@@ -88,7 +88,7 @@ class HHClubButler(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
     # 插件版本
-    plugin_version = "0.27"
+    plugin_version = "0.28"
     # 插件作者
     plugin_author = "六个橙子"
     # 作者主页
@@ -2029,8 +2029,12 @@ class HHClubButler(_PluginBase):
                 stat_done += 1
                 continue  # 已下载完成的不动
             try:
+                # transmission-rpc 4.x 的 added_date 是 datetime 对象（带 tzinfo），
+                # 需先转成秒级时间戳再参与比较
+                if hasattr(added, "timestamp"):
+                    added = added.timestamp()
                 added = float(added)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OSError, OverflowError):
                 added = 0.0
             if added <= 0:
                 stat_noadd += 1
