@@ -88,7 +88,7 @@ class HHClubButler(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
     # 插件版本
-    plugin_version = "0.26"
+    plugin_version = "0.27"
     # 插件作者
     plugin_author = "六个橙子"
     # 作者主页
@@ -1980,7 +1980,8 @@ class HHClubButler(_PluginBase):
                 if isinstance(t, dict):
                     name = str(t.get("name") or "")
                     progress = t.get("progress")
-                    added = t.get("added_on") or t.get("added_time") or t.get("addedDate") or 0
+                    added = (t.get("added_on") or t.get("added_time")
+                             or t.get("added_date") or t.get("addedDate") or 0)
                     tags = str(t.get("tags") or t.get("labels") or "")
                     tid = t.get("hash") or t.get("id")
                     raw_keys = list(t.keys()) if stat_probe < 3 else None
@@ -1988,10 +1989,12 @@ class HHClubButler(_PluginBase):
                     name = str(getattr(t, "name", "") or "")
                     progress = HHClubButler._get_progress_ratio(t, dl_type)
                     added = (getattr(t, "added_on", 0) or getattr(t, "added_time", 0)
-                             or getattr(t, "addedDate", 0) or 0)
+                             or getattr(t, "added_date", 0) or getattr(t, "addedDate", 0) or 0)
                     tags = str(getattr(t, "tags", "") or getattr(t, "labels", "") or "")
                     tid = getattr(t, "hash", None) or getattr(t, "hashString", None) or getattr(t, "id", None)
                     raw_keys = None
+                    added_probe = {k: getattr(t, k, "MISS")
+                                   for k in ("added_on", "added_time", "added_date", "addedDate")}
             except Exception:
                 continue
             stat_total += 1
@@ -2011,7 +2014,7 @@ class HHClubButler(_PluginBase):
                 logger.info(f"清理诊断[{stat_probe}] name={name[:60]!r} tracker_host={tracker_host!r} "
                             f"tracker_has_hh={'hhanclub' in tracker or 'hhclub' in tracker} "
                             f"tags={tags!r} progress={progress!r} added={added!r} is_site={is_site} "
-                            f"keys={raw_keys}")
+                            f"keys={raw_keys} added_probe={added_probe if raw_keys is None else None}")
             if not is_site:
                 continue
             stat_site += 1
