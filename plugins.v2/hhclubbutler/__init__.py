@@ -88,7 +88,7 @@ class HHClubButler(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
     # 插件版本
-    plugin_version = "0.29"
+    plugin_version = "0.30"
     # 插件作者
     plugin_author = "六个橙子"
     # 作者主页
@@ -993,6 +993,8 @@ class HHClubButler(_PluginBase):
             logger.warning(self._last_result)
             self._save_log(logs)
             return
+        # v0.30：全量备份（含0做种/不满足条件的），供在途种子积分/体积反查
+        seeds_full = list(seeds)
         # 全量种子标题（含0做种/不满足做种人数条件的），供自动清理兜底识别：
         # 只要任务名来自保种区，无论当前做种人数如何都能识别为本站种子
         all_site_titles = {HHClubButler._norm_title(s.get("title") or "") for s in seeds}
@@ -1016,6 +1018,36 @@ class HHClubButler(_PluginBase):
         current_gb = current.get("total_gb", 0.0)
         logs.append(f"当前保种：{current.get('count', 0)} 个，预计每日积分 {current_pt:.1f}，体积 {current_gb:.1f} GB")
 
+        # 2.5 v0.30：在途种子（下载中未完成）计算 + 候选剔除已在下载器的种子
+        # 目的：①优选不再选中在途种子（防重复推送）；②达标评估计入在途（防过度推送）
+        dl_all = self._get_downloader_seeds(logs, only_completed=False, any_tracker=True)
+        in_flight_pt = 0.0
+        in_flight_gb = 0.0
+        if dl_all is None:
+            logs.append("⚠️ 下载器种子列表获取失败，在途与去重均无法判定，本次暂停推送新增以防重复")
+        else:
+            dl_done = self._get_downloader_seeds(logs, only_completed=True, any_tracker=True) or set()
+            in_flight_names = set(dl_all) - set(dl_done)
+            if in_flight_names:
+                pt_map = {}
+                gb_map = {}
+                for s in seeds_full:
+                    nm = HHClubButler._norm_title(s.get("title") or "")
+                    pt_map[nm] = s.get("daily_pt", 0.0)
+                    gb_map[nm] = s.get("size", 0.0)
+                for nm in in_flight_names:
+                    in_flight_pt += pt_map.get(nm, 0.0)
+                    in_flight_gb += gb_map.get(nm, 0.0)
+            logs.append(f"在途（下载中未完成）{len(in_flight_names)} 个，预计积分 {in_flight_pt:.1f}，"
+                        f"体积 {in_flight_gb:.1f} GB")
+            # 候选剔除：已在下载器的种子（含在途）不再作为新增候选，从源头防重复推送
+            dl_norm_all = {HHClubButler._norm_title(n) for n in dl_all}
+            before = len(seeds)
+            seeds = [s for s in seeds if HHClubButler._norm_title(s.get("title") or "") not in dl_norm_all]
+            removed = before - len(seeds)
+            if removed:
+                logs.append(f"已剔除 {removed} 个已在下载器中的候选（含下载中），剩 {len(seeds)} 个")
+
         # 缓存概况数据（设置页顶部卡片用，免二次抓取）；降级运行不覆盖上次正常概况
         if not current.get("degraded"):
             try:
@@ -1024,14 +1056,32 @@ class HHClubButler(_PluginBase):
             except Exception as e:
                 logger.error(f"构建概况缓存失败：{e}")
 
-        # 3. 计算目标（按积分/按体积 二选一）
+        # 3. 计算目标（按积分/按体积 二选一）；v0.30：达标评估计入在途，当前+在途达标则本次不推不删
         target = self._target_pt if not self._use_volume else self._target_volume
         if not self._use_volume:
-            eff_target = max(0.0, target - current_pt)
-            logs.append(f"目标积分 {target}，当前保种预计 {current_pt:.1f}，差额 {eff_target:.1f}")
+            committed = current_pt + in_flight_pt
+            if committed >= target - 1e-6:
+                msg = f"当前保种+在途预计已达标（{committed:.1f} ≥ 目标 {target:.0f}），本次不推不删"
+                logs.append(msg)
+                self._last_result = f"已达目标（当前+在途 {committed:.1f}/{target:.0f} 积分）"
+                logger.info(f"憨憨保种区管家：{msg}")
+                self._save_log(logs)
+                return
+            eff_target = max(0.0, target - committed)
+            logs.append(f"目标积分 {target}，当前保种预计 {current_pt:.1f}，在途预计 {in_flight_pt:.1f}，"
+                        f"差额 {eff_target:.1f}")
         else:
-            eff_target = max(0.0, target - current_gb)
-            logs.append(f"目标体积（总保种上限）{target}，当前保种体积 {current_gb:.1f} GB，剩余可增 {eff_target:.1f} GB")
+            committed = current_gb + in_flight_gb
+            if committed >= target - 1e-6:
+                msg = f"当前保种+在途预计已达标（{committed:.1f} GB ≥ 目标 {target:.0f} GB），本次不推不删"
+                logs.append(msg)
+                self._last_result = f"已达目标（当前+在途 {committed:.1f}/{target:.0f} GB）"
+                logger.info(f"憨憨保种区管家：{msg}")
+                self._save_log(logs)
+                return
+            eff_target = max(0.0, target - committed)
+            logs.append(f"目标体积（总保种上限）{target}，当前保种体积 {current_gb:.1f} GB，"
+                        f"在途预计 {in_flight_gb:.1f} GB，剩余可增 {eff_target:.1f} GB")
 
         # 4. 做种人数条件过滤（增量/换种两种模式均生效）
         if self._seeder_cond:
@@ -1045,7 +1095,8 @@ class HHClubButler(_PluginBase):
 
         # 5. 优选（增量/换种）
         if self._mode == "wash" and current.get("seeds"):
-            result = self._optimize_with_wash(seeds, current.get("seeds"), eff_target, target, logs)
+            wash_target = max(0.0, target - (in_flight_pt if not self._use_volume else in_flight_gb))
+            result = self._optimize_with_wash(seeds, current.get("seeds"), eff_target, wash_target, logs)
         else:
             result = self._optimize_incremental(seeds, eff_target, current_gb, logs)
             result["del_seeds"] = []
@@ -1062,14 +1113,16 @@ class HHClubButler(_PluginBase):
                             f"-{s.get('daily_pt',0.0):.1f} 积分")
         # 6.5 过滤已在下载器中的种子，避免重复推送（取全部种子含下载中/暂停/tracker缺失的，
         #     不按tracker筛选——tracker字段可能因暂停未连接等缺失，按tracker筛选会漏掉已在下载器的种子）
+        # v0.30：复用 2.5 步抓取的 dl_all；获取失败时保守暂停推送防重复
         filtered = 0
         if picked:
-            dl_now = self._get_downloader_seeds(logs, only_completed=False, any_tracker=True)
-            if dl_now is not None:
+            if dl_all is None:
+                logs.append("⚠️ 去重检查失败（下载器列表获取失败），本次暂停推送防重复")
+                picked = []
+            else:
                 # 归一化标题比较：站点标题与下载器任务名常有空格/点/括号差异，原始文本匹配会漏
-                dl_norm = {HHClubButler._norm_title(n) for n in dl_now}
                 before = len(picked)
-                picked = [s for s in picked if HHClubButler._norm_title(s["title"]) not in dl_norm]
+                picked = [s for s in picked if HHClubButler._norm_title(s["title"]) not in dl_norm_all]
                 filtered = before - len(picked)
                 if filtered:
                     logs.append(f"已过滤 {filtered} 个已在下载器的种子，实际推送 {len(picked)} 个")
