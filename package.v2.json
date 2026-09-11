@@ -3,7 +3,7 @@
     "name": "憨憨保种区管家",
     "description": "自动化优选添加及换种工具",
     "labels": "保种,优选,憨憨,管家",
-    "version": "0.25",
+    "version": "0.26",
     "icon": "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png",
     "author": "六个橙子",
     "author_url": "https://github.com/SixOrg",
@@ -11,6 +11,7 @@
     "v3": true,
     "release": true,
     "history": {
+      "0.26": "修复 Transmission(TR) 下载器进度口径：TR progress 为 0~100 百分比，按下载器类型归一化，自动清理可正确识别未完成下载任务（此前 TR 下进度超 1% 的任务被误判为已完成而跳过清理）；补读 TR addedDate 添加时间字段；保种统计同步归一化，避免未完成任务计入已完成做种；QB 逻辑保持不变",
       "0.25": "修复 Transmission(TR) 下载器兼容：tracker 识别适配 TR 的 trackerList/trackerStats 字段，TR-1 下可正常识别憨憨种子；tracker 匹配失败时输出样例便于排查；推送标签按下载器类型小写匹配修复",
       "0.24": "配置页刷新说明移至初始做种人数分布图例的下一行，与标题左对齐",
       "0.23": "刷新说明优化：配置页说明移至最近运行状态上方并提示左下角查看数据可手动刷新；数据页说明左对齐、立即刷新保持右上；仪表盘说明左对齐；上次更新时间超1小时按小时+分钟显示",
