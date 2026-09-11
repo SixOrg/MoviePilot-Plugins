@@ -88,7 +88,7 @@ class HHClubButler(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
     # 插件版本
-    plugin_version = "0.31"
+    plugin_version = "0.32"
     # 插件作者
     plugin_author = "六个橙子"
     # 作者主页
@@ -665,7 +665,7 @@ class HHClubButler(_PluginBase):
     @staticmethod
     def _overview_html(ov: dict, last_ts: float = 0.0, hours: float = 6.0) -> str:
         """憨憨保种区管家概况（单行4列·透明背景·档位配色堆积条·达标可得口径）"""
-        if not ov or ov.get("count", 0) <= 0:
+        if not ov or not ov.get("ok"):
             return ('<div style="padding:12px 14px;border-radius:10px;'
                     'border:1px solid rgba(var(--v-theme-on-surface),.08);'
                     'background:rgba(var(--v-theme-surface),.55);'
@@ -899,8 +899,18 @@ class HHClubButler(_PluginBase):
         try:
             logs = []
             cur = self._get_current_seeding(logs)
-            if not cur or cur.get("error") or cur.get("degraded"):
+            if not cur:
+                logger.warning("憨憨保种区管家概况刷新失败：未获取到任何数据，保留上次数据")
                 return
+            if cur.get("error"):
+                logger.warning(f"憨憨保种区管家概况刷新失败（{cur['error']}），保留上次数据")
+                return
+            if cur.get("degraded"):
+                logger.warning(f"憨憨保种区管家概况刷新失败（{cur['degraded']}），保留上次数据")
+                return
+            if cur.get("count", 0) <= 0 and not cur.get("seeds"):
+                logger.warning("憨憨保种区管家概况刷新：完成页与下载器交集为空"
+                               "（下载器内暂无保种区已完成种子），按真实 0 个显示")
             self._last_overview = self._build_overview_from_current(cur)
             self._last_overview_ts = time.time()
             logger.info(f"憨憨保种区管家概况已{'手动' if manual else '自动'}刷新："
@@ -1497,9 +1507,8 @@ class HHClubButler(_PluginBase):
             if miss_c:
                 logs.append("未匹配（完成页侧）前10：" + " | ".join(miss_c))
         if not matched and completed and dl_names:
-            logs.append("⚠️ 完成页与下载器交集为空（种子名匹配失败），"
-                        "本次按空保种降级处理，仅执行增量优选（不删除）")
-            result["degraded"] = "完成页与下载器交集为空（种子名匹配失败）"
+            logs.append("完成页与下载器交集为空（下载器内暂无保种区已完成种子），"
+                        "当前保种按 0 个计（数据真实，概况正常显示，不误报为数据异常）")
         return result
 
     def _build_overview_from_current(self, cur: dict) -> dict:
@@ -1530,7 +1539,7 @@ class HHClubButler(_PluginBase):
             "total_bean": total_bean,
             "total_pt": cur.get("total_pt", 0.0),
             "dist": dist,
-            "ok": cur.get("count", 0) > 0 or bool(seeds),
+            "ok": not cur.get("error") and not cur.get("degraded"),
         }
 
     def _build_seeding_overview(self, logs: list) -> dict:
@@ -1562,7 +1571,7 @@ class HHClubButler(_PluginBase):
             "total_bean": total_bean,
             "total_pt": cur.get("total_pt", 0.0),
             "dist": dist,
-            "ok": cur.get("count", 0) > 0 or seeds or cur.get("error"),
+            "ok": not cur.get("error") and not cur.get("degraded"),
         }
 
     def _fetch_completed(self, logs: list) -> List[dict]:
