@@ -88,7 +88,7 @@ class HHClubButler(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
     # 插件版本
-    plugin_version = "0.24"
+    plugin_version = "0.25"
     # 插件作者
     plugin_author = "六个橙子"
     # 作者主页
@@ -1639,6 +1639,77 @@ class HHClubButler(_PluginBase):
             logger.error(f"获取下载器 {self._downloader} 失败：{e}")
             return None
 
+    @staticmethod
+    def _get_tname(t) -> str:
+        """取下载器种子对象的任务名（兼容 dict / qbittorrent-api / transmission-rpc 对象）"""
+        try:
+            return str(t.get("name") if isinstance(t, dict) else getattr(t, "name", "") or "")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _extract_tracker_text(t, dl_type: str = "") -> str:
+        """从下载器种子对象提取 tracker 相关文本（兼容 qBittorrent 与 Transmission）
+
+        QB（dict 或 qbittorrent-api Torrent）：tracker / tracker_v2 为 URL 字符串，
+        trackers 为 URL 列表；magnet_uri 含 tr= 参数。
+        TR（MP v3 的 transmission-rpc Torrent）：无 tracker 字段，tracker 信息在
+        trackerList（分号分隔的 announce 字符串）与 trackerStats（对象数组含 announce），
+        trackers 为 Tracker 命名元组列表；且无 magnet_uri，需用 magnetLink()/magnet
+        生成磁力链兜底（含 tr= 参数）。"""
+        try:
+            parts = []
+            if isinstance(t, dict):
+                parts.append(str(t.get("tracker") or ""))
+                parts.append(str(t.get("tracker_v2") or ""))
+                tr = t.get("trackers")
+                if isinstance(tr, (list, tuple)):
+                    parts.extend(str(x) for x in tr)
+                else:
+                    parts.append(str(tr or ""))
+                parts.append(str(t.get("trackerList") or ""))
+                stats = t.get("trackerStats") or []
+                if isinstance(stats, list):
+                    for s in stats:
+                        if isinstance(s, dict):
+                            parts.append(str(s.get("announce") or ""))
+                parts.append(str(t.get("magnet_uri") or ""))
+            else:
+                parts.append(str(getattr(t, "tracker", "") or ""))
+                parts.append(str(getattr(t, "tracker_v2", "") or ""))
+                tr = getattr(t, "trackers", None)
+                if isinstance(tr, (list, tuple)):
+                    parts.extend(str(x) for x in tr)
+                else:
+                    parts.append(str(tr or ""))
+                parts.append(str(getattr(t, "trackerList", "") or ""))
+                parts.append(str(getattr(t, "tracker_list", "") or ""))
+                stats = getattr(t, "trackerStats", None) or []
+                if isinstance(stats, list):
+                    for s in stats:
+                        announce = None
+                        try:
+                            if isinstance(s, dict):
+                                announce = s.get("announce")
+                            else:
+                                announce = getattr(s, "announce", None) or getattr(s, "url", None)
+                        except Exception:
+                            announce = None
+                        if announce:
+                            parts.append(str(announce))
+                # TR 无 magnet_uri 属性，用 magnetLink()/magnet 生成磁力链兜底（含 tr= 参数）
+                try:
+                    m = getattr(t, "magnet_uri", None) or getattr(t, "magnet", None)
+                    if callable(m):
+                        m = m()
+                    if m:
+                        parts.append(str(m))
+                except Exception:
+                    pass
+            return " ".join(p for p in parts if p)
+        except Exception:
+            return ""
+
     def _get_downloader_seeds(self, logs: list, only_completed: bool = True,
                               any_tracker: bool = False) -> Optional[set]:
         """获取下载器中种子名集合
@@ -1652,6 +1723,11 @@ class HHClubButler(_PluginBase):
         if not service:
             logs.append("未配置有效的下载器")
             return None
+        dl_type = ""
+        try:
+            dl_type = str(service.type or service.config.type or "")
+        except Exception:
+            pass
         try:
             torrents, error = service.instance.get_torrents()
             if error:
@@ -1662,12 +1738,7 @@ class HHClubButler(_PluginBase):
             for t in torrents:
                 tracker = ""
                 try:
-                    if isinstance(t, dict):
-                        tracker = str(t.get("tracker") or t.get("tracker_v2")
-                                      or t.get("trackers") or "")
-                    else:
-                        tracker = str(getattr(t, "tracker", "") or getattr(t, "tracker_v2", "")
-                                      or getattr(t, "trackers", "") or "")
+                    tracker = HHClubButler._extract_tracker_text(t, dl_type)
                 except Exception:
                     pass
                 if any_tracker or ("hhanclub" in tracker or "hhclub" in tracker
@@ -1703,7 +1774,18 @@ class HHClubButler(_PluginBase):
             else:
                 logs.append(f"下载器全部种子 {len(names)} 个（含下载中/暂停/tracker缺失，用于推送去重）")
             if not any_tracker and site_total == 0:
-                logs.append("下载器未匹配到本站tracker种子（tracker字段缺失或格式异常），为避免误算已中止")
+                logs.append("下载器未匹配到本站tracker种子（tracker字段缺失或格式异常），"
+                            "为避免误算已中止（下载器类型：%s）" % (dl_type or "未知"))
+                try:
+                    samples = []
+                    for t in list(torrents)[:3]:
+                        samples.append("%s → %s" % (
+                            (HHClubButler._get_tname(t) or "?").strip()[:50],
+                            HHClubButler._extract_tracker_text(t, dl_type)[:100] or "(空)"))
+                    if samples:
+                        logs.append("tracker样例：" + " | ".join(samples))
+                except Exception:
+                    pass
                 return None
             if not names:
                 if only_completed:
@@ -1741,9 +1823,10 @@ class HHClubButler(_PluginBase):
                         pass
                     kwargs = {}
                     if self._tag:
-                        if "Qbittorrent" in str(dl_type):
+                        dl_type_l = str(dl_type).lower()
+                        if "qbittorrent" in dl_type_l:
                             kwargs["tag"] = self._tag
-                        elif "Transmission" in str(dl_type):
+                        elif "transmission" in dl_type_l:
                             kwargs["labels"] = [self._tag]
                         else:
                             kwargs["tag"] = self._tag
@@ -1867,10 +1950,10 @@ class HHClubButler(_PluginBase):
         stat_probe = 0
         for t in torrents:
             try:
+                # 统一提取 tracker/magnet 文本（兼容 QB 与 TR 的字段差异）
+                tracker = HHClubButler._extract_tracker_text(t)
                 if isinstance(t, dict):
                     name = str(t.get("name") or "")
-                    tracker = str(t.get("tracker") or t.get("tracker_v2") or t.get("trackers") or "")
-                    magnet = str(t.get("magnet_uri") or "")
                     progress = t.get("progress")
                     added = t.get("added_on") or t.get("added_time") or 0
                     tags = str(t.get("tags") or t.get("labels") or "")
@@ -1878,9 +1961,6 @@ class HHClubButler(_PluginBase):
                     raw_keys = list(t.keys()) if stat_probe < 3 else None
                 else:
                     name = str(getattr(t, "name", "") or "")
-                    tracker = str(getattr(t, "tracker", "") or getattr(t, "tracker_v2", "")
-                                  or getattr(t, "trackers", "") or "")
-                    magnet = str(getattr(t, "magnet_uri", "") or "")
                     progress = getattr(t, "progress", None)
                     added = getattr(t, "added_on", 0) or getattr(t, "added_time", 0) or 0
                     tags = str(getattr(t, "tags", "") or getattr(t, "labels", "") or "")
@@ -1889,10 +1969,9 @@ class HHClubButler(_PluginBase):
             except Exception:
                 continue
             stat_total += 1
-            # 本站识别（tracker 字段在暂停/从未联系时为空，此时靠 magnet_uri 里的 announce 地址兜底；
-            # magnet_uri 对任何任务都存在且必带 tr= 参数，含本站 tracker 域名即视为本站任务）
-            is_site = ("hhanclub" in tracker or "hhclub" in tracker or "hanclub" in tracker
-                       or "hhanclub" in magnet or "hhclub" in magnet or "hanclub" in magnet)
+            # 本站识别（tracker 文本已含 tracker/magnet_uri/magnetLink 等来源；
+            # tracker 字段在暂停/从未联系时为空，此时靠磁力链里的 announce 地址兜底）
+            is_site = ("hhanclub" in tracker or "hhclub" in tracker or "hanclub" in tracker)
             if not is_site and site_titles:
                 n = HHClubButler._norm_title(name)
                 if n and n in site_titles:
@@ -1904,7 +1983,7 @@ class HHClubButler(_PluginBase):
                 stat_probe += 1
                 tracker_host = tracker.split("/")[0] if tracker else ""
                 logger.info(f"清理诊断[{stat_probe}] name={name[:60]!r} tracker_host={tracker_host!r} "
-                            f"magnet_has_hh={'hhanclub' in magnet or 'hhclub' in magnet} "
+                            f"tracker_has_hh={'hhanclub' in tracker or 'hhclub' in tracker} "
                             f"tags={tags!r} progress={progress!r} added={added!r} is_site={is_site} "
                             f"keys={raw_keys}")
             if not is_site:
