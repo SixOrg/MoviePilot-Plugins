@@ -3,7 +3,7 @@
     "name": "憨憨保种区管家",
     "description": "自动化优选添加及换种工具",
     "labels": "保种,优选,憨憨,管家",
-    "version": "0.28",
+    "version": "0.29",
     "icon": "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png",
     "author": "六个橙子",
     "author_url": "https://github.com/SixOrg",
@@ -11,6 +11,7 @@
     "v3": true,
     "release": true,
     "history": {
+      "0.29": "运行容错降级：①下载器连接正常但无本站tracker种子（空下载器/全其他站种子）时按空保种继续，增量优选可正常拉种，不再停止；②完成页抓取失败或与下载器交集为空时降级为只增不删继续运行，不再硬停；③降级运行不覆盖上次正常概况数据；④交集为空时日志打印完成页与下载器两侧种子名样本，便于定位匹配问题",
       "0.28": "修复 Transmission 自动清理仍不生效：transmission-rpc 4.x 的 added_date 返回 datetime 对象而非秒数时间戳，float() 转换失败被误判为无添加时间；改为 datetime 对象先转时间戳再比较",
       "0.27": "修复 Transmission 自动清理仍不生效：transmission-rpc 4.x 的添加时间字段为 added_date（下划线格式），修正 added 读取；清理诊断增加添加时间字段探测便于排查",
       "0.26": "修复 Transmission(TR) 下载器进度口径：TR progress 为 0~100 百分比，按下载器类型归一化，自动清理可正确识别未完成下载任务（此前 TR 下进度超 1% 的任务被误判为已完成而跳过清理）；补读 TR addedDate 添加时间字段；保种统计同步归一化，避免未完成任务计入已完成做种；QB 逻辑保持不变",
