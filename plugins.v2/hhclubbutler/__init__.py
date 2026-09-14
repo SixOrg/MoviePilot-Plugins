@@ -88,7 +88,7 @@ class HHClubButler(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
     # 插件版本
-    plugin_version = "1.0"
+    plugin_version = "1.1"
     # 插件作者
     plugin_author = "六个橙子"
     # 作者主页
@@ -1085,7 +1085,9 @@ class HHClubButler(_PluginBase):
         target = self._target_pt if not self._use_volume else self._target_volume
         if not self._use_volume:
             committed = current_pt + in_flight_pt
-            if committed >= target - 1e-6:
+            # v1.1：wash 换种模式即使当前+在途已达标也放行，允许删低补高；
+            #       增量模式仍按"已达标就停"避免重复推送
+            if committed >= target - 1e-6 and self._mode != "wash":
                 msg = f"当前保种+在途预计已达标（{committed:.1f} ≥ 目标 {target:.0f}），本次不推不删"
                 logs.append(msg)
                 self._last_result = f"已达目标（当前+在途 {committed:.1f}/{target:.0f} 积分）"
@@ -1097,7 +1099,8 @@ class HHClubButler(_PluginBase):
                         f"差额 {eff_target:.1f}")
         else:
             committed = current_gb + in_flight_gb
-            if committed >= target - 1e-6:
+            # v1.1：wash 换种模式即使已达标也放行（同积分分支）
+            if committed >= target - 1e-6 and self._mode != "wash":
                 msg = f"当前保种+在途预计已达标（{committed:.1f} GB ≥ 目标 {target:.0f} GB），本次不推不删"
                 logs.append(msg)
                 self._last_result = f"已达目标（当前+在途 {committed:.1f}/{target:.0f} GB）"
@@ -1200,6 +1203,25 @@ class HHClubButler(_PluginBase):
                 logger.error(f"憨憨保种区管家发送通知失败：{e}")
         else:
             logger.info("憨憨保种区管家通知未开启（『发送通知』开关为关），已跳过发送")
+
+        # v1.1：wash 删除后，从当前保种快照中扣掉已删种子再更新概况缓存。
+        # 不重新抓取完成页/下载器（零新增网络请求，对 PT 站更友好）；
+        # 新推送的种子仍在下载中，本就不计入"在保种子"，故只减不增。
+        del_done = result.get("del_seeds") or []
+        if del_done and not current.get("degraded"):
+            del_titles = {s.get("title") for s in del_done}
+            remain = [s for s in current.get("seeds", []) if s.get("title") not in del_titles]
+            current["seeds"] = remain
+            current["count"] = len(remain)
+            current["total_pt"] = sum(s.get("daily_pt", 0.0) for s in remain)
+            current["total_gb"] = sum(s.get("size", 0.0) for s in remain)
+            try:
+                self._last_overview = self._build_overview_from_current(current)
+                self._last_overview_ts = time.time()
+                logger.info(f"憨憨保种区管家：概况已按删除后更新（{len(remain)} 个 / "
+                            f"{current['total_gb']:.1f} GB / {current['total_pt']:.1f} 积分）")
+            except Exception as e:
+                logger.error(f"删除后更新概况失败：{e}")
 
     def _build_notify(self, mode_name: str, current: dict, current_pt: float,
                       current_gb: float, target: float, eff_target: float,
