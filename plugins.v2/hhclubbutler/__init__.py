@@ -88,7 +88,7 @@ class HHClubButler(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
     # 插件版本
-    plugin_version = "1.1"
+    plugin_version = "1.2"
     # 插件作者
     plugin_author = "六个橙子"
     # 作者主页
@@ -1292,12 +1292,14 @@ class HHClubButler(_PluginBase):
         return None
 
     def _get_site_cookie(self) -> str:
-        """获取站点Cookie：优先MP站点管理，其次配置页手动填写"""
+        """获取站点Cookie：优先MP站点管理，其次配置页手动填写。
+        v1.2：读到后缓存到 self._cookie，避免每次推送种子都重复读MP+重复打日志"""
         if not self._cookie:
             site = self._get_mp_site()
             if site and site.cookie:
+                self._cookie = site.cookie
                 logger.info("已从MP站点管理自动获取憨憨站Cookie")
-                return site.cookie
+                return self._cookie
         return self._cookie or ""
 
     def _get_site_url(self) -> str:
@@ -1916,6 +1918,7 @@ class HHClubButler(_PluginBase):
             logs.append("未配置有效的下载器，无法推送")
             return 0, 0, []
         session = self._session()
+        push_cookie = self._get_site_cookie() or None  # v1.2：循环外取一次，避免每个种子重复读MP
         ok_count = 0
         fail_list = []
         for s in seeds:
@@ -1947,7 +1950,7 @@ class HHClubButler(_PluginBase):
                     success = service.instance.add_torrent(
                         content=r.content,
                         download_dir=self._save_path or None,
-                        cookie=self._get_site_cookie() or None,
+                        cookie=push_cookie,
                         **kwargs
                     )
                     if success:
