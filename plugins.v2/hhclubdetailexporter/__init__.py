@@ -216,7 +216,7 @@ class HHClubDetailExporter(_PluginBase):
     plugin_name = "憨憨保种区明细导出"
     plugin_desc = "每天定时（默认23:55）导出憨憨站保种区保种明细为Excel，用于公式验证与数据积累。"
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubdetail/icon.png"
-    plugin_version = "1.0.3"
+    plugin_version = "1.0"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "hhclubdetail_"
@@ -247,8 +247,12 @@ class HHClubDetailExporter(_PluginBase):
         self._last_result = "尚未运行"
         if self._enabled:
             self._cleanup_old_files()
-            # 立即运行一次
+            # 立即运行一次：触发后立即重置开关，避免反复运行/页面常驻勾选
             if cfg.get("onlyonce"):
+                try:
+                    self.update_config({"onlyonce": False})
+                except Exception as e:
+                    logger.error(f"hhclubdetail - 重置 onlyonce 失败：{e}")
                 self._thread = threading.Thread(target=self._run_worker, args=())
                 self._thread.daemon = True
                 self._thread.start()
@@ -442,27 +446,30 @@ class HHClubDetailExporter(_PluginBase):
         ]
 
     def _delete_file(self, name: str = "") -> Dict[str, Any]:
-        """删除指定导出文件（防路径穿越：仅允许数据目录下的 .xlsx）"""
+        """删除指定导出文件（防路径穿越：仅允许数据目录下的 .xlsx/.csv）"""
         try:
             if not name or not name.strip():
-                return {"success": False, "message": "缺少文件名"}
+                return {"success": False, "message": "缺少文件名", "data": None}
             data_path = self.get_data_path().resolve()
             target = (data_path / name.strip()).resolve()
-            if target.parent != data_path or target.suffix.lower() != ".xlsx":
-                return {"success": False, "message": "文件名无效"}
+            if target.parent != data_path or target.suffix.lower() not in (".xlsx", ".csv"):
+                return {"success": False, "message": "文件名无效", "data": None}
             if target.exists():
                 target.unlink()
                 logger.info(f"hhclubdetail - 已手动删除导出文件：{name}")
-                return {"success": True, "message": f"已删除 {name}"}
-            return {"success": False, "message": "文件不存在"}
+                return {"success": True, "message": f"已删除 {name}", "data": None}
+            return {"success": False, "message": "文件不存在", "data": None}
         except Exception as e:
             logger.error(f"hhclubdetail - 删除文件失败：{e}")
-            return {"success": False, "message": str(e)}
+            return {"success": False, "message": str(e), "data": None}
 
     def get_page(self) -> List[dict]:
         files = []
         try:
-            files = sorted(self.get_data_path().glob("*.xlsx"), reverse=True)[:20]
+            data_path = self.get_data_path()
+            files = sorted([p for p in data_path.iterdir()
+                            if p.suffix.lower() in (".xlsx", ".csv")],
+                           reverse=True)[:20]
         except Exception:
             pass
         rows = []
@@ -486,7 +493,7 @@ class HHClubDetailExporter(_PluginBase):
                                     "click": {
                                         "api": "plugin/HHClubDetailExporter/delete_file",
                                         "method": "get",
-                                        "params": {"name": p.name},
+                                        "params": {"name": p.name, "apikey": settings.API_TOKEN},
                                     }
                                 },
                             }]
@@ -616,12 +623,16 @@ class HHClubDetailExporter(_PluginBase):
                 data_dir.mkdir(parents=True, exist_ok=True)
             except Exception:
                 pass
-            fname = f"Hhan保种区完整明细_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
+            fname = f"Hhan保种区完整明细_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.xlsx"
             path = data_dir / fname
             if not write_excel(path, rows_all, summary_all):
                 return "Excel 写入失败（检查磁盘权限/目录可写）"
+            # openpyxl 缺失时降级为 .csv，按实际写入的文件报告
+            actual = path if path.exists() else data_dir / fname.replace(".xlsx", ".csv")
+            if not actual.exists():
+                return "文件写入失败（未找到输出文件）"
             self._cleanup_old_files()
-            msg = f"导出成功：{fname}（明细 {summary_all['count']} 行 / 达标 {summary_all['pass']} 行）"
+            msg = f"导出成功：{actual}（明细 {summary_all['count']} 行 / 达标 {summary_all['pass']} 行）"
             if self._notify:
                 try:
                     self.post_message("憨憨保种区明细导出", msg)
