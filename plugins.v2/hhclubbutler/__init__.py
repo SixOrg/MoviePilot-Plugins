@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 HHCLUB 憨憨保种区管家插件（MoviePilot V2）
 =================================================
@@ -10,16 +10,21 @@ HHCLUB 憨憨保种区管家插件（MoviePilot V2）
 5. 一键推送到 MoviePilot 已配置的 QB/TR 下载器，保存路径自定义
 6. 数据页展示最近一次优选结果与今日保种概况
 
-公式（经用户结算日志 + Excel 达标池 109 项交叉验证）：
-    每日憨豆 = 0.018467 × 体积(GB) × 18h × 憨豆倍率
-    每日积分 = 0.018195 × 体积(GB) × 18h × 积分倍率
-    倍率（按初始保种人数）：憨豆 0-1人×3 / 2-3人×2 / 4-5人×1.5
-                           积分 0-1人×2 / 2-3人×1.75 / 4-5人×1.5
-    超过5人：无保种区奖励
+公式（v1.2.4：wiki 基础公式逐字核对 + 4天结算真值回归，误差≤0.4%）：
+    Aᵢ = (1-10^(-Tᵢ/8)) × Sᵢ(GB) × (1+2×10^(-(Nᵢ-1)/9))，Nᵢ=当前做种人数(now)
+    B = 0.02×min(种子数,500) + B₀×(2/π)×arctan(ΣA/300-5) + 20
+    B₀：憨豆 31.5、积分 30.5（保种区A口径4天反推；wiki 标注 25 已数学证伪，
+        B0=25 时 B 上限 47.5/h，任何A/N组合都达不到实结 51.1/h）
+    档位倍率按下载时人数(init)：憨豆 1人×3 / 2-3人×2 / 4-5人×1.5（wiki 原文）
+                              积分 1人×2 / 2-3人×1.75 / 4-5人×1.5（wiki 原文）
+    A 作用域 = 保种区达标池（全站A口径因 atan 饱和对结算变化不敏感，已证伪）
+    每日憨豆 = B(31.5) × Σ(aᵢ×倍率ᵢ)/A总 × 18h；积分同构(B0=30.5)，上限1800
+    结算集合 = 保种区保种详情(action=7)中"今日达标"的种子（每天0点结算）
 """
 
 import re
 import time
+import math
 import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -43,14 +48,14 @@ lock = threading.Lock()
 # ============================================================
 # 公式常量（用户结算日志+Excel校准，勿改）
 # ============================================================
-C_BEAN = 0.018467   # 憨豆基础系数：每GB每小时基础憨豆
-C_PT = 0.018195     # 积分基础系数
 HOURS = 18          # 保种区每日按18小时计
 
-# 憨豆倍率表（按初始保种人数）
-BEAN_MUL = {1: 3.0, 2: 2.0, 3: 2.0, 4: 1.5, 5: 1.5}
+# 憨豆倍率表（按初始保种人数，wiki: 1人3倍/2-3人2倍/4-5人1.5倍）
+# v1.2.2: 档4-5人实测结算系数≈4.0（9/4、9/5、9/8三日含4-5人种子结算反推；
+#          wiki 标注1.5倍与结算数据不符，保种区试运行中，以实测为准）
+BEAN_MUL = {1: 3.0, 2: 2.0, 3: 2.0, 4: 1.5, 5: 1.5}  # wiki 保种区规则原文（档位按下载时人数）
 # 积分倍率表
-PT_MUL = {1: 2.0, 2: 1.75, 3: 1.75, 4: 1.5, 5: 1.5}
+PT_MUL = {1: 2.0, 2: 1.75, 3: 1.75, 4: 1.5, 5: 1.5}  # wiki 保种区规则原文（档位按下载时人数）
 
 
 def multiplier(n: Optional[int]) -> Tuple[float, float]:
@@ -60,6 +65,126 @@ def multiplier(n: Optional[int]) -> Tuple[float, float]:
     if n > 5:
         return 0.0, 0.0
     return BEAN_MUL.get(n, 1.5), PT_MUL.get(n, 1.5)
+
+
+# ============================================================
+# v1.2.1: wiki 真实积分公式
+# Aᵢ = (1 - 10^(-Tᵢ/8)) × Sᵢ × (1 + 2×10^(-(Nᵢ-1)/9))
+# B  = 0.02×min(N,500) + B₀×(2/π)×arctan(A/300-5) + 20
+# B₀=20 普通区，保种区按档位倍率另乘
+# ============================================================
+def seed_a_factor(seeders: int, size_gb: float, pub_weeks: float, n_now: Optional[int] = None) -> float:
+    """计算单颗种子的 Aᵢ 贡献值（wiki 基础公式）。
+    seeders: 初始保种人数 Nᵢ（档位倍率用）
+    n_now: 当前保种人数（A公式人数因子用；保种区实测用当前人数，缺省回退 seeders）
+    size_gb: 种子大小 GB
+    pub_weeks: 种子发布到现在的周数 Tᵢ
+    公式: Aᵢ = (1 - 10^(-T/8)) × S × (1 + √2×10^(-(N-1)/9))
+    """
+    if not seeders or seeders <= 0:
+        seeders = 1
+    n = n_now if n_now and n_now > 0 else seeders
+    # 时间因子 (1 - 10^(-T/8))
+    t_factor = 1.0 - (10.0 ** (-pub_weeks / 8.0)) if pub_weeks > 0 else 0.0
+    # 人数因子 (1 + 2×10^(-(N-1)/9))；wiki 原文人数因子为 2（2026-09-17 逐字核对）
+    n_factor = 1.0 + 2.0 * (10.0 ** (-float(n - 1) / 9.0))
+    return t_factor * size_gb * n_factor
+
+
+def beans_per_hour(total_a: float, seeding_count: int, b0: float = 20.0) -> float:
+    """根据总 A 计算每小时憨豆（普通区 B₀=20）"""
+    n_bonus = 0.02 * min(seeding_count, 500)
+    arg = total_a / 300.0 - 5.0
+    main = b0 * (2.0 / math.pi) * math.atan(arg) + 20.0
+    return n_bonus + main
+
+
+def rescue_total_beans(seeds: list) -> float:
+    """v1.2.1: 保种区总憨豆/小时。所有种子汇总 A，B 公式只调一次（+20 和 0.02×N 不重复加），
+    再按各组 A 占比分配，乘档位倍率。"""
+    from collections import defaultdict
+    groups = defaultdict(lambda: {"a_sum": 0.0, "count": 0})
+    total_a = 0.0
+    total_count = 0
+    for s in seeds:
+        n = s.get("seeders", 0) or 1
+        if n > 5:
+            continue
+        n_now = s.get("seeders_now", 0) or n
+        a = seed_a_factor(n, s.get("size", 0), s.get("pub_weeks", 4.0), n_now)
+        groups[n]["a_sum"] += a
+        groups[n]["count"] += 1
+        total_a += a
+        total_count += 1
+    if total_a <= 0 or total_count <= 0:
+        return 0.0
+    # v1.2.3: B 公式只调一次（憨豆 B0=31.5，保种区A口径结算反推）
+    b_total = beans_per_hour(total_a, total_count, b0=31.5)
+    # 按各组 A 占比分配，乘档位倍率
+    result = 0.0
+    for n, g in groups.items():
+        bean_mul, _ = multiplier(n)
+        result += b_total * (g["a_sum"] / total_a) * bean_mul
+    return result
+
+
+def rescue_total_pt(seeds: list) -> float:
+    """v1.2.1: 保种区总做种积分/小时。同 beans，乘积分倍率。"""
+    from collections import defaultdict
+    groups = defaultdict(lambda: {"a_sum": 0.0, "count": 0})
+    total_a = 0.0
+    total_count = 0
+    for s in seeds:
+        n = s.get("seeders", 0) or 1
+        if n > 5:
+            continue
+        n_now = s.get("seeders_now", 0) or n
+        a = seed_a_factor(n, s.get("size", 0), s.get("pub_weeks", 4.0), n_now)
+        groups[n]["a_sum"] += a
+        groups[n]["count"] += 1
+        total_a += a
+        total_count += 1
+    if total_a <= 0 or total_count <= 0:
+        return 0.0
+    # v1.2.4: 积分 B0=30.5（结算反推，与憨豆分离）；人数因子用当前人数(now)，同憨豆侧
+    b_total = beans_per_hour(total_a, total_count, b0=30.5)
+    result = 0.0
+    for n, g in groups.items():
+        _, pt_mul = multiplier(n)
+        result += b_total * (g["a_sum"] / total_a) * pt_mul
+    return result
+
+
+def seed_daily_pt(seeders: int, size_gb: float, pub_weeks: float, n_now: Optional[int] = None) -> float:
+    """单颗种子每日积分（18h）：只算 arctan 部分，不含用户级 +20 和 0.02×N。
+    总量由 rescue_total_pt 汇总（B 公式只调一次）。"""
+    _, pt_mul = multiplier(seeders)
+    if pt_mul <= 0:
+        return 0.0
+    a = seed_a_factor(seeders, size_gb, pub_weeks, n_now)
+    if a <= 0:
+        return 0.0
+    # v1.2.2+: 单种子日贡献由 _recompute_daily 的 A 份额模型覆盖；此处为候选解析占位值。
+    arg = a / 300.0 - 5.0
+    marginal = 30.5 * (2.0 / math.pi) * math.atan(arg)
+    if marginal < 0:
+        marginal = 0.0
+    return marginal * pt_mul * HOURS
+
+
+def seed_daily_bean(seeders: int, size_gb: float, pub_weeks: float) -> float:
+    """单颗种子每日憨豆（18h）：只算 arctan 部分，不含用户级 +20 和 0.02×N。"""
+    bean_mul, _ = multiplier(seeders)
+    if bean_mul <= 0:
+        return 0.0
+    a = seed_a_factor(seeders, size_gb, pub_weeks)
+    if a <= 0:
+        return 0.0
+    arg = a / 300.0 - 5.0
+    marginal = 31.5 * (2.0 / math.pi) * math.atan(arg)
+    if marginal < 0:
+        marginal = 0.0
+    return marginal * bean_mul * HOURS
 
 
 def size_to_gb(text: str) -> Optional[float]:
@@ -88,7 +213,7 @@ class HHClubButler(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
     # 插件版本
-    plugin_version = "1.2"
+    plugin_version = "1.3"
     # 插件作者
     plugin_author = "六个橙子"
     # 作者主页
@@ -181,6 +306,13 @@ class HHClubButler(_PluginBase):
         # 概况自动刷新：固定每 6 小时一次（距最近一次运行/定时更新计时），
         # 后台线程静默抓取，不优选/不推送/不删除
         self._overview_hours = 6.0
+        # v1.2.1: 发布时间缓存 {seed_id: "YYYY-MM-DD HH:MM:SS"}（用 get_data/save_data 持久化）
+        try:
+            self._pubtime_cache = self.get_data("pubtime_cache") or {}
+        except Exception:
+            self._pubtime_cache = {}
+        if not isinstance(self._pubtime_cache, dict):
+            self._pubtime_cache = {}
         self._start_overview_thread()
 
         # 配置生效日志：置于全部配置读取之后，按当前生效模式只显示对应目标值
@@ -1026,6 +1158,30 @@ class HHClubButler(_PluginBase):
             return
         current_pt = current.get("total_pt", 0.0)
         current_gb = current.get("total_gb", 0.0)
+        # v1.2.2: 候选种子的 A 份额日贡献以当前保种集合为基准归一（单独按候选池算会虚高）
+        if not current.get("degraded") and seeds and current.get("seeds"):
+            try:
+                cur_seeds = current["seeds"]
+                ref_a = sum(seed_a_factor(s.get("seeders", 0) or 1, s.get("size", 0),
+                                          s.get("pub_weeks", 4.0),
+                                          s.get("seeders_now", 0) or (s.get("seeders", 0) or 1))
+                            for s in cur_seeds if (s.get("seeders", 0) or 1) <= 5)
+                ref_n = sum(1 for s in cur_seeds if (s.get("seeders", 0) or 1) <= 5)
+                if ref_a > 0:
+                    ref_b = beans_per_hour(ref_a, ref_n, b0=29.0)
+                    for s in seeds:
+                        n = s.get("seeders", 0) or 1
+                        if n > 5:
+                            s["daily_pt"] = s["daily_bean"] = 0.0
+                            s["pt_per_gb"] = 0.0
+                            continue
+                        a = seed_a_factor(n, s.get("size", 0), s.get("pub_weeks", 4.0), n)
+                        bm, pm = multiplier(n)
+                        s["daily_bean"] = ref_b * (a / ref_a) * bm * HOURS
+                        s["daily_pt"] = ref_b * (a / ref_a) * pm * HOURS
+                        s["pt_per_gb"] = s["daily_pt"] / max(s.get("size", 0.1), 0.1)
+            except Exception as e:
+                logs.append(f"候选种子按当前集合归一跳过：{e}")
         logs.append(f"当前保种：{current.get('count', 0)} 个，预计每日积分 {current_pt:.1f}，体积 {current_gb:.1f} GB")
 
         # 2.4 v0.33：自动清理超时未完成的下载任务（本站相关：tracker匹配/本站标签/保种区种子名三重识别）。
@@ -1302,6 +1458,118 @@ class HHClubButler(_PluginBase):
                 return self._cookie
         return self._cookie or ""
 
+    def _recompute_daily(self, seeds: list):
+        """v1.2.2: 按 A 份额模型重算每颗种子的日憨豆/积分贡献（两遍计算，自洽于卡片总量）。
+
+        公式: A总 = Σ (1-10^(-T/8))×S×(1+2×10^(-(N-1)/9))  (N=初始保种人数, T=发布时间周数)
+              B总 = 0.02×min(N,500) + 29×(2/π)×arctan(A总/300-5) + 20
+              单种子日贡献 = B总 × (aᵢ/A总) × 档位倍率 × 18h
+        """
+        if not seeds:
+            return
+        total_a = 0.0
+        total_n = 0
+        for s in seeds:
+            n = s.get("seeders", 0) or 1
+            if n > 5:
+                continue
+            n_now = s.get("seeders_now", 0) or n
+            total_a += seed_a_factor(n, s.get("size", 0), s.get("pub_weeks", 4.0), n_now)
+            total_n += 1
+        if total_a <= 0 or total_n <= 0:
+            return
+        # v1.2.3: 憨豆/积分 B0 分离（4天结算真值反推，保种区A口径）：憨豆 31.5、积分 30.5
+        # wiki 标注"保种区B0为25"，但数学上 B0=25 最大 B=0.02N+25+20=47.5/h 达不到实结，已证伪
+        b_total_bean = beans_per_hour(total_a, total_n, b0=31.5)
+        b_total_pt = beans_per_hour(total_a, total_n, b0=30.5)
+        for s in seeds:
+            n = s.get("seeders", 0) or 1
+            if n > 5:
+                s["daily_pt"] = 0.0
+                s["daily_bean"] = 0.0
+                s["pt_per_gb"] = 0.0
+                continue
+            n_now = s.get("seeders_now", 0) or n
+            a = seed_a_factor(n, s.get("size", 0), s.get("pub_weeks", 4.0), n_now)
+            bm, pm = multiplier(n)
+            s["daily_bean"] = b_total_bean * (a / total_a) * bm * HOURS
+            s["daily_pt"] = b_total_pt * (a / total_a) * pm * HOURS
+            s["pt_per_gb"] = s["daily_pt"] / max(s.get("size", 0.1), 0.1)
+        # v1.3.0: 保种区额外积分上限 1800（用户实证），超出按比例缩放
+        _pt_sum = sum(s.get("daily_pt", 0.0) for s in seeds)
+        if _pt_sum > 1800:
+            _ratio = 1800.0 / _pt_sum
+            for s in seeds:
+                s["daily_pt"] = s.get("daily_pt", 0.0) * _ratio
+                s["pt_per_gb"] = s["daily_pt"] / max(s.get("size", 0.1), 0.1)
+
+    def _save_pubtime_cache(self):
+        """持久化发布时间缓存（位置参数，跟网友插件一致）"""
+        try:
+            self.save_data("pubtime_cache", self._pubtime_cache)
+        except Exception:
+            pass
+
+    def _batch_resolve_pubtime(self, seeds: list, logs: list):
+        """批量补全种子发布时间：有缓存直接用，没缓存的并发请求 details.php"""
+        if not seeds:
+            return
+        missing = [s for s in seeds if s.get("seed_id")]
+        if not missing:
+            return
+        # 先查缓存
+        need_fetch = []
+        for s in missing:
+            key = str(s["seed_id"])
+            cached = self._pubtime_cache.get(key)
+            if cached:
+                try:
+                    dt = datetime.strptime(str(cached).strip(), "%Y-%m-%d %H:%M:%S")
+                    s["pub_weeks"] = max(0.0, (datetime.now() - dt).total_seconds() / 604800.0)
+                    s["pub_dt"] = str(cached)
+                    continue
+                except Exception:
+                    pass
+            need_fetch.append(s)
+        if not need_fetch:
+            return
+        # 并发请求详情页（最多5个并发）
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        def fetch_one(s):
+            sid = s["seed_id"]
+            try:
+                session = self._session()
+                url = f"{self._get_site_url()}/details.php?id={sid}"
+                r = session.get(url, timeout=8)
+                m = re.search(r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})', r.text)
+                if m:
+                    return sid, m.group(1)
+            except Exception:
+                pass
+            return sid, None
+        logger.info(f"发布时间补全开始：{len(need_fetch)} 颗种子待拉详情页（10并发）")
+        done = 0
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            futures = {ex.submit(fetch_one, s): s for s in need_fetch}
+            for fut in as_completed(futures):
+                sid, pub_str = fut.result()
+                done += 1
+                if done % 20 == 0:
+                    logger.info(f"发布时间补全进度：{done}/{len(need_fetch)}")
+                if pub_str:
+                    self._pubtime_cache[str(sid)] = pub_str
+                    # 每补全20个就存一次，防止中断丢失
+                    if done % 20 == 0:
+                        self._save_pubtime_cache()
+                    dt = datetime.strptime(pub_str, "%Y-%m-%d %H:%M:%S")
+                    w = max(0.0, (datetime.now() - dt).total_seconds() / 604800.0)
+                    for s in need_fetch:
+                        if s["seed_id"] == sid:
+                            s["pub_weeks"] = w
+                            s["pub_dt"] = pub_str
+        self._save_pubtime_cache()
+        logs.append(f"发布时间缓存补全完成：{len(self._pubtime_cache)} 颗种子")
+
     def _get_site_url(self) -> str:
         """获取站点地址：优先MP站点管理，其次配置页"""
         url = self._site_url
@@ -1408,6 +1676,14 @@ class HHClubButler(_PluginBase):
                 logs.append(f"保种区第{page + 1}页获取失败：{e}")
                 break
             time.sleep(0.5)
+        # v1.2.1: 候选区种子补全发布时间（缓存/详情页）
+        if seeds:
+            try:
+                self._batch_resolve_pubtime(seeds, logs)
+            except Exception as e:
+                logs.append(f"候选区发布时间补全跳过：{e}")
+        # v1.2.2: 按 A 份额模型重算单种子日贡献（旧 arctan 单种子公式对普通体积全为0）
+        self._recompute_daily(seeds)
         return seeds
 
     def _parse_rescue_page(self, html: str) -> Tuple[List[dict], int]:
@@ -1469,16 +1745,34 @@ class HHClubButler(_PluginBase):
         bean_mul, pt_mul = multiplier(seeders)
         if pt_mul <= 0:
             return None
+        # v1.2.1: 解析发布时间（torrent-info-text-adde 的 title 属性）
+        pub_dt = None
+        adde_el = row.select_one(".torrent-info-text-adde span[title]") or row.select_one(".torrent-info-text-adde")
+        if adde_el:
+            pub_str = adde_el.get("title") or adde_el.get_text(strip=True)
+            try:
+                pub_dt = datetime.strptime(pub_str.strip(), "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                pub_dt = None
+        pub_weeks = max(0.0, (datetime.now() - pub_dt).total_seconds() / 604800.0) if pub_dt else 4.0
+        # v1.2.1: 种子ID 从 details.php?id=xxx 提取
+        seed_id = None
+        m_id = re.search(r'details\.php\?id=(\d+)', str(a_title.get("href") if a_title else ""))
+        if m_id:
+            seed_id = int(m_id.group(1))
         return {
             "title": title,
             "href": href,
             "size": size,
             "seeders": seeders,
+            "seed_id": seed_id,
+            "pub_dt": pub_dt.isoformat() if pub_dt else None,
+            "pub_weeks": pub_weeks,
             "bean_mul": bean_mul,
             "pt_mul": pt_mul,
-            "daily_pt": C_PT * size * HOURS * pt_mul,
-            "daily_bean": C_BEAN * size * HOURS * bean_mul,
-            "pt_per_gb": C_PT * HOURS * pt_mul,
+            "daily_pt": seed_daily_pt(seeders, size, pub_weeks),
+            "daily_bean": seed_daily_bean(seeders, size, pub_weeks),
+            "pt_per_gb": seed_daily_pt(seeders, size, 4.0) / max(size, 0.1),
         }
 
     def _get_current_seeding(self, logs: list) -> dict:
@@ -1518,8 +1812,11 @@ class HHClubButler(_PluginBase):
                 matched_dl.add(dn)
                 matched_map.setdefault(hit["title"], hit)
         matched = list(matched_map.values())
+        # v1.2.2: 对交集集合重算 A 份额日贡献（与卡片总量 rescue_total_pt 完全自洽）
+        self._recompute_daily(matched)
         result["count"] = len(matched)
         result["total_pt"] = sum(c["daily_pt"] for c in matched)
+        result["total_bean"] = sum(c["daily_bean"] for c in matched)
         result["total_gb"] = sum(c["size"] for c in matched)
         result["seeds"] = matched
         logs.append(f"完成页 {len(completed)} 个 ∩ 下载器做种 {len(dl_names)} 个 = 当前保种 {len(matched)} 个")
@@ -1556,14 +1853,16 @@ class HHClubButler(_PluginBase):
                 key = "4-5人"
             dist[key]["count"] += 1
             dist[key]["gb"] += s.get("size", 0.0)
-            total_bean += s.get("daily_bean", 0.0)
         total_gb = cur.get("total_gb", 0.0)
+        # v1.2.1: 总量用 B 公式汇总（只调一次，含 +20 和 0.02×N）
+        total_bean = rescue_total_beans(seeds) * HOURS
+        total_pt = rescue_total_pt(seeds) * HOURS
         return {
             "count": cur.get("count", 0),
             "total_gb": total_gb,
             "total_tb": total_gb / 1024.0,
             "total_bean": total_bean,
-            "total_pt": cur.get("total_pt", 0.0),
+            "total_pt": total_pt,
             "dist": dist,
             "ok": not cur.get("error") and not cur.get("degraded"),
         }
@@ -1588,14 +1887,16 @@ class HHClubButler(_PluginBase):
                 key = "4-5人"
             dist[key]["count"] += 1
             dist[key]["gb"] += s.get("size", 0.0)
-            total_bean += s.get("daily_bean", 0.0)
         total_gb = cur.get("total_gb", 0.0)
+        # v1.2.1: 总量用 B 公式汇总（只调一次，含 +20 和 0.02×N）
+        total_bean = rescue_total_beans(seeds) * HOURS
+        total_pt = rescue_total_pt(seeds) * HOURS
         return {
             "count": cur.get("count", 0),
             "total_gb": total_gb,
             "total_tb": total_gb / 1024.0,
             "total_bean": total_bean,
-            "total_pt": cur.get("total_pt", 0.0),
+            "total_pt": total_pt,
             "dist": dist,
             "ok": not cur.get("error") and not cur.get("degraded"),
         }
@@ -1640,6 +1941,14 @@ class HHClubButler(_PluginBase):
                 logs.append(f"完成页第{page + 1}页获取失败：{e}")
                 break
             time.sleep(0.5)
+        # v1.2.1: 完成页种子补全发布时间（缓存/详情页）
+        if items:
+            try:
+                self._batch_resolve_pubtime(items, logs)
+            except Exception as e:
+                logs.append(f"完成页发布时间补全跳过：{e}")
+        # v1.2.2: 按 A 份额模型重算单种子日贡献
+        self._recompute_daily(items)
         return items
 
     @staticmethod
@@ -1676,11 +1985,14 @@ class HHClubButler(_PluginBase):
         headers = [th.get_text(strip=True) for th in header_tr.find_all(["th", "td"])] if header_tr else []
         idx_size = 2
         idx_n = 3
+        idx_now = 4
         for i, h in enumerate(headers):
             if "大小" in h:
                 idx_size = i
             if "初始保种" in h:
                 idx_n = i
+            if "现在保种" in h:
+                idx_now = i
         # 数据行
         for tr in table.select("tr.text-center"):
             tds = tr.find_all("td")
@@ -1694,20 +2006,38 @@ class HHClubButler(_PluginBase):
                 n = int(n_str)
             except ValueError:
                 n = 1
+            # v1.3.0: 解析"现在保种人数"（A公式人数因子用当前人数）
+            n_now = n
+            try:
+                n_now = int(tds[idx_now].get_text(strip=True))
+            except ValueError:
+                pass
             if not size:
                 continue
             bean_mul, pt_mul = multiplier(n)
             if pt_mul <= 0:
                 continue
+            # v1.2.1: 种子ID 从第一列 td 提取
+            seed_id = None
+            try:
+                sid_txt = tds[0].get_text(strip=True)
+                seed_id = int(sid_txt) if sid_txt.isdigit() else None
+            except Exception:
+                pass
+            # v1.2.1: 完成页无发布时间，先用默认 4 周（后续从缓存补）
+            pub_weeks = 4.0
             items.append({
                 "title": title,
                 "size": size,
                 "seeders": n,
+                "seeders_now": n_now,
+                "seed_id": seed_id,
+                "pub_weeks": pub_weeks,
                 "bean_mul": bean_mul,
                 "pt_mul": pt_mul,
-                "daily_pt": C_PT * size * HOURS * pt_mul,
-                "daily_bean": C_BEAN * size * HOURS * bean_mul,
-                "pt_per_gb": C_PT * HOURS * pt_mul,
+                "daily_pt": seed_daily_pt(n, size, pub_weeks),
+                "daily_bean": seed_daily_bean(n, size, pub_weeks),
+                "pt_per_gb": seed_daily_pt(n, size, 4.0) / max(size, 0.1),
             })
         return items, max_page
 
@@ -2353,7 +2683,8 @@ class HHClubButler(_PluginBase):
 
     @staticmethod
     def _tier(seeders) -> int:
-        """倍率档位：0=0-1人(最高倍率), 1=2-3人, 2=4-5人(最低倍率)"""
+        """倍率档位（换种按体积模式的填充顺序，非准确性逻辑）：
+        0=0-1人(3倍), 1=2-3人(2倍), 2=4-5人(v1.2.2实测≈4倍，为最高倍率但保留原档序)"""
         if seeders <= 1:
             return 0
         if seeders <= 3:
