@@ -216,7 +216,7 @@ class HHClubDetailExporter(_PluginBase):
     plugin_name = "憨憨保种区明细导出"
     plugin_desc = "每天定时（默认23:55）导出憨憨站保种区保种明细为Excel，用于公式验证与数据积累。"
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubdetail/icon.png"
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "hhclubdetail_"
@@ -562,6 +562,22 @@ class HHClubDetailExporter(_PluginBase):
         """onlyonce 后台线程入口"""
         self.run()
 
+    def _session_get_retry(self, session: requests.Session, url: str,
+                           timeout: int = 30, tries: int = 3, delay: int = 5) -> requests.Response:
+        """带重试的 GET：憨憨站偶发读超时，失败自动重试，提高导出成功率"""
+        last_exc: Optional[Exception] = None
+        for i in range(tries):
+            try:
+                r = session.get(url, timeout=timeout)
+                r.raise_for_status()
+                return r
+            except Exception as e:
+                last_exc = e
+                logger.warning(f"hhclubdetail - 请求失败（第{i + 1}/{tries}次）：{url} - {e}")
+                if i < tries - 1:
+                    time.sleep(delay)
+        raise last_exc  # type: ignore[misc]
+
     def _export_once(self) -> str:
         try:
             uid = self._get_site_uid()
@@ -573,7 +589,7 @@ class HHClubDetailExporter(_PluginBase):
             site_url = self._get_site_url()
             # 先抓第一页，从分页链接确定总页数（不写死页数，种子增多自动跟随）
             first_url = f"{site_url}/userdetails.php?id={uid}&action=7"
-            r = session.get(first_url, timeout=30)
+            r = self._session_get_retry(session, first_url)
             r.raise_for_status()
             rows, summary = parse_action7(r.text)
             if not rows:
@@ -585,7 +601,7 @@ class HHClubDetailExporter(_PluginBase):
             # 安全上限 100 页（约 5000 颗），防分页解析异常导致死循环
             while page <= max_page and page < 100:
                 url = f"{first_url}&page={page}"
-                r = session.get(url, timeout=30)
+                r = self._session_get_retry(session, url)
                 r.raise_for_status()
                 rows, _ = parse_action7(r.text)
                 if not rows:
