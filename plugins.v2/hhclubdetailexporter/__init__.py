@@ -545,7 +545,7 @@ class HHClubDetailExporter(_PluginBase):
     # ============================================================
     def _get_mp_site(self):
         try:
-            from app.modules.site.oper import SiteOper
+            from app.db.site_oper import SiteOper
             site_oper = SiteOper()
             for site in site_oper.list_active():
                 url = site.url or ""
