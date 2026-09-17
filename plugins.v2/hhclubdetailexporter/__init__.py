@@ -216,7 +216,7 @@ class HHClubDetailExporter(_PluginBase):
     plugin_name = "憨憨保种区明细导出"
     plugin_desc = "每天定时（默认23:55）导出憨憨站保种区保种明细为Excel，用于公式验证与数据积累。"
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubdetail/icon.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "hhclubdetail_"
@@ -380,6 +380,39 @@ class HHClubDetailExporter(_PluginBase):
                         ]
                     },
                     {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'uid',
+                                            'label': '站点UID（可选）',
+                                            'placeholder': '14332（留空则访问站点主页自动获取）'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'cookie',
+                                            'label': 'Cookie（可选）',
+                                            'placeholder': '留空则自动从MP站点管理获取憨憨站Cookie'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
                         'component': 'VAlert',
                         'props': {'type': 'info', 'variant': 'tonal',
                                   'text': '导出文件保存到插件数据目录，页面底部可见文件列表与完整路径。'
@@ -393,6 +426,8 @@ class HHClubDetailExporter(_PluginBase):
             "cron": self._cron,
             "retain_days": self._retain_days,
             "notify": self._notify,
+            "uid": self._uid or "",
+            "cookie": self._cookie or "",
         }
 
     def get_page(self) -> List[dict]:
@@ -578,14 +613,14 @@ class HHClubDetailExporter(_PluginBase):
         try:
             session = self._session()
             url = self._get_site_url()
-            r = session.get(url, timeout=15)
+            r = session.get(url, timeout=30)
             m = re.search(r"userdetails\.php\?id=(\d+)", r.text)
             if m:
                 self._uid = m.group(1)
                 logger.info(f"hhclubdetail - 已从站点主页自动获取UID：{self._uid}")
                 return self._uid
         except Exception as e:
-            logger.error(f"自动获取站点UID失败：{e}")
+            logger.error(f"自动获取站点UID失败：{e}（如站点主页访问超时，请在插件配置中直接填写UID，如14332）")
         return None
 
     def _session(self) -> requests.Session:
