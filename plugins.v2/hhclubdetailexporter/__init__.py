@@ -216,7 +216,7 @@ class HHClubDetailExporter(_PluginBase):
     plugin_name = "憨憨保种区明细导出"
     plugin_desc = "每天定时（默认23:55）导出憨憨站保种区保种明细为Excel，用于公式验证与数据积累。"
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubdetail/icon.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "hhclubdetail_"
@@ -430,60 +430,121 @@ class HHClubDetailExporter(_PluginBase):
             "cookie": self._cookie or "",
         }
 
+    def get_api(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "path": "/delete_file",
+                "endpoint": self._delete_file,
+                "methods": ["GET"],
+                "summary": "删除指定导出文件",
+                "description": "按文件名删除插件数据目录下的导出文件（仅限 .xlsx）",
+            }
+        ]
+
+    def _delete_file(self, name: str = "") -> Dict[str, Any]:
+        """删除指定导出文件（防路径穿越：仅允许数据目录下的 .xlsx）"""
+        try:
+            if not name or not name.strip():
+                return {"success": False, "message": "缺少文件名"}
+            data_path = self.get_data_path().resolve()
+            target = (data_path / name.strip()).resolve()
+            if target.parent != data_path or target.suffix.lower() != ".xlsx":
+                return {"success": False, "message": "文件名无效"}
+            if target.exists():
+                target.unlink()
+                logger.info(f"hhclubdetail - 已手动删除导出文件：{name}")
+                return {"success": True, "message": f"已删除 {name}"}
+            return {"success": False, "message": "文件不存在"}
+        except Exception as e:
+            logger.error(f"hhclubdetail - 删除文件失败：{e}")
+            return {"success": False, "message": str(e)}
+
     def get_page(self) -> List[dict]:
         files = []
         try:
             files = sorted(self.get_data_path().glob("*.xlsx"), reverse=True)[:20]
         except Exception:
             pass
-        rows_html = ""
+        rows = []
         if files:
             for p in files:
                 mtime = datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
                 size_kb = p.stat().st_size / 1024
-                rows_html += f"<tr><td>{p.name}</td><td style='text-align:right'>{size_kb:.0f} KB</td>" \
-                             f"<td style='text-align:center'>{mtime}</td></tr>"
+                rows.append({
+                    "component": "tr",
+                    "content": [
+                        {"component": "td", "text": p.name},
+                        {"component": "td", "text": f"{size_kb:.0f} KB"},
+                        {"component": "td", "text": mtime},
+                        {
+                            "component": "td",
+                            "content": [{
+                                "component": "VBtn",
+                                "props": {"color": "error", "variant": "outlined", "size": "x-small"},
+                                "text": "删除",
+                                "events": {
+                                    "click": {
+                                        "api": "plugin/HHClubDetailExporter/delete_file",
+                                        "method": "get",
+                                        "params": {"name": p.name},
+                                    }
+                                },
+                            }]
+                        },
+                    ],
+                })
         else:
-            rows_html = '<tr><td colspan="3" style="color:#999;text-align:center">暂无导出文件（' \
-                        '每天 ' + self._cron + ' 自动导出，或点左上角「立即运行一次」/ 插件命令手动导出）</td></tr>'
+            rows.append({
+                "component": "tr",
+                "content": [{
+                    "component": "td",
+                    "text": f"暂无导出文件（每天 {self._cron} 自动导出，或勾选「立即运行一次」手动导出）",
+                    "props": {"colspan": 4, "class": "text-center"},
+                }]
+            })
         return [
             {
-                'component': 'VCard',
-                'props': {'flat': True},
-                'content': [
+                "component": "div",
+                "props": {"class": "pa-2"},
+                "content": [
                     {
-                        'component': 'VCardText',
-                        'props': {},
-                        'content': [
+                        "component": "p",
+                        "props": {"class": "text-caption mb-1"},
+                        "text": f"保存目录：{self.get_data_path()}",
+                    },
+                    {
+                        "component": "p",
+                        "props": {"class": "text-caption mb-1"},
+                        "text": f"定时：{self._cron}（23:55 = 0 点结算前的当天最后状态）  保留最近 {self._retain_days} 天",
+                    },
+                    {
+                        "component": "p",
+                        "props": {"class": "text-caption mb-1"},
+                        "text": f"最近运行状态：{self._last_result}",
+                    },
+                ],
+            },
+            {
+                "component": "VTable",
+                "props": {"hover": True},
+                "content": [
+                    {
+                        "component": "thead",
+                        "content": [
                             {
-                                'component': 'div',
-                                'html': f"<div style='font-size:12px;color:#666;margin-bottom:6px'>"
-                                        f"保存目录：<code>{self.get_data_path()}</code></div>"
-                            },
-                            {
-                                'component': 'div',
-                                'html': f"<div style='font-size:12px;color:#666;margin-bottom:6px'>"
-                                        f"定时：{self._cron}（23:55 = 0 点结算前的当天最后状态）；"
-                                        f"保留最近 {self._retain_days} 天</div>"
-                            },
-                            {
-                                'component': 'div',
-                                'html': "<table style='width:100%;font-size:12px;border-collapse:collapse'>"
-                                        "<tr style='background:rgba(127,127,127,.12)'>"
-                                        "<th style='padding:6px;text-align:left'>文件名</th>"
-                                        "<th style='padding:6px;text-align:right'>大小</th>"
-                                        "<th style='padding:6px;text-align:center'>导出时间</th></tr>"
-                                        + rows_html + "</table>"
-                            },
-                            {
-                                'component': 'VAlert',
-                                'props': {'type': 'info', 'variant': 'tonal',
-                                          'text': f"最近运行状态：{self._last_result}"}
+                                "component": "tr",
+                                "content": [
+                                    {"component": "th", "text": "文件名"},
+                                    {"component": "th", "text": "大小"},
+                                    {"component": "th", "text": "导出时间"},
+                                    {"component": "th", "text": "操作"},
+                                ],
                             }
-                        ]
-                    }
-                ]
-            }
+                        ],
+                    },
+                    {"component": "tbody", "content": rows},
+                ],
+            },
         ]
 
     def stop_service(self):
