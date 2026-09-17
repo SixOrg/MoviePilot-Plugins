@@ -1,35 +1,32 @@
 {
-  "HHClubButler": {
-    "name": "憨憨保种区管家",
-    "description": "自动化优选添加及换种工具",
-    "labels": "保种,优选,憨憨,管家",
-    "version": "1.3",
-    "icon": "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png",
-    "author": "六个橙子",
-    "author_url": "https://github.com/SixOrg",
-    "level": 1,
-    "v3": true,
-    "release": true,
-    "history": {
-      "1.3": "【2026-09-17】公式按wiki原文逐字核对+结算真值回归定稿（憨豆/积分误差≤0.4%）：①人数因子用wiki原文2.0，A作用域=保种区达标池，Ni=当前做种人数(now)，档位倍率=下载时人数(init)；②倍率表回归wiki原文（憨豆1人3倍/2-3人2倍/4-5人1.5倍，积分2/1.75/1.5）；③B0按4天结算真值反推：憨豆31.5、积分30.5（wiki标注保种区25已被数学证伪：B0=25时B上限47.5/h、日上限≈1730，达不到实结1863）；④做种积分上限1800（用户实证）；⑤修复积分预估虚高：rescue_total_pt 漏传当前做种人数(n_now)，人数因子误用初始人数导致A虚高；⑥验证：9/12→1829/1564、9/13→1835/1568、9/15→1865/1594、9/16→1863/1593，误差-0.03%~+0.40%",
-      "1.2": "【2026-09-14】修复：cookie 只读取一次并缓存，不再每个推送种子都重复读MP站点配置、重复打日志；一次运行只输出一行Cookie日志",
-      "1.1": "【2026-09-14】①概况卡片删除后实时扣减：wash 换种删除种子后自动从快照扣掉数量/积分/体积/做种分布，零新增网络请求；②wash 换种模式不再因当前+在途已达标而提前结束，允许在已达标情况下继续删低补高（增量模式仍维持已达标即停）",
-      "1.0": "【2026-09-11】正式版发布：①自动清理未完成下载提前执行，启用后无论是否达标都会清理超时任务；②概况显示修复——完成页与下载器交集为空时按真实 0 个显示，刷新失败日志留痕；③在途种子归一化反查，杜绝重复推送与过度推送；④换种优选跨档升级（同档位不替换）、保证达标且尽量使用高倍率种子；⑤兼容 QB/TR 双下载器；⑥概况每 6 小时自动刷新 + 手动立即刷新，仪表盘卡片展示"
+    "HHClubButler": {
+          "name": "憨憨保种区管家",
+          "description": "自动化优选添加及换种工具",
+          "labels": "保种,优选,憨憨,管家",
+          "version": "1.30",
+          "icon": "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png",
+          "author": "六个橙子",
+          "author_url": "https://github.com/SixOrg",
+          "level": 1,
+          "v3": true,
+          "release": true,
+          "history": {
+                  "1.2": "【2026-09-14】修复：cookie 只读取一次并缓存，不再每个推送种子都重复读MP站点配置、重复打日志；一次运行只输出一行Cookie日志",
+                  "1.1": "【2026-09-14】①概况卡片删除后实时扣减：wash 换种删除种子后自动从快照扣掉数量/积分/体积/做种分布，零新增网络请求；②wash 换种模式不再因当前+在途已达标而提前结束，允许在已达标情况下继续删低补高（增量模式仍维持已达标即停）",
+                  "1.0": "【2026-09-11】正式版发布：①自动清理未完成下载提前执行，启用后无论是否达标都会清理超时任务；②概况显示修复——完成页与下载器交集为空时按真实 0 个显示，刷新失败日志留痕；③在途种子归一化反查，杜绝重复推送与过度推送；④换种优选跨档升级（同档位不替换）、保证达标且尽量使用高倍率种子；⑤兼容 QB/TR 双下载器；⑥概况每 6 小时自动刷新 + 手动立即刷新，仪表盘卡片展示"
+          }
+    },
+    "HHClubDetailExporter": {
+          "name": "憨憨保种区明细导出",
+          "description": "每天定时（默认23:55）导出憨憨站『完成的保种区种子』全部明细为Excel，用于公式验证与数据积累。23:55抓取的是0点结算前的当天最后状态。",
+          "labels": "保种,明细,导出,憨憨,验证",
+          "version": "1.0",
+          "icon": "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png",
+          "author": "六个橙子",
+          "author_url": "https://github.com/SixOrg",
+          "level": 1,
+          "v3": true,
+          "release": true,
+          "history": {}
     }
-  },
-  "HHClubDetailExporter": {
-    "name": "憨憨保种区明细导出",
-    "description": "每天定时（默认23:55）导出憨憨站『完成的保种区种子』全部明细为Excel，用于公式验证与数据积累。23:55抓取的是0点结算前的当天最后状态。",
-    "labels": "保种,明细,导出,憨憨,验证",
-    "version": "1.0",
-    "icon": "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png",
-    "author": "六个橙子",
-    "author_url": "https://github.com/SixOrg",
-    "level": 1,
-    "v3": true,
-    "release": true,
-    "history": {
-      "1.0": "【2026-09-17】全新发布：每天23:55（0点结算前的最后状态）自动抓取『个人页面-完成的保种区种子』全部分页（页数自动解析，种子增多不限页数）导出明细（MP环境无openpyxl时自动降级写.csv），文件名带时间戳不覆盖同日多次运行；插件页面文件列表显示文件名/大小/导出时间，支持逐行删除（API鉴权apikey、返回体符合MP统一envelope）；『立即运行一次』触发后自动复位开关；站点Cookie从MP站点管理自动获取，UID可自动获取或手动配置"
-    }
-  }
 }
