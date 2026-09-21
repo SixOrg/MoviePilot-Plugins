@@ -1,30 +1,15 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 HHCLUB 憨憨保种区管家插件（MoviePilot V2）
-=================================================
-功能：
-1. 定时/手动抓取憨憨保种区全部种子（rescue.php 全页）
-2. 按目标积分（默认1800）用 DP 背包算法优选：占用最少保种体积达到目标每日积分
-3. 支持按体积模式：保种体积固定时积分最大化
-4. 支持择优换种：自动删除低效率已保种种子、下载高效率候选种子
-5. 一键推送到 MoviePilot 已配置的 QB/TR 下载器，保存路径自定义
-6. 数据页展示最近一次优选结果与今日保种概况
-
-公式（v1.2.4：wiki 基础公式逐字核对 + 4天结算真值回归，误差≤0.4%）：
-    Aᵢ = (1-10^(-Tᵢ/8)) × Sᵢ(GB) × (1+2×10^(-(Nᵢ-1)/9))，Nᵢ=当前做种人数(now)
-    B = 0.02×min(种子数,500) + B₀×(2/π)×arctan(ΣA/300-5) + 20
-    B₀：憨豆 31.5、积分 30.5（保种区A口径4天反推；wiki 标注 25 已数学证伪，
-        B0=25 时 B 上限 47.5/h，任何A/N组合都达不到实结 51.1/h）
-    档位倍率按下载时人数(init)：憨豆 1人×3 / 2-3人×2 / 4-5人×1.5（wiki 原文）
-                              积分 1人×2 / 2-3人×1.75 / 4-5人×1.5（wiki 原文）
-    A 作用域 = 保种区达标池（全站A口径因 atan 饱和对结算变化不敏感，已证伪）
-    每日憨豆 = B(31.5) × Σ(aᵢ×倍率ᵢ)/A总 × 18h；积分同构(B0=30.5)，上限1800
-    结算集合 = 保种区保种详情(action=7)中"今日达标"的种子（每天0点结算）
+v1.4：
+1. 移除全部积分/憨豆预估与公式，只保留目标体积模式
+2. 优选逻辑：高倍率档优先（0-1人 > 2-3人 > 4-5人）
+3. 面板"达标可得"改为"上次憨豆/上次积分"（rescuesettleinfo 实结值）
+4. 新增仿QB风格保种管理页：列出在保种子，支持手动删除（同步删下载器任务+文件）
 """
 
 import re
 import time
-import math
 import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -32,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from bs4 import BeautifulSoup
 
 from app.core.config import settings
 from app.db.site_oper import SiteOper
@@ -39,156 +25,14 @@ from app.helper.downloader import DownloaderHelper
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas.types import NotificationType
+from fastapi.responses import HTMLResponse
 
 import requests
-from bs4 import BeautifulSoup
 
 lock = threading.Lock()
 
-# ============================================================
-# 公式常量（用户结算日志+Excel校准，勿改）
-# ============================================================
-HOURS = 18          # 保种区每日按18小时计
-
-# 憨豆倍率表（按初始保种人数，wiki: 1人3倍/2-3人2倍/4-5人1.5倍）
-# v1.2.2: 档4-5人实测结算系数≈4.0（9/4、9/5、9/8三日含4-5人种子结算反推；
-#          wiki 标注1.5倍与结算数据不符，保种区试运行中，以实测为准）
-BEAN_MUL = {1: 3.0, 2: 2.0, 3: 2.0, 4: 1.5, 5: 1.5}  # wiki 保种区规则原文（档位按下载时人数）
-# 积分倍率表
-PT_MUL = {1: 2.0, 2: 1.75, 3: 1.75, 4: 1.5, 5: 1.5}  # wiki 保种区规则原文（档位按下载时人数）
-
-
-def multiplier(n: Optional[int]) -> Tuple[float, float]:
-    """按初始保种人数取倍率，返回(憨豆倍率, 积分倍率)；0人按1人档；>5人无奖励"""
-    if not n or n <= 0:
-        n = 1
-    if n > 5:
-        return 0.0, 0.0
-    return BEAN_MUL.get(n, 1.5), PT_MUL.get(n, 1.5)
-
-
-# ============================================================
-# v1.2.1: wiki 真实积分公式
-# Aᵢ = (1 - 10^(-Tᵢ/8)) × Sᵢ × (1 + 2×10^(-(Nᵢ-1)/9))
-# B  = 0.02×min(N,500) + B₀×(2/π)×arctan(A/300-5) + 20
-# B₀=20 普通区，保种区按档位倍率另乘
-# ============================================================
-def seed_a_factor(seeders: int, size_gb: float, pub_weeks: float, n_now: Optional[int] = None) -> float:
-    """计算单颗种子的 Aᵢ 贡献值（wiki 基础公式）。
-    seeders: 初始保种人数 Nᵢ（档位倍率用）
-    n_now: 当前保种人数（A公式人数因子用；保种区实测用当前人数，缺省回退 seeders）
-    size_gb: 种子大小 GB
-    pub_weeks: 种子发布到现在的周数 Tᵢ
-    公式: Aᵢ = (1 - 10^(-T/8)) × S × (1 + √2×10^(-(N-1)/9))
-    """
-    if not seeders or seeders <= 0:
-        seeders = 1
-    n = n_now if n_now and n_now > 0 else seeders
-    # 时间因子 (1 - 10^(-T/8))
-    t_factor = 1.0 - (10.0 ** (-pub_weeks / 8.0)) if pub_weeks > 0 else 0.0
-    # 人数因子 (1 + 2×10^(-(N-1)/9))；wiki 原文人数因子为 2（2026-09-17 逐字核对）
-    n_factor = 1.0 + 2.0 * (10.0 ** (-float(n - 1) / 9.0))
-    return t_factor * size_gb * n_factor
-
-
-def beans_per_hour(total_a: float, seeding_count: int, b0: float = 20.0) -> float:
-    """根据总 A 计算每小时憨豆（普通区 B₀=20）"""
-    n_bonus = 0.02 * min(seeding_count, 500)
-    arg = total_a / 300.0 - 5.0
-    main = b0 * (2.0 / math.pi) * math.atan(arg) + 20.0
-    return n_bonus + main
-
-
-def rescue_total_beans(seeds: list) -> float:
-    """v1.2.1: 保种区总憨豆/小时。所有种子汇总 A，B 公式只调一次（+20 和 0.02×N 不重复加），
-    再按各组 A 占比分配，乘档位倍率。"""
-    from collections import defaultdict
-    groups = defaultdict(lambda: {"a_sum": 0.0, "count": 0})
-    total_a = 0.0
-    total_count = 0
-    for s in seeds:
-        n = s.get("seeders", 0) or 1
-        if n > 5:
-            continue
-        n_now = s.get("seeders_now", 0) or n
-        a = seed_a_factor(n, s.get("size", 0), s.get("pub_weeks", 4.0), n_now)
-        groups[n]["a_sum"] += a
-        groups[n]["count"] += 1
-        total_a += a
-        total_count += 1
-    if total_a <= 0 or total_count <= 0:
-        return 0.0
-    # v1.2.3: B 公式只调一次（憨豆 B0=31.5，保种区A口径结算反推）
-    b_total = beans_per_hour(total_a, total_count, b0=31.5)
-    # 按各组 A 占比分配，乘档位倍率
-    result = 0.0
-    for n, g in groups.items():
-        bean_mul, _ = multiplier(n)
-        result += b_total * (g["a_sum"] / total_a) * bean_mul
-    return result
-
-
-def rescue_total_pt(seeds: list) -> float:
-    """v1.2.1: 保种区总做种积分/小时。同 beans，乘积分倍率。"""
-    from collections import defaultdict
-    groups = defaultdict(lambda: {"a_sum": 0.0, "count": 0})
-    total_a = 0.0
-    total_count = 0
-    for s in seeds:
-        n = s.get("seeders", 0) or 1
-        if n > 5:
-            continue
-        n_now = s.get("seeders_now", 0) or n
-        a = seed_a_factor(n, s.get("size", 0), s.get("pub_weeks", 4.0), n_now)
-        groups[n]["a_sum"] += a
-        groups[n]["count"] += 1
-        total_a += a
-        total_count += 1
-    if total_a <= 0 or total_count <= 0:
-        return 0.0
-    # v1.2.4: 积分 B0=30.5（结算反推，与憨豆分离）；人数因子用当前人数(now)，同憨豆侧
-    b_total = beans_per_hour(total_a, total_count, b0=30.5)
-    result = 0.0
-    for n, g in groups.items():
-        _, pt_mul = multiplier(n)
-        result += b_total * (g["a_sum"] / total_a) * pt_mul
-    return result
-
-
-def seed_daily_pt(seeders: int, size_gb: float, pub_weeks: float, n_now: Optional[int] = None) -> float:
-    """单颗种子每日积分（18h）：只算 arctan 部分，不含用户级 +20 和 0.02×N。
-    总量由 rescue_total_pt 汇总（B 公式只调一次）。"""
-    _, pt_mul = multiplier(seeders)
-    if pt_mul <= 0:
-        return 0.0
-    a = seed_a_factor(seeders, size_gb, pub_weeks, n_now)
-    if a <= 0:
-        return 0.0
-    # v1.2.2+: 单种子日贡献由 _recompute_daily 的 A 份额模型覆盖；此处为候选解析占位值。
-    arg = a / 300.0 - 5.0
-    marginal = 30.5 * (2.0 / math.pi) * math.atan(arg)
-    if marginal < 0:
-        marginal = 0.0
-    return marginal * pt_mul * HOURS
-
-
-def seed_daily_bean(seeders: int, size_gb: float, pub_weeks: float) -> float:
-    """单颗种子每日憨豆（18h）：只算 arctan 部分，不含用户级 +20 和 0.02×N。"""
-    bean_mul, _ = multiplier(seeders)
-    if bean_mul <= 0:
-        return 0.0
-    a = seed_a_factor(seeders, size_gb, pub_weeks)
-    if a <= 0:
-        return 0.0
-    arg = a / 300.0 - 5.0
-    marginal = 31.5 * (2.0 / math.pi) * math.atan(arg)
-    if marginal < 0:
-        marginal = 0.0
-    return marginal * bean_mul * HOURS
-
 
 def size_to_gb(text: str) -> Optional[float]:
-    """'44.23GB' / '1.5TB' / '800MB' -> GB"""
     m = re.search(r'([\d.]+)\s*(TB|GB|MB|KB)', text or '', re.I)
     if not m:
         return None
@@ -205,27 +49,36 @@ def size_to_gb(text: str) -> Optional[float]:
     return v
 
 
+def tier_of(seeders: Optional[int]) -> int:
+    n = seeders or 1
+    if n <= 1:
+        return 0
+    if n <= 3:
+        return 1
+    if n <= 5:
+        return 2
+    return 99
+
+
+TIER_NAMES = ("0-1人", "2-3人", "4-5人")
+TIER_BADGE = {
+    0: '<span style="display:inline-block;padding:1px 8px;border-radius:10px;background:#22c55e;color:#fff;font-size:11px;">0-1人 ×3.0</span>',
+    1: '<span style="display:inline-block;padding:1px 8px;border-radius:10px;background:#3b82f6;color:#fff;font-size:11px;">2-3人 ×2.0</span>',
+    2: '<span style="display:inline-block;padding:1px 8px;border-radius:10px;background:#ef4444;color:#fff;font-size:11px;">4-5人 ×1.5</span>',
+}
+
+
 class HHClubButler(_PluginBase):
-    # 插件名称
     plugin_name = "憨憨保种区管家"
-    # 插件描述
-    plugin_desc = "自动化优选添加及换种工具"
-    # 插件图标
+    plugin_desc = "按目标体积与档位自动优选添加及换种工具"
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
-    # 插件版本
-    plugin_version = "1.3"
-    # 插件作者
+    plugin_version = "2.0"
     plugin_author = "六个橙子"
-    # 作者主页
     author_url = "https://github.com/SixOrg"
-    # 插件配置项ID前缀
     plugin_config_prefix = "hhclubbutler_"
-    # 加载顺序
     plugin_order = 20
-    # 可使用的用户级别
     auth_level = 1
 
-    # 私有属性
     _enabled: bool = False
     _onlyonce: bool = False
     _notify: bool = False
@@ -234,8 +87,6 @@ class HHClubButler(_PluginBase):
     _site_url: str = ""
     _uid: str = ""
     _mode: str = "incremental"
-    _use_volume: bool = False
-    _target_pt: float = 1800
     _target_volume: float = 0
     _seeder_cond: str = ""
     _exclude_zero: bool = False
@@ -245,7 +96,6 @@ class HHClubButler(_PluginBase):
     _auto_clean_days: float = 0.0
     _scheduler = None
 
-    # 运行状态
     _running: bool = False
     _last_result: str = "尚未运行"
     _last_overview: dict = None
@@ -265,35 +115,13 @@ class HHClubButler(_PluginBase):
         self._site_url = (config.get("site_url") or "").rstrip("/")
         self._uid = config.get("uid") or ""
         self._mode = config.get("mode") or "incremental"
-        # 兼容旧配置：v1.0.27 起已移除“基础订阅”模式，自动回落到增量优选
-        if self._mode == "subscribe":
+        if self._mode not in ("incremental", "wash"):
             self._mode = "incremental"
-        _uv = config.get("use_volume")
-        if isinstance(_uv, str):
-            self._use_volume = _uv.strip().lower() in ("1", "true", "yes", "on")
-        else:
-            self._use_volume = bool(_uv)
         try:
-            raw_pt = float(config.get("target_pt") or 1800)
+            self._target_volume = float(config.get("target_volume") or 0)
         except (TypeError, ValueError):
-            raw_pt = 1800
-        # 站点积分上限1800硬性锁定：超过自动按1800，并回写配置纠正（输入框同步显示1800）
-        self._target_pt = min(1800.0, raw_pt)
-        if raw_pt > 1800:
-            try:
-                self._update_cfg(target_pt=1800)
-            except Exception:
-                pass
-        try:
-            self._target_volume = float(config.get("target_volume") or 2000)
-        except (TypeError, ValueError):
-            self._target_volume = 2000
-        # 做种人数条件：增量优选过滤用；兼容旧版“基础订阅”的 subscribe_n 配置
-        raw_cond = config.get("seeder_cond")
-        if raw_cond is None or str(raw_cond).strip() == "":
-            if config.get("subscribe_n") is not None:
-                raw_cond = str(config.get("subscribe_n"))
-        self._seeder_cond = str(raw_cond or "").strip()
+            self._target_volume = 0
+        self._seeder_cond = str(config.get("seeder_cond") or "").strip()
         self._exclude_zero = bool(config.get("exclude_zero"))
         self._downloader = config.get("downloader") or ""
         self._save_path = config.get("save_path") or ""
@@ -303,26 +131,11 @@ class HHClubButler(_PluginBase):
         except (TypeError, ValueError):
             self._auto_clean_days = 0
         self._auto_clean_days = max(0.0, min(365.0, self._auto_clean_days))
-        # 概况自动刷新：固定每 6 小时一次（距最近一次运行/定时更新计时），
-        # 后台线程静默抓取，不优选/不推送/不删除
         self._overview_hours = 6.0
-        # v1.2.1: 发布时间缓存 {seed_id: "YYYY-MM-DD HH:MM:SS"}（用 get_data/save_data 持久化）
-        try:
-            self._pubtime_cache = self.get_data("pubtime_cache") or {}
-        except Exception:
-            self._pubtime_cache = {}
-        if not isinstance(self._pubtime_cache, dict):
-            self._pubtime_cache = {}
         self._start_overview_thread()
 
-        # 配置生效日志：置于全部配置读取之后，按当前生效模式只显示对应目标值
-        # （积分模式不显示体积目标，体积模式不显示积分目标，避免混显误会）
-        if self._use_volume:
-            logger.info(f"憨憨保种区管家配置生效：启用={self._enabled} 通知={self._notify} "
-                        f"模式={self._mode} 目标体积={self._target_volume}")
-        else:
-            logger.info(f"憨憨保种区管家配置生效：启用={self._enabled} 通知={self._notify} "
-                        f"模式={self._mode} 目标积分={self._target_pt}")
+        logger.info(f"憨憨保种区管家配置生效：启用={self._enabled} 通知={self._notify} "
+                    f"模式={self._mode} 目标体积={self._target_volume:g} GB")
 
         if self._onlyonce:
             self._onlyonce = False
@@ -332,8 +145,6 @@ class HHClubButler(_PluginBase):
                 "notify": self._notify,
                 "cron": self._cron,
                 "mode": self._mode,
-                "use_volume": self._use_volume,
-                "target_pt": self._target_pt,
                 "target_volume": self._target_volume,
                 "seeder_cond": self._seeder_cond,
                 "exclude_zero": self._exclude_zero,
@@ -345,7 +156,6 @@ class HHClubButler(_PluginBase):
                 "tag": self._tag,
                 "auto_clean_days": self._auto_clean_days,
             })
-            # 立即运行一次
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
             self._scheduler.add_job(
                 func=self.run,
@@ -370,26 +180,23 @@ class HHClubButler(_PluginBase):
 
     def get_api(self) -> List[Dict[str, Any]]:
         return [{
-            "path": "/run",
-            "endpoint": self.api_run,
-            "methods": ["POST"],
-            "auth": "apikey",
+            "path": "/run", "endpoint": self.api_run, "methods": ["POST"], "auth": "apikey",
             "summary": "立即运行优选",
-            "description": "抓取保种区并优选推送",
         }, {
-            "path": "/result",
-            "endpoint": self.api_result,
-            "methods": ["GET"],
-            "auth": "apikey",
+            "path": "/result", "endpoint": self.api_result, "methods": ["GET"], "auth": "apikey",
             "summary": "最近运行结果",
-            "description": "查看最近一次优选结果",
         }, {
-            "path": "/refresh_overview",
-            "endpoint": self.api_refresh_overview,
-            "methods": ["GET"],
-            "auth": "apikey",
-            "summary": "立即刷新概况",
-            "description": "立即刷新保种概况数据（仅刷新数据，不优选/不推送/不删除）",
+            "path": "/refresh_overview", "endpoint": self.api_refresh_overview,
+            "methods": ["GET"], "auth": "apikey", "summary": "立即刷新概况",
+        }, {
+            "path": "/list_rescue_seeds", "endpoint": self.api_list_rescue_seeds,
+            "methods": ["GET"], "auth": "apikey", "summary": "列出当前保种区在保种子",
+        }, {
+            "path": "/delete_rescue_seed", "endpoint": self.api_delete_rescue_seed,
+            "methods": ["POST"], "auth": "apikey", "summary": "删除一颗保种种子（含下载器任务+文件）",
+        }, {
+            "path": "/rescue_panel", "endpoint": self.api_rescue_panel,
+            "methods": ["GET"], "auth": "apikey", "summary": "仿QB保种管理页",
         }]
 
     def get_service(self) -> List[Dict[str, Any]]:
@@ -414,302 +221,95 @@ class HHClubButler(_PluginBase):
             {
                 'component': 'VForm',
                 'content': [
-                    {
-                        # 顶部保种区概况卡片（纯Vuetify组件，数据=最近一次运行缓存，打开设置不实时抓取）
-                        **self._overview_form_cards()
-                    },
+                    {**self._overview_form_cards()},
                     {
                         'component': 'VRow',
                         'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12, 'md': 4},
-                                'content': [
-                                    {'component': 'VSwitch', 'props': {'model': 'enabled', 'label': '启用插件'}}
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12, 'md': 4},
-                                'content': [
-                                    {'component': 'VSwitch', 'props': {'model': 'onlyonce', 'label': '立即运行一次'}}
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12, 'md': 4},
-                                'content': [
-                                    {'component': 'VSwitch', 'props': {'model': 'notify', 'label': '发送通知'}}
-                                ]
-                            }
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                             'content': [{'component': 'VSwitch', 'props': {'model': 'enabled', 'label': '启用插件'}}]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                             'content': [{'component': 'VSwitch', 'props': {'model': 'onlyonce', 'label': '立即运行一次'}}]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                             'content': [{'component': 'VSwitch', 'props': {'model': 'notify', 'label': '发送通知'}}]},
                         ]
                     },
                     {
                         'component': 'VRow',
                         'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12, 'md': 6},
-                                'content': [
-                                    {
-                                        'component': 'VCronField',
-                                        'props': {
-                                            'model': 'cron',
-                                            'label': '执行周期',
-                                            'placeholder': '30 14 * * *（每天14:30，保种区14:10更新后）'
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12, 'md': 6},
-                                'content': [
-                                    {
-                                        'component': 'VSelect',
-                                        'props': {
-                                            'model': 'downloader',
-                                            'label': '下载器',
-                                            'items': downloaders
-                                        }
-                                    }
-                                ]
-                            }
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                             'content': [{'component': 'VCronField', 'props': {
+                                 'model': 'cron', 'label': '执行周期',
+                                 'placeholder': '30 14 * * *（每天14:30，保种区14:10更新后）'}}]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                             'content': [{'component': 'VSelect', 'props': {
+                                 'model': 'downloader', 'label': '下载器', 'items': downloaders}}]},
                         ]
                     },
                     {
                         'component': 'VRow',
                         'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12, 'md': 6},
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'save_path',
-                                            'label': '保存路径',
-                                            'placeholder': '如 /downloads/下载/保种'
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12, 'md': 6},
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'tag',
-                                            'label': '自定义标签',
-                                            'placeholder': '如 hhan（推送到下载器后自动打标）'
-                                        }
-                                    }
-                                ]
-                            }
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                             'content': [{'component': 'VTextField', 'props': {
+                                 'model': 'save_path', 'label': '保存路径',
+                                 'placeholder': '如 /downloads/下载/保种'}}]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                             'content': [{'component': 'VTextField', 'props': {
+                                 'model': 'tag', 'label': '自定义标签',
+                                 'placeholder': '如 hhan（推送到下载器后自动打标）'}}]},
                         ]
                     },
                     {
                         'component': 'VRow',
                         'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12, 'md': 6},
-                                'content': [
-                                    {
-                                        'component': 'VSelect',
-                                        'props': {
-                                            'model': 'mode',
-                                            'label': '优选模式',
-                                            'items': [
-                                                {'title': '增量优选（不删保种&补齐达标）', 'value': 'incremental'},
-                                                {'title': '换种优选（删除低效&下载高效）', 'value': 'wash'}
-                                            ]
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12, 'md': 6},
-                                'content': [
-                                    {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'exclude_zero',
-                                            'label': '排除0做种人数种子',
-                                        }
-                                    }
-                                ]
-                            }
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                             'content': [{'component': 'VSelect', 'props': {
+                                 'model': 'mode', 'label': '优选模式',
+                                 'items': [
+                                     {'title': '增量优选（不删保种&补齐体积）', 'value': 'incremental'},
+                                     {'title': '换种优选（删低档位&补高档位）', 'value': 'wash'}
+                                 ]}}]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                             'content': [{'component': 'VTextField', 'props': {
+                                 'model': 'target_volume',
+                                 'label': '目标体积（GB，总保种上限）',
+                                 'type': 'number',
+                                 'hint': '含已做种总体积，0=不限',
+                                 'persistent-hint': True}}]},
                         ]
                     },
-                    # 目标设置区：全部字段常驻，前端按 model 动态显隐（show 表达式）
                     {
                         'component': 'VRow',
                         'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12, 'md': 6},
-                                'content': [
-                                    {
-                                        'component': 'VSelect',
-                                        'props': {
-                                            'model': 'use_volume',
-                                            'label': '目标类型',
-                                            'items': [
-                                                {'title': '按目标积分', 'value': False},
-                                                {'title': '按目标体积', 'value': True}
-                                            ]
-                                        }
-                                    },
-                                    {
-                                        'component': 'VRow',
-                                        'props': {'no-gutters': True},
-                                        'content': [
-                                            {
-                                                'component': 'VCol',
-                                                'props': {
-                                                    'cols': 12,
-                                                    'show': '{{mode == "wash" && !use_volume}}'
-                                                },
-                                                'content': [
-                                                    {
-                                                        'component': 'div',
-                                                        'props': {
-                                                            'style': 'color:#e53935;font-size:12px;margin-top:4px;line-height:1.4;padding-left:16px;'
-                                                        },
-                                                        'text': '※若目标值低于实际积分值，将自动删除超标文件※'
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {
-                                                    'cols': 12,
-                                                    'show': '{{mode == "wash" && use_volume}}'
-                                                },
-                                                'content': [
-                                                    {
-                                                        'component': 'div',
-                                                        'props': {
-                                                            'style': 'color:#e53935;font-size:12px;margin-top:4px;line-height:1.4;padding-left:16px;'
-                                                        },
-                                                        'text': '※若目标值低于实际体积值，将自动删除超标文件※'
-                                                    }
-                                                ]
-                                            },
-                                        ]
-                                    },
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12, 'md': 6,
-                                    'show': '{{!use_volume}}'
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'target_pt',
-                                            'label': '目标积分（每日）',
-                                            'type': 'number',
-                                            'max': 1800,
-                                            'hint': '含已做种总积分，上限1800',
-                                            'persistent-hint': True
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12, 'md': 6,
-                                    'show': '{{use_volume}}'
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'target_volume',
-                                            'label': '目标体积（GB，总保种上限）',
-                                            'type': 'number',
-                                            'hint': '含已做种总体积，0=不限',
-                                            'persistent-hint': True
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12, 'md': 6},
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'seeder_cond',
-                                            'label': '做种人数',
-                                            'hint': '支持输入单值或区间，例如：1或1-5，留空=系统自行优选',
-                                            'persistent-hint': True
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12, 'md': 6},
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'auto_clean_days',
-                                            'label': '自动清理未完成下载（天）',
-                                            'hint': '超过N天仍未下载完成自动删除（含未完成文件）；留空或0=不清理',
-                                            'persistent-hint': True
-                                        }
-                                    }
-                                ]
-                            },
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                             'content': [{'component': 'VTextField', 'props': {
+                                 'model': 'seeder_cond',
+                                 'label': '做种人数',
+                                 'hint': '支持单值或区间，例如 1 或 1-5，留空=系统自行优选',
+                                 'persistent-hint': True}}]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                             'content': [{'component': 'VTextField', 'props': {
+                                 'model': 'auto_clean_days',
+                                 'label': '自动清理未完成下载（天）',
+                                 'hint': '超过N天仍未下载完成自动删除（含未完成文件）；留空或0=不清理',
+                                 'persistent-hint': True}}]},
                         ]
                     },
                 ]
             }
         ]
         defaults = {
-            "enabled": False,
-            "onlyonce": False,
-            "notify": True,
-            "cron": "30 14 * * *",
-            "mode": "incremental",
-            "use_volume": False,
-            "target_pt": 1800,
-            "target_volume": 0,
-            "seeder_cond": "",
-            "exclude_zero": False,
-            "downloader": "",
-            "save_path": "",
-            "tag": "",
-            "auto_clean_days": 0
+            "enabled": False, "onlyonce": False, "notify": True,
+            "cron": "30 14 * * *", "mode": "incremental",
+            "target_volume": 0, "seeder_cond": "", "exclude_zero": False,
+            "downloader": "", "save_path": "", "tag": "", "auto_clean_days": 0,
         }
         return form, defaults
 
     def _overview_form_cards(self) -> dict:
-        """设置页顶部概况卡片：纯Vuetify组件拼装（兼容不支持html字段的表单渲染器，任何MP版本可渲染）"""
         if not self._last_overview or not self._last_overview.get("ok"):
-            return {
-                'component': 'VCard',
-                'props': {'flat': True},
-                'content': [
-                    {
-                        'component': 'VCardText',
-                        'props': {},
-                        'text': '尚未运行或未获取到数据（运行一次后此处显示最近概况）'
-                    }
-                ]
-            }
+            return {'component': 'VCard', 'props': {'flat': True},
+                    'content': [{'component': 'VCardText', 'props': {},
+                                 'text': '尚未运行或未获取到数据（运行一次后此处显示最近概况）'}]}
         ov = self._last_overview
         d = ov["dist"]
         c = ov.get("count", 0) or sum(x["count"] for x in d.values()) or 1
@@ -718,85 +318,71 @@ class HHClubButler(_PluginBase):
         c45 = d["4-5人"]["count"] / c * 100.0
 
         def stat_col(label, num, sub=""):
-            return {
-                'component': 'VCol',
-                'props': {'cols': 6, 'md': 3},
-                'content': [
-                    {'component': 'div',
-                     'props': {'style': 'text-align:center;font-size:11px;color:rgba(var(--v-theme-on-surface),.6);white-space:nowrap;'},
-                     'text': label},
-                    {'component': 'div',
-                     'props': {'style': 'text-align:center;font-size:17px;font-weight:700;white-space:nowrap;'},
-                     'text': f'{num} {sub}'},
-                ]
-            }
+            return {'component': 'VCol', 'props': {'cols': 6, 'md': 3},
+                    'content': [
+                        {'component': 'div',
+                         'props': {'style': 'text-align:center;font-size:11px;color:rgba(var(--v-theme-on-surface),.6);white-space:nowrap;'},
+                         'text': label},
+                        {'component': 'div',
+                         'props': {'style': 'text-align:center;font-size:17px;font-weight:700;white-space:nowrap;'},
+                         'text': f'{num} {sub}'},
+                    ]}
 
         def legend_col(key, align):
-            return {
-                'component': 'VCol',
-                'props': {'cols': 12, 'md': 4},
-                'content': [
-                    {'component': 'div',
-                     'props': {'style': f'font-size:11px;color:rgba(var(--v-theme-on-surface),.6);white-space:nowrap;text-align:{align};'},
-                     'text': f'{key} {d[key]["count"]}个 {d[key]["gb"]:.1f}GB'}
-                ]
-            }
+            return {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                    'content': [{'component': 'div',
+                                 'props': {'style': f'font-size:11px;color:rgba(var(--v-theme-on-surface),.6);white-space:nowrap;text-align:{align};'},
+                                 'text': f'{key} {d[key]["count"]}个 {d[key]["gb"]:.1f}GB'}]}
 
-        return {
-            'component': 'VCard',
-            'props': {'flat': True},
-            'content': [
-                {
-                    'component': 'VCardText',
-                    'props': {'class': 'pt-2'},
-                    'content': [
-                        {'component': 'VRow', 'content': [
-                            stat_col("🌱 在保种子", ov.get("count", 0), "个"),
-                            stat_col("💾 总体积", f'{ov.get("total_gb", 0.0):.1f}', "GB"),
-                            stat_col("🥜 达标可得憨豆", f'+{ov.get("total_bean", 0.0):.1f}', ""),
-                            stat_col("⭐ 达标可得积分", f'+{ov.get("total_pt", 0.0):.1f}', ""),
-                        ]},
-                        {'component': 'div',
-                         'props': {'style': 'margin-top:8px;margin-bottom:4px;font-size:11px;color:rgba(var(--v-theme-on-surface),.6);'},
-                         'text': '初始做种人数分布'},
-                        # 堆积条：纯div+style（与四列数字同一渲染机制，最稳）
-                        {'component': 'div',
-                         'props': {'style': 'width:100%;display:flex;border-radius:4px;overflow:hidden;'},
-                         'content': [
-                             {'component': 'div',
-                              'props': {'style': f'height:8px;width:{c01:.2f}%;background:#22c55e;'},
-                              'text': ''},
-                             {'component': 'div',
-                              'props': {'style': f'height:8px;width:{c23:.2f}%;background:#3b82f6;'},
-                              'text': ''},
-                             {'component': 'div',
-                              'props': {'style': f'height:8px;width:{c45:.2f}%;background:#ef4444;'},
-                              'text': ''},
+        last_bean = ov.get("last_bean")
+        last_pt = ov.get("last_pt")
+        last_date = ov.get("last_date", "")
+        bean_txt = f'{last_bean:.0f}' if isinstance(last_bean, (int, float)) else '—'
+        pt_txt = f'{last_pt:.0f}' if isinstance(last_pt, (int, float)) else '—'
+
+        return {'component': 'VCard', 'props': {'flat': True},
+                'content': [
+                    {'component': 'VCardText', 'props': {'class': 'pt-2'},
+                     'content': [
+                         {'component': 'VRow', 'content': [
+                             stat_col("🌱 在保种子", ov.get("count", 0), "个"),
+                             stat_col("💾 总体积", f'{ov.get("total_gb", 0.0):.1f}', "GB"),
+                             stat_col("🥜 上次憨豆", bean_txt, ""),
+                             stat_col("⭐ 上次积分", pt_txt, ""),
                          ]},
-                        {'component': 'VRow', 'props': {'no-gutters': True}, 'content': [
-                            legend_col("0-1人", "left"),
-                            legend_col("2-3人", "center"),
-                            legend_col("4-5人", "right"),
-                        ]},
-                        {
-                            'component': 'div',
-                            'props': {'style': 'margin-top:8px;font-size:10.5px;color:rgba(var(--v-theme-on-surface),.4);'},
-                            'text': HHClubButler._overview_refresh_note(self._last_overview_ts, self._overview_hours)
-                                    + '。左下角「查看数据」中可手动立即刷新。'
-                        },
-                    ]
-                },
-                {
-                    'component': 'VAlert',
-                    'props': {'type': 'info', 'variant': 'tonal',
-                              'text': f"最近运行状态：{self._last_result}"}
-                }
-            ]
-        }
+                         {'component': 'div',
+                          'props': {'style': 'margin-top:8px;margin-bottom:4px;font-size:11px;color:rgba(var(--v-theme-on-surface),.6);'},
+                          'text': f'初始做种人数分布' + (f' · 上次结算 {last_date}' if last_date else '')},
+                         {'component': 'div',
+                          'props': {'style': 'width:100%;display:flex;border-radius:4px;overflow:hidden;'},
+                          'content': [
+                              {'component': 'div', 'props': {'style': f'height:8px;width:{c01:.2f}%;background:#22c55e;'}, 'text': ''},
+                              {'component': 'div', 'props': {'style': f'height:8px;width:{c23:.2f}%;background:#3b82f6;'}, 'text': ''},
+                              {'component': 'div', 'props': {'style': f'height:8px;width:{c45:.2f}%;background:#ef4444;'}, 'text': ''},
+                          ]},
+                         {'component': 'VRow', 'props': {'no-gutters': True}, 'content': [
+                             legend_col("0-1人", "left"),
+                             legend_col("2-3人", "center"),
+                             legend_col("4-5人", "right"),
+                         ]},
+                         {'component': 'VRow', 'props': {'class': 'd-flex align-center', 'no-gutters': True, 'style': 'margin-top:8px;'},
+                          'content': [
+                              {'component': 'VCol', 'props': {'cols': 'auto'},
+                               'content': [{'component': 'div',
+                                            'props': {'style': 'font-size:10.5px;color:rgba(var(--v-theme-on-surface),.4);'},
+                                            'text': HHClubButler._refresh_note(self._last_overview_ts, self._overview_hours)}]},
+                              {'component': 'VCol', 'props': {'cols': True},
+                               'content': [{'component': 'div',
+                                            'props': {'style': 'font-size:10.5px;color:rgba(var(--v-theme-on-surface),.4);text-align:right;'},
+                                            'text': '左下角 [查看数据] 内置 [立即刷新] 及 [保种管理台]'}]},
+                          ]},
+                     ]},
+                    {'component': 'VAlert', 'props': {'type': 'info', 'variant': 'tonal',
+                                                     'text': f"最近运行状态：{self._last_result}"}}
+                ]}
 
     @staticmethod
     def _overview_html(ov: dict, last_ts: float = 0.0, hours: float = 6.0) -> str:
-        """憨憨保种区管家概况（单行4列·透明背景·档位配色堆积条·达标可得口径）"""
         if not ov or not ov.get("ok"):
             return ('<div style="padding:12px 14px;border-radius:10px;'
                     'border:1px solid rgba(var(--v-theme-on-surface),.08);'
@@ -813,57 +399,42 @@ class HHClubButler(_PluginBase):
         def pct(k):
             return (d[k]["gb"] / t_gb * 100.0) if t_gb else 0.0
 
-        icons = {
-            "在保种子": "🌱",
-            "总体积": "💾",
-            "达标可得憨豆": "🥜",
-            "达标可得积分": "⭐",
-        }
+        last_bean = ov.get("last_bean")
+        last_pt = ov.get("last_pt")
+        last_date = ov.get("last_date", "")
+        bean_txt = f'{last_bean:.0f}' if isinstance(last_bean, (int, float)) else '—'
+        pt_txt = f'{last_pt:.0f}' if isinstance(last_pt, (int, float)) else '—'
 
         def td(label, num, sub):
-            return (
-                f'<td style="text-align:center;padding:4px 2px;width:25%;vertical-align:top;">'
-                f'<div style="font-size:10.5px;color:{ON60};white-space:nowrap;">'
-                f'{icons[label]} {label}</div>'
-                f'<div style="font-size:17px;font-weight:700;color:{ON};line-height:1.4;white-space:nowrap;">{num}'
-                f'<span style="font-size:10px;font-weight:400;color:{ON40};"> {sub}</span></div></td>'
-            )
+            return (f'<td style="text-align:center;padding:4px 2px;width:25%;vertical-align:top;">'
+                    f'<div style="font-size:10.5px;color:{ON60};white-space:nowrap;">{label}</div>'
+                    f'<div style="font-size:17px;font-weight:700;color:{ON};line-height:1.4;white-space:nowrap;">{num}'
+                    f'<span style="font-size:10px;font-weight:400;color:{ON40};"> {sub}</span></div></td>')
 
-        cells = (
-            '<table style="width:100%;border-collapse:collapse;table-layout:fixed;margin:2px 0 6px;"><tr>'
-            + td("在保种子", f'{ov["count"]}', "个")
-            + td("总体积", f'{ov["total_gb"]:.1f}', "GB")
-            + td("达标可得憨豆", f'+{ov["total_bean"]:.1f}', "")
-            + td("达标可得积分", f'+{ov["total_pt"]:.1f}', "")
-            + '</tr></table>'
-        )
-        bar = (
-            '<table style="width:100%;border-collapse:collapse;table-layout:fixed;margin:6px 0 6px;"><tr>'
-            f'<td style="height:10px;width:{pct("0-1人"):.2f}%;background:{C["0-1人"]};border-radius:5px 0 0 5px;"></td>'
-            f'<td style="height:10px;width:{pct("2-3人"):.2f}%;background:{C["2-3人"]};"></td>'
-            f'<td style="height:10px;width:{pct("4-5人"):.2f}%;background:{C["4-5人"]};border-radius:0 5px 5px 0;"></td>'
-            '</tr></table>'
-        )
-        legend = (
-            '<table style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:10.5px;color:{ON60};"><tr>'
-            f'<td style="text-align:left;white-space:nowrap;"><span style="display:inline-block;width:7px;height:7px;border-radius:2px;background:{C["0-1人"]};margin-right:3px;"></span>0-1人 {d["0-1人"]["count"]}个 {d["0-1人"]["gb"]:.1f}GB</td>'
-            f'<td style="text-align:center;white-space:nowrap;"><span style="display:inline-block;width:7px;height:7px;border-radius:2px;background:{C["2-3人"]};margin-right:3px;"></span>2-3人 {d["2-3人"]["count"]}个 {d["2-3人"]["gb"]:.0f}GB</td>'
-            f'<td style="text-align:right;white-space:nowrap;"><span style="display:inline-block;width:7px;height:7px;border-radius:2px;background:{C["4-5人"]};margin-right:3px;"></span>4-5人 {d["4-5人"]["count"]}个 {d["4-5人"]["gb"]:.1f}GB</td>'
-            '</tr></table>'
-        )
-        dist_title = (
-            '<table style="width:100%;border-collapse:collapse;table-layout:fixed;margin:2px 0 2px;"><tr>'
-            f'<td style="text-align:left;font-size:10.5px;color:{ON60};">初始做种人数分布</td>'
-            '</tr></table>'
-        )
-        return (
-            f'<div style="background:transparent;">'
-            f'{cells}{dist_title}{bar}{legend}</div>'
-        )
+        cells = ('<table style="width:100%;border-collapse:collapse;table-layout:fixed;margin:2px 0 6px;"><tr>'
+                 + td("🌱 在保种子", f'{ov["count"]}', "个")
+                 + td("💾 总体积", f'{ov["total_gb"]:.1f}', "GB")
+                 + td("🥜 上次憨豆", bean_txt, "")
+                 + td("⭐ 上次积分", pt_txt, "")
+                 + '</tr></table>')
+        bar = ('<table style="width:100%;border-collapse:collapse;table-layout:fixed;margin:6px 0 6px;"><tr>'
+               f'<td style="height:10px;width:{pct("0-1人"):.2f}%;background:{C["0-1人"]};border-radius:5px 0 0 5px;"></td>'
+               f'<td style="height:10px;width:{pct("2-3人"):.2f}%;background:{C["2-3人"]};"></td>'
+               f'<td style="height:10px;width:{pct("4-5人"):.2f}%;background:{C["4-5人"]};border-radius:0 5px 5px 0;"></td>'
+               '</tr></table>')
+        legend = ('<table style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:10.5px;color:{ON60};"><tr>'
+                  f'<td style="text-align:left;white-space:nowrap;"><span style="display:inline-block;width:7px;height:7px;border-radius:2px;background:{C["0-1人"]};margin-right:3px;"></span>0-1人 {d["0-1人"]["count"]}个 {d["0-1人"]["gb"]:.1f}GB</td>'
+                  f'<td style="text-align:center;white-space:nowrap;"><span style="display:inline-block;width:7px;height:7px;border-radius:2px;background:{C["2-3人"]};margin-right:3px;"></span>2-3人 {d["2-3人"]["count"]}个 {d["2-3人"]["gb"]:.0f}GB</td>'
+                  f'<td style="text-align:right;white-space:nowrap;"><span style="display:inline-block;width:7px;height:7px;border-radius:2px;background:{C["4-5人"]};margin-right:3px;"></span>4-5人 {d["4-5人"]["count"]}个 {d["4-5人"]["gb"]:.1f}GB</td>'
+                  '</tr></table>')
+        dist_title = (f'<table style="width:100%;border-collapse:collapse;table-layout:fixed;margin:2px 0 2px;"><tr>'
+                      f'<td style="text-align:left;font-size:10.5px;color:{ON60};">初始做种人数分布'
+                      + (f' · 上次结算 {last_date}' if last_date else '')
+                      + '</td></tr></table>')
+        return f'<div style="background:transparent;">{cells}{dist_title}{bar}{legend}</div>'
 
     @staticmethod
-    def _overview_refresh_note(last_ts: float = 0.0, hours: float = 6.0) -> str:
-        """概况刷新说明（设置页顶部卡片用）"""
+    def _refresh_note(last_ts: float = 0.0, hours: float = 6.0) -> str:
         if last_ts and last_ts > 0:
             mins = max(0, int((time.time() - last_ts) / 60))
             if mins >= 60:
@@ -874,102 +445,170 @@ class HHClubButler(_PluginBase):
             if hours > 0:
                 return f"每 {hours:g} 小时自动刷新一次 · 上次更新 {ago}"
             return f"上次更新 {ago}"
-        return f"每 {hours:g} 小时自动刷新一次（距最近一次运行或定时更新后开始计时）"
+        return f"每 {hours:g} 小时自动刷新一次"
+
+    def _build_management_page(self) -> dict:
+        """仿QB风格保种管理页"""
+        try:
+            cur = self._get_current_seeding([])
+        except Exception as e:
+            cur = {"error": str(e), "seeds": []}
+        seeds = cur.get("seeds", []) or []
+        seeds = sorted(seeds, key=lambda s: (tier_of(s.get("seeders", 1)), -s.get("size", 0)))
+
+        rows = []
+        for i, s in enumerate(seeds, 1):
+            title = (s.get("title") or "").strip()
+            size = s.get("size", 0.0) or 0.0
+            seeders = s.get("seeders", 0) or 0
+            t = tier_of(seeders)
+            badge = TIER_BADGE.get(t, '<span style="display:inline-block;padding:1px 8px;border-radius:10px;background:#999;color:#fff;font-size:11px;">&gt;5人</span>')
+            safe_title = title.replace("\\", "\\\\").replace("'", "\\'")
+            rows.append({
+                "component": "VRow",
+                "props": {"class": "py-1", "style": "border-bottom:1px solid rgba(var(--v-theme-on-surface),.06);"},
+                "content": [
+                    {"component": "VCol", "props": {"cols": 1},
+                     "content": [{"component": "div",
+                                   "props": {"class": "text-caption",
+                                             "style": "text-align:center;color:rgba(var(--v-theme-on-surface),.5);"},
+                                   "text": str(i)}]},
+                    {"component": "VCol", "props": {"cols": 6},
+                     "content": [{"component": "div",
+                                   "props": {"style": "font-size:12px;word-break:break-all;line-height:1.4;",
+                                             "title": title},
+                                   "text": title}]},
+                    {"component": "VCol", "props": {"cols": 2},
+                     "content": [{"component": "div",
+                                   "props": {"class": "text-caption", "style": "text-align:right;"},
+                                   "text": f"{size:.2f} GB"}]},
+                    {"component": "VCol", "props": {"cols": 2},
+                     "content": [{"component": "div", "props": {"style": "text-align:center;"},
+                                   "html": badge}]},
+                    {"component": "VCol", "props": {"cols": 1},
+                     "content": [{"component": "VBtn",
+                                   "props": {"size": "x-small", "color": "error", "variant": "tonal",
+                                             "icon": "mdi-delete-outline"},
+                                   "events": {"click": {
+                                       "api": "plugin/HHClubButler/delete_rescue_seed",
+                                       "method": "post",
+                                       "params": {"apikey": settings.API_TOKEN, "title": safe_title}
+                                   }}}]},
+                ]
+            })
+
+        header = {
+            "component": "VRow",
+            "props": {"class": "py-1",
+                      "style": "border-bottom:1px solid rgba(var(--v-theme-on-surface),.12);font-weight:600;font-size:11px;color:rgba(var(--v-theme-on-surface),.6);"},
+            "content": [
+                {"component": "VCol", "props": {"cols": 1}, "content": [{"component": "div", "text": "#"}]},
+                {"component": "VCol", "props": {"cols": 6}, "content": [{"component": "div", "text": "种子名称"}]},
+                {"component": "VCol", "props": {"cols": 2},
+                 "content": [{"component": "div", "props": {"style": "text-align:right;"}, "text": "大小"}]},
+                {"component": "VCol", "props": {"cols": 2},
+                 "content": [{"component": "div", "props": {"style": "text-align:center;"}, "text": "档位"}]},
+                {"component": "VCol", "props": {"cols": 1},
+                 "content": [{"component": "div", "props": {"style": "text-align:center;"}, "text": "删除"}]},
+            ]
+        }
+
+        total_gb = sum(s.get("size", 0.0) for s in seeds)
+        summary_html = (
+            f'<div style="padding:6px 4px;font-size:12px;color:rgba(var(--v-theme-on-surface),.6);">'
+            f'共 <b style="color:rgb(var(--v-theme-on-surface));">{len(seeds)}</b> 个种子 · '
+            f'总体积 <b style="color:rgb(var(--v-theme-on-surface));">{total_gb:.1f} GB</b> · '
+            f'点击删除按钮将同时删除下载器任务和文件</div>'
+        )
+
+        return {
+            "component": "VCard",
+            "props": {"flat": True},
+            "content": [
+                {"component": "VCardTitle", "props": {"class": "text-subtitle-1"},
+                 "content": [{"component": "div", "text": "📋 保种管理（仿QB面板）"}]},
+                {"component": "VCardText", "content": [
+                    {"component": "div", "html": summary_html},
+                    header,
+                    *rows,
+                    {"component": "div", "props": {"style": "margin-top:8px;"},
+                     "content": [{"component": "VBtn",
+                                   "props": {"size": "small", "color": "primary", "variant": "tonal",
+                                             "prepend-icon": "mdi-refresh"},
+                                   "events": {"click": {
+                                       "api": "plugin/HHClubButler/refresh_overview",
+                                       "method": "get",
+                                       "params": {"apikey": settings.API_TOKEN}
+                                   }},
+                                   "content": [{"component": "div", "text": "刷新列表"}]}]}
+                ]}
+            ]
+        }
 
     def get_page(self) -> List[dict]:
-        """数据页：憨憨保种区管家概况卡片 + 最近运行状态"""
         overview = None
         try:
             overview = self._get_overview_cached_or_refresh()
         except Exception as e:
             logger.error(f"获取憨憨保种区管家概况失败：{e}")
-        return [
-            {
-                'component': 'VCard',
-                'props': {'flat': True},
-                'content': [
-                    {
-                        'component': 'VCardText',
-                        'props': {},
-                        'content': [
-                            {
-                                'component': 'VRow',
-                                'props': {'class': 'd-flex justify-space-between align-center', 'no-gutters': True},
-                                'content': [
-                                    {
-                                        'component': 'div',
-                                        'html': ('<div style="font-size:10.5px;color:rgba(var(--v-theme-on-surface),.4);'
-                                                 'margin-right:10px;white-space:nowrap;">'
-                                                 + HHClubButler._overview_refresh_note(
-                                                     self._last_overview_ts, self._overview_hours)
-                                                 + '</div>')
-                                    },
-                                    {
-                                        'component': 'div',
-                                        'html': '<a style="cursor:pointer;color:#42A5F5;'
-                                                 'text-decoration:none;white-space:nowrap;">🔄 立即刷新</a>',
-                                        'events': {
-                                            'click': {
-                                                'api': 'plugin/HHClubButler/refresh_overview',
-                                                'method': 'get',
-                                                'params': {'apikey': settings.API_TOKEN}
-                                            }
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'div',
-                                'html': HHClubButler._overview_html(
-                                    overview, self._last_overview_ts, self._overview_hours)
-                            },
-                            {
-                                'component': 'VAlert',
-                                'props': {'type': 'info', 'variant': 'tonal',
-                                          'text': f"最近运行状态：{self._last_result}"}
-                            }
-                        ]
-                    }
-                ]
-            }
-        ]
+        panel_link = (
+            '<div style="padding:10px 0;display:flex;align-items:center;gap:10px;">'
+            '<a href="/api/v1/plugin/HHClubButler/rescue_panel?apikey=' + getattr(settings, 'API_TOKEN', '') + '" target="_blank" '
+            'style="display:inline-flex;align-items:center;gap:6px;padding:7px 18px;background:rgba(66,165,245,.12);'
+            'color:#42A5F5;text-decoration:none;border-radius:4px;font-size:13px;font-weight:500;border:1px solid rgba(66,165,245,.3);">'
+            '🖥️ 保种管理台</a>'
+            '<span style="font-size:11px;color:rgba(var(--v-theme-on-surface),.45);">独立工作台 · 批量删除 · 搜索· 查看· 档位· 筛选· 列自定义 · 多皮肤等功能</span>'
+            '</div>'
+        )
+        return [{
+            'component': 'VRow', 'props': {'density': 'compact', 'no-gutters': True},
+            'content': [
+                {'component': 'VCol', 'props': {'cols': 12, 'md': 12},
+                 'content': [
+                     {'component': 'VRow', 'props': {'class': 'd-flex justify-space-between align-center', 'no-gutters': True},
+                      'content': [
+                          {'component': 'div', 'html': (
+                              '<div style="font-size:10.5px;color:rgba(var(--v-theme-on-surface),.4);'
+                              'margin-right:10px;white-space:nowrap;">'
+                              + HHClubButler._refresh_note(self._last_overview_ts, self._overview_hours)
+                              + '</div>')},
+                          {'component': 'div', 'html': '<a style="cursor:pointer;color:#42A5F5;text-decoration:none;white-space:nowrap;">🔄 立即刷新</a>',
+                           'events': {'click': {'api': 'plugin/HHClubButler/refresh_overview', 'method': 'get',
+                                                'params': {'apikey': settings.API_TOKEN}}}}
+                      ]},
+                     {'component': 'div', 'html': HHClubButler._overview_html(
+                         overview, self._last_overview_ts, self._overview_hours)},
+                     {'component': 'VAlert', 'props': {'type': 'info', 'variant': 'tonal',
+                                                      'text': f"最近运行状态：{self._last_result}"}},
+                     {'component': 'div', 'html': panel_link},
+                 ]},
+            ]
+        }]
 
     def get_dashboard_meta(self) -> Optional[List[Dict[str, str]]]:
-        """仪表盘元信息"""
         return [{"key": "seeding", "name": "憨憨保种区管家"}]
 
-    def get_dashboard(self, key: str, **kwargs) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], Optional[List[dict]]]]:
-        """仪表盘：今日保种概况卡片"""
+    def get_dashboard(self, key: str, **kwargs):
         if key and key != "seeding":
             return None
         try:
             overview = self._get_overview_cached_or_refresh()
         except Exception as e:
             logger.error(f"仪表盘概况获取失败：{e}")
-            overview = {"count": 0, "total_gb": 0.0, "total_tb": 0.0,
-                        "total_bean": 0.0, "total_pt": 0.0,
+            overview = {"count": 0, "total_gb": 0.0,
                         "dist": {"0-1人": {"count": 0, "gb": 0.0},
                                  "2-3人": {"count": 0, "gb": 0.0},
                                  "4-5人": {"count": 0, "gb": 0.0}}}
         elements = [
-            {
-                'component': 'div',
-                'props': {'style': 'text-align:left;font-size:10.5px;'
-                                   'color:rgba(var(--v-theme-on-surface),.4);'
-                                   'margin-bottom:6px;white-space:nowrap;'},
-                'text': HHClubButler._overview_refresh_note(self._last_overview_ts, self._overview_hours)
-            },
-            {
-                'component': 'div',
-                'html': HHClubButler._overview_html(
-                    overview, self._last_overview_ts, self._overview_hours)
-            }
+            {'component': 'div',
+             'props': {'style': 'text-align:left;font-size:10.5px;color:rgba(var(--v-theme-on-surface),.4);margin-bottom:6px;white-space:nowrap;'},
+             'text': HHClubButler._refresh_note(self._last_overview_ts, self._overview_hours)},
+            {'component': 'div', 'html': HHClubButler._overview_html(
+                overview, self._last_overview_ts, self._overview_hours)}
         ]
-        return (
-            {"cols": 12, "md": 6},
-            {"refresh": 60, "title": "憨憨保种区管家", "border": True},
-            elements
-        )
+        return ({"cols": 12, "md": 6},
+                {"refresh": 60, "title": "憨憨保种区管家", "border": True},
+                elements)
 
     def stop_service(self):
         try:
@@ -992,7 +631,6 @@ class HHClubButler(_PluginBase):
             self._overview_thread = None
 
     def _start_overview_thread(self):
-        """启动概况自动刷新后台线程"""
         try:
             self._overview_stop = threading.Event()
             self._overview_thread = threading.Thread(
@@ -1002,7 +640,6 @@ class HHClubButler(_PluginBase):
             logger.error(f"启动概况刷新线程失败：{e}")
 
     def _overview_loop(self):
-        """按配置间隔（距最近一次更新）静默刷新概况缓存"""
         while True:
             try:
                 if self._overview_stop is None or self._overview_stop.is_set():
@@ -1024,34 +661,24 @@ class HHClubButler(_PluginBase):
                     return
 
     def _refresh_overview(self, manual: bool = False):
-        """静默刷新概况缓存（只读站点+下载器，不做任何优选/推送/删除）
-
-        :param manual: True=手动触发（如点击立即刷新），日志措辞显示"手动刷新"
-        """
         try:
-            logs = []
-            cur = self._get_current_seeding(logs)
-            if not cur:
-                logger.warning("憨憨保种区管家概况刷新失败：未获取到任何数据，保留上次数据")
-                return
+            cur = self._get_current_seeding([])
             if cur.get("error"):
                 logger.warning(f"憨憨保种区管家概况刷新失败（{cur['error']}），保留上次数据")
                 return
             if cur.get("degraded"):
                 logger.warning(f"憨憨保种区管家概况刷新失败（{cur['degraded']}），保留上次数据")
                 return
-            if cur.get("count", 0) <= 0 and not cur.get("seeds"):
-                logger.warning("憨憨保种区管家概况刷新：完成页与下载器交集为空"
-                               "（下载器内暂无保种区已完成种子），按真实 0 个显示")
             self._last_overview = self._build_overview_from_current(cur)
             self._last_overview_ts = time.time()
             logger.info(f"憨憨保种区管家概况已{'手动' if manual else '自动'}刷新："
-                        f"{cur.get('count', 0)} 个 / {cur.get('total_gb', 0.0):.1f} GB")
+                        f"{cur.get('count', 0)} 个 / {cur.get('total_gb', 0.0):.1f} GB"
+                        f" / 上次憨豆 {self._last_overview.get('last_bean', '—')}"
+                        f" / 上次积分 {self._last_overview.get('last_pt', '—')}")
         except Exception as e:
             logger.error(f"概况{'手动' if manual else '自动'}刷新失败：{e}")
 
     def _get_overview_cached_or_refresh(self) -> dict:
-        """概况读取：优先缓存；缓存缺失或超时(间隔+5分钟)时兜底现场刷新一次"""
         try:
             if (self._last_overview is None
                     or (self._overview_hours > 0
@@ -1060,48 +687,401 @@ class HHClubButler(_PluginBase):
         except Exception as e:
             logger.error(f"概况读取失败：{e}")
         return self._last_overview or {
-            "count": 0, "total_gb": 0.0, "total_tb": 0.0,
-            "total_bean": 0.0, "total_pt": 0.0,
+            "count": 0, "total_gb": 0.0,
             "dist": {"0-1人": {"count": 0, "gb": 0.0},
                      "2-3人": {"count": 0, "gb": 0.0},
                      "4-5人": {"count": 0, "gb": 0.0}}}
 
-    # ============================================================
-    # API
-    # ============================================================
     def api_run(self):
-        """手动触发运行（后台执行，请求立即返回，避免进度条挂起）"""
         if self._running:
             return {"success": False, "result": "憨憨保种区管家正在运行中，请稍候"}
         threading.Thread(target=self.run, daemon=True).start()
         return {"success": True, "result": "已在后台启动优选，请查看运行日志"}
 
     def api_result(self):
-        """查看最近结果"""
         return {"result": self._last_result}
 
     def api_refresh_overview(self):
-        """立即刷新概况（仅刷新数据，不优选/不推送/不删除）"""
         try:
             self._refresh_overview(manual=True)
             if self._last_overview_ts > 0:
                 return {"success": True, "message": "概况已刷新", "data": None}
-            return {"success": False, "message": "概况刷新失败（站点或下载器不可用），保留上次数据", "data": None}
+            return {"success": False, "message": "概况刷新失败", "data": None}
         except Exception as e:
             logger.error(f"立即刷新概况失败：{e}")
             return {"success": False, "message": f"概况刷新失败：{e}", "data": None}
 
-    # ============================================================
-    # 核心逻辑
-    # ============================================================
+    def api_list_rescue_seeds(self):
+        try:
+            cur = self._get_current_seeding([])
+            seeds = list(cur.get("seeds", []) or [])
+            try:
+                detail = self._get_downloader_detail_map()
+            except Exception as e:
+                logger.warning(f"下载器详情合并失败：{e}")
+                detail = {}
+            for s in seeds:
+                nm = HHClubButler._norm_title(s.get("title") or "")
+                d = detail.get(nm) or {}
+                for k in ("upspeed", "dlspeed", "eta", "ratio", "path",
+                          "cur_seeders", "cur_leechers", "tracker", "added",
+                          "progress", "hash"):
+                    if k in d:
+                        s[k] = d[k]
+            return {"success": True, "data": seeds}
+        except Exception as e:
+            logger.error(f"list_rescue_seeds 失败：{e}")
+            return {"success": False, "message": str(e)}
+
+    def _get_downloader_detail_map(self) -> dict:
+        out = {}
+        service = self._get_downloader_obj()
+        if not service:
+            return out
+        try:
+            dl_type = str(service.type or service.config.type or "").lower()
+        except Exception:
+            dl_type = ""
+        try:
+            torrents, error = service.instance.get_torrents()
+            if error:
+                return out
+        except Exception as e:
+            logger.warning(f"详情map取种子失败：{e}")
+            return out
+
+        def g(t, *names):
+            for n in names:
+                try:
+                    v = t.get(n) if isinstance(t, dict) else getattr(t, n, None)
+                    if v is not None:
+                        return v
+                except Exception:
+                    pass
+            return None
+
+        for t in torrents:
+            try:
+                name = g(t, "name") or ""
+                if not name:
+                    continue
+                progress = HHClubButler._get_progress_ratio(t, dl_type)
+                if progress is not None and progress < 1.0:
+                    continue
+                upspeed = g(t, "upspeed", "rateUpload", "upload_speed", "uploadRate") or 0
+                dlspeed = g(t, "dlspeed", "rateDownload", "download_speed", "downloadRate") or 0
+                eta = g(t, "eta") or 0
+                ratio = g(t, "ratio", "uploadRatio")
+                path = g(t, "save_path", "downloadDir", "download_dir", "content_path", "path", "dir") or ""
+                cur_s = g(t, "num_seeds", "seeds", "seeders", "seederCount", "num_seeders")
+                cur_l = g(t, "num_leechs", "leechs", "leechers", "leecherCount", "num_leechers")
+                added = g(t, "added_on", "date_added", "dateAdded")
+                tracker = ""
+                try:
+                    tracker = HHClubButler._extract_tracker_text(t, dl_type)
+                except Exception:
+                    pass
+                dom = ""
+                m = re.search(r"https?://([^/]+)", tracker or "")
+                if m:
+                    dom = m.group(1)
+                added_str = ""
+                try:
+                    if added:
+                        added = int(added)
+                        if added > 1e9:
+                            added_str = time.strftime("%Y-%m-%d", time.localtime(added))
+                except Exception:
+                    pass
+                out[HHClubButler._norm_title(name)] = {
+                    "upspeed": float(upspeed or 0),
+                    "dlspeed": float(dlspeed or 0),
+                    "eta": int(eta or 0),
+                    "ratio": float(ratio) if ratio is not None else None,
+                    "path": str(path or ""),
+                    "cur_seeders": int(cur_s) if cur_s is not None else None,
+                    "cur_leechers": int(cur_l) if cur_l is not None else None,
+                    "tracker": dom,
+                    "added": added_str,
+                    "progress": progress,
+                }
+            except Exception:
+                continue
+        return out
+
+    def api_rescue_panel(self):
+        apikey = getattr(settings, "API_TOKEN", "") or ""
+        return HTMLResponse(content=self._build_rescue_panel_html(apikey))
+
+    def _build_rescue_panel_html(self, apikey: str) -> str:
+        import json as _json
+        ak = _json.dumps(apikey)
+        html = r"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>憨憨保种区管理</title><style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:"Segoe UI","PingFang SC",Arial,sans-serif;background:var(--bg);color:var(--fg);font-size:12px;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+body[data-theme="light"]{--bg:#ffffff;--fg:#1d1d1f;--topbar:#f5f5f7;--border:#e5e5ea;--chip:#e8e8ed;--chip-active:#0071e3;--chip-hover:#d1d1d6;--input-bg:#ffffff;--input-border:#d2d2d7;--btn:#0071e3;--btn-danger:#ff3b30;--btn-ghost:#e8e8ed;--toolbar:#f0f0f2;--picker-bg:#ffffff;--picker-border:#d2d2d7;--th:#f5f5f7;--th-hover:#e8e8ed;--td-border:#f0f0f2;--tr-hover:#f0f5ff;--tr-sel:#0071e3;--footer:#f5f5f7;--footer-border:#e5e5ea;--muted:#86868b;--muted2:#6e6e73}
+body[data-theme="cream"]{--bg:#fdf6e3;--fg:#3e2f1c;--topbar:#f5e6c8;--border:#d4c5a0;--chip:#ead9b8;--chip-active:#b8860b;--chip-hover:#e0cf9f;--input-bg:#fff8e0;--input-border:#c4b080;--btn:#b8860b;--btn-danger:#c0392b;--btn-ghost:#ead9b8;--toolbar:#f0e0bc;--picker-bg:#fdf6e3;--picker-border:#c4b080;--th:#f0e0bc;--th-hover:#e8d5a0;--td-border:#e0d0a5;--tr-hover:#f5e6b8;--tr-sel:#8b6914;--footer:#e8d8a8;--footer-border:#d4c5a0;--muted:#8b7355;--muted2:#6b5535}
+body[data-theme="sakura"]{--bg:#fff5f7;--fg:#4a2a35;--topbar:#ffe4ec;--border:#f8c8d8;--chip:#ffd6e5;--chip-active:#e91e63;--chip-hover:#ffc2d6;--input-bg:#ffffff;--input-border:#f8b8cc;--btn:#e91e63;--btn-danger:#c0392b;--btn-ghost:#ffd6e5;--toolbar:#ffe0ec;--picker-bg:#fff5f7;--picker-border:#f8b8cc;--th:#ffe0ec;--th-hover:#ffd0e0;--td-border:#f8d0dc;--tr-hover:#ffe4ef;--tr-sel:#ad1457;--footer:#ffe4ec;--footer-border:#f8c8d8;--muted:#a06878;--muted2:#804858}
+body[data-theme="mint"]{--bg:#f0faf4;--fg:#1f3a2e;--topbar:#d8f0e2;--border:#b8dcc4;--chip:#c8ecd4;--chip-active:#10b981;--chip-hover:#b0e4c2;--input-bg:#ffffff;--input-border:#a8d4b8;--btn:#10b981;--btn-danger:#e53e3e;--btn-ghost:#c8ecd4;--toolbar:#e0f2e8;--picker-bg:#f0faf4;--picker-border:#a8d4b8;--th:#e0f2e8;--th-hover:#d0ead8;--td-border:#d8ecd0;--tr-hover:#e0f5e8;--tr-sel:#059669;--footer:#e0f2e8;--footer-border:#b8dcc4;--muted:#6a9a7e;--muted2:#4a7a5e}
+body[data-theme="sky"]{--bg:#f0f7ff;--fg:#1a2a3e;--topbar:#dceafd;--border:#b8d4f0;--chip:#cce4fa;--chip-active:#0ea5e9;--chip-hover:#b8d8f5;--input-bg:#ffffff;--input-border:#a8c8ee;--btn:#0ea5e9;--btn-danger:#e53e3e;--btn-ghost:#cce4fa;--toolbar:#e0eefd;--picker-bg:#f0f7ff;--picker-border:#a8c8ee;--th:#e0eefd;--th-hover:#d0e6f8;--td-border:#d8e8f8;--tr-hover:#e0f0ff;--tr-sel:#0284c7;--footer:#e0eefd;--footer-border:#b8d4f0;--muted:#6a8aaa;--muted2:#4a6a8a}
+body[data-theme="lavender"]{--bg:#f6f3ff;--fg:#2e1f4a;--topbar:#e8e0fb;--border:#ccbfe8;--chip:#ddd2f5;--chip-active:#8b5cf6;--chip-hover:#cdbef0;--input-bg:#ffffff;--input-border:#bcade0;--btn:#8b5cf6;--btn-danger:#e53e3e;--btn-ghost:#ddd2f5;--toolbar:#ece6fb;--picker-bg:#f6f3ff;--picker-border:#bcade0;--th:#ece6fb;--th-hover:#e0d6f5;--td-border:#e0d8f0;--tr-hover:#ece4ff;--tr-sel:#7c3aed;--footer:#ece6fb;--footer-border:#ccbfe8;--muted:#8a7aaa;--muted2:#6a5a8a}
+body[data-theme="silver"]{--bg:#eef0f2;--fg:#2a2d32;--topbar:#dde1e6;--border:#c0c5cc;--chip:#d4d8dd;--chip-active:#6b7280;--chip-hover:#c8ccd2;--input-bg:#ffffff;--input-border:#b8bdc4;--btn:#6b7280;--btn-danger:#d97706;--btn-ghost:#d4d8dd;--toolbar:#e4e7eb;--picker-bg:#eef0f2;--picker-border:#b8bdc4;--th:#e4e7eb;--th-hover:#d8dce0;--td-border:#dde1e6;--tr-hover:#e2e6ea;--tr-sel:#4b5563;--footer:#dde1e6;--footer-border:#c0c5cc;--muted:#7a8088;--muted2:#5a6068}
+body[data-theme="dark"]{--bg:#1e1e1e;--fg:#d4d4d4;--topbar:#252526;--border:#000;--chip:#3a3d41;--chip-active:#0e639c;--chip-hover:#494c50;--input-bg:#3c3c3c;--input-border:#555;--btn:#0e639c;--btn-danger:#c72e2e;--btn-ghost:#3a3d41;--toolbar:#2d2d30;--picker-bg:#252526;--picker-border:#555;--th:#2d2d30;--th-hover:#37373d;--td-border:#333;--tr-hover:#2a2d2e;--tr-sel:#094771;--footer:#000;--footer-border:#000;--muted:#888;--muted2:#aaa}
+body[data-theme="graphite"]{--bg:#2c2c2e;--fg:#e5e5e7;--topbar:#1c1c1e;--border:#0a0a0a;--chip:#3a3a3c;--chip-active:#64d2ff;--chip-hover:#48484a;--input-bg:#1c1c1e;--input-border:#48484a;--btn:#64d2ff;--btn-danger:#ff453a;--btn-ghost:#3a3a3c;--toolbar:#1c1c1e;--picker-bg:#2c2c2e;--picker-border:#48484a;--th:#1c1c1e;--th-hover:#3a3a3c;--td-border:#38383a;--tr-hover:#3a3a3c;--tr-sel:#0a84ff;--footer:#000;--footer-border:#000;--muted:#8e8e93;--muted2:#aeaeb2}
+body[data-theme="midnight"]{--bg:#191923;--fg:#e0e0ec;--topbar:#10101a;--border:#050508;--chip:#2a2a38;--chip-active:#5e5ce6;--chip-hover:#35354a;--input-bg:#10101a;--input-border:#3a3a4e;--btn:#5e5ce6;--btn-danger:#ff453a;--btn-ghost:#2a2a38;--toolbar:#14141e;--picker-bg:#191923;--picker-border:#3a3a4e;--th:#14141e;--th-hover:#20202e;--td-border:#252535;--tr-hover:#22222e;--tr-sel:#4846c9;--footer:#050508;--footer-border:#000;--muted:#6a6a8a;--muted2:#9a9ab8}
+body[data-theme="navy"]{--bg:#0d1b2a;--fg:#c8d6e5;--topbar:#1b263b;--border:#0a1520;--chip:#2c3e5d;--chip-active:#4fc3f7;--chip-hover:#34496b;--input-bg:#1b263b;--input-border:#34496b;--btn:#4fc3f7;--btn-danger:#e74c3c;--btn-ghost:#2c3e5d;--toolbar:#162235;--picker-bg:#0d1b2a;--picker-border:#34496b;--th:#162235;--th-hover:#1f2f4a;--td-border:#1f2d42;--tr-hover:#1a2a42;--tr-sel:#2a6fa0;--footer:#0a1520;--footer-border:#000;--muted:#6a8aa8;--muted2:#8aa8c8}
+body[data-theme="plum"]{--bg:#1a0f1f;--fg:#e0c8e8;--topbar:#2a1530;--border:#100a15;--chip:#3a2045;--chip-active:#ce93d8;--chip-hover:#452850;--input-bg:#2a1530;--input-border:#452850;--btn:#ce93d8;--btn-danger:#ef5350;--btn-ghost:#3a2045;--toolbar:#22122a;--picker-bg:#1a0f1f;--picker-border:#452850;--th:#22122a;--th-hover:#2e1838;--td-border:#2e1838;--tr-hover:#2a1830;--tr-sel:#7b1fa2;--footer:#100a15;--footer-border:#000;--muted:#8a6a9a;--muted2:#b090c0}
+body[data-theme="charcoal"]{--bg:#23201e;--fg:#e0dcd6;--topbar:#1a1715;--border:#0a0806;--chip:#3a3532;--chip-active:#d4a574;--chip-hover:#45403c;--input-bg:#1a1715;--input-border:#4a4440;--btn:#d4a574;--btn-danger:#e74c3c;--btn-ghost:#3a3532;--toolbar:#1e1a18;--picker-bg:#23201e;--picker-border:#4a4440;--th:#1e1a18;--th-hover:#2a2522;--td-border:#33302c;--tr-hover:#2a2624;--tr-sel:#8a6a44;--footer:#0a0806;--footer-border:#000;--muted:#8a8078;--muted2:#aaa098}
+body[data-theme="forest"]{--bg:#0f1f17;--fg:#c8e0d0;--topbar:#162a1f;--border:#0a1510;--chip:#1f3a2a;--chip-active:#66bb6a;--chip-hover:#2a4a35;--input-bg:#162a1f;--input-border:#2a4a35;--btn:#66bb6a;--btn-danger:#ef5350;--btn-ghost:#1f3a2a;--toolbar:#122519;--picker-bg:#0f1f17;--picker-border:#2a4a35;--th:#122519;--th-hover:#1a3525;--td-border:#1a3020;--tr-hover:#1a2e20;--tr-sel:#2e7d32;--footer:#0a1510;--footer-border:#000;--muted:#5a8a6a;--muted2:#8ab89a}
+body[data-theme="hc"]{--bg:#000000;--fg:#ffffff;--topbar:#1a1a1a;--border:#404040;--chip:#2a2a2a;--chip-active:#00ffff;--chip-hover:#3a3a3a;--input-bg:#000;--input-border:#888;--btn:#00ffff;--btn-danger:#ff0000;--btn-ghost:#2a2a2a;--toolbar:#1a1a1a;--picker-bg:#000;--picker-border:#888;--th:#1a1a1a;--th-hover:#2a2a2a;--td-border:#333;--tr-hover:#1a1a1a;--tr-sel:#006666;--footer:#000;--footer-border:#404040;--muted:#aaaaaa;--muted2:#cccccc}
+.topbar{background:var(--topbar);padding:8px 12px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--border);flex-wrap:wrap}
+.topbar h1{font-size:14px;color:var(--fg);margin-right:8px}
+.chip{background:var(--chip);padding:3px 10px;border-radius:12px;cursor:pointer;font-size:11px;user-select:none;color:var(--fg)}
+.chip.active{background:var(--chip-active);color:#fff}
+.chip:hover{background:var(--chip-hover)}
+.search{margin-left:auto;background:var(--input-bg);border:1px solid var(--input-border);color:var(--fg);padding:5px 10px;border-radius:3px;width:200px}
+.btn{background:var(--btn);color:#fff;border:none;padding:5px 12px;border-radius:3px;cursor:pointer;font-size:12px}
+.btn.danger{background:var(--btn-danger)}
+.btn.ghost{background:var(--btn-ghost);color:var(--fg)}
+.toolbar2{background:var(--toolbar);padding:6px 12px;display:flex;gap:6px;border-bottom:1px solid var(--border);align-items:center;position:relative;flex-wrap:wrap}
+.colpicker{position:absolute;right:12px;top:42px;background:var(--picker-bg);border:1px solid var(--picker-border);border-radius:4px;padding:8px;z-index:100;min-width:160px;display:none;box-shadow:0 4px 16px rgba(0,0,0,0.5);max-height:70vh;overflow:auto}
+.colpicker.show{display:block}
+.colpicker h4{font-size:11px;color:var(--muted2);margin-bottom:6px;font-weight:normal}
+.colpicker label{display:flex;align-items:center;gap:6px;padding:3px 0;cursor:pointer;font-size:12px;color:var(--fg)}
+.colpicker label:hover{color:var(--fg)}
+.table-wrap{flex:1;overflow:auto}
+table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px;table-layout:fixed}
+th,td{padding:6px 10px;border-bottom:1px solid var(--td-border);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;position:relative}
+th{background:var(--th);color:var(--muted2);text-align:left;font-weight:500;cursor:pointer;user-select:none;position:sticky;top:0;z-index:2}
+th:hover{background:var(--th-hover)}
+th.sorted{color:var(--muted2)}
+th .sortind{margin-left:4px;font-size:10px}
+th .resize{position:absolute;right:0;top:0;width:5px;height:100%;cursor:col-resize;background:transparent;z-index:3}
+th .resize:hover{background:var(--chip-active)}
+tr:hover td{background:var(--tr-hover)}
+tr.sel td{background:var(--tr-sel);color:#fff}
+.tier0{color:#22c55e;font-weight:600}.tier1{color:#4da3ff;font-weight:600}.tier2{color:#ff6b6b;font-weight:600}
+.qual-yes{color:#22c55e}
+.right{text-align:right;font-variant-numeric:tabular-nums}
+.hide{display:none !important}
+.footer{background:var(--footer);padding:6px 14px;font-size:11px;color:var(--muted);border-top:1px solid var(--footer-border);display:flex;gap:18px;flex-wrap:wrap}
+.themebtn{background:var(--btn-ghost);color:var(--fg);border:1px solid var(--input-border);padding:3px 10px;border-radius:3px;cursor:pointer;font-size:11px}
+</style></head><body>
+<div class="topbar">
+<h1>憨憨保种区管理</h1>
+<span class="chip active" data-tier="all">全部 <b id="cnt_all">0</b></span>
+<span class="chip" data-tier="0">0-1人 <b id="cnt_t0">0</b></span>
+<span class="chip" data-tier="1">2-3人 <b id="cnt_t1">0</b></span>
+<span class="chip" data-tier="2">4-5人 <b id="cnt_t2">0</b></span>
+<input class="search" id="q" placeholder="搜索名称...">
+<button class="btn danger" id="btnDel">删除选中</button>
+<button class="btn ghost" onclick="load()">刷新</button>
+<select class="themebtn" id="themeSel" title="选择皮肤" style="cursor:pointer;"><option value="light">纯白</option><option value="cream">米黄暖</option><option value="sakura">樱花粉</option><option value="mint">薄荷绿</option><option value="sky">天空蓝</option><option value="lavender">薰衣草紫</option><option value="silver">银灰金属</option><option value="dark">深灰</option><option value="graphite">石墨蓝</option><option value="midnight">午夜蓝</option><option value="navy">深蓝</option><option value="plum">暗紫</option><option value="charcoal">炭灰暖</option><option value="forest">暗夜绿</option><option value="hc">高对比</option></select>
+</div>
+<div class="toolbar2">
+<span style="color:#888;font-size:11px;">点击表头排序</span>
+<span style="margin-left:auto;"><button class="btn ghost" id="colsBtn">列选择</button></span>
+<div class="colpicker" id="colpicker"><h4>勾选要显示的列</h4>
+<label><input type="checkbox" data-col="c_sid" checked>种子ID</label>
+<label><input type="checkbox" data-col="c_name" checked>种子名称</label>
+<label><input type="checkbox" data-col="c_size" checked>种子大小</label>
+<label><input type="checkbox" data-col="c_init" checked>初始人数</label>
+<label><input type="checkbox" data-col="c_now" checked>现在人数</label>
+<label><input type="checkbox" data-col="c_tier" checked>档位</label>
+<label><input type="checkbox" data-col="c_done_at">完成时间</label>
+<label><input type="checkbox" data-col="c_last_settle">上次结算时间</label>
+<label><input type="checkbox" data-col="c_today_hours">今日做种时间</label>
+<label><input type="checkbox" data-col="c_qualified">今日是否达标</label>
+</div></div>
+<div class="table-wrap"><table id="tbl"><thead><tr id="head"></tr></thead><tbody id="tbody"></tbody></table></div>
+<div class="footer">
+<span>已选 <b id="seln">0</b> 个 / 共 <b id="totaln">0</b> 个</span>
+<span>已选体积 <b id="selgb">0</b> GB</span>
+<span>总体积 <b id="totalgb">0</b> GB</span>
+</div>
+<script>
+var APIKEY=__APIKEY__;
+var COLS=[
+{k:"c_sid",t:"种子ID",w:"70",r:1,sortk:"seed_id"},
+{k:"c_name",t:"种子名称",w:"260",sortk:"title"},
+{k:"c_size",t:"种子大小",w:"90",r:1,sortk:"size"},
+{k:"c_init",t:"初始人数",w:"70",r:1,sortk:"seeders"},
+{k:"c_now",t:"现在人数",w:"70",r:1,sortk:"now_seeders"},
+{k:"c_tier",t:"档位",w:"80",sortk:"seeders"},
+{k:"c_done_at",t:"完成时间",w:"140",sortk:"completed_at"},
+{k:"c_last_settle",t:"上次结算时间",w:"140",sortk:"last_settle"},
+{k:"c_today_hours",t:"今日做种时间",w:"90",sortk:"today_hours"},
+{k:"c_qualified",t:"今日达标",w:"70",sortk:"qualified"}
+];
+var seeds=[],filtered=[],sel={};
+var curTier="all",sortKey="size",sortDir=-1,query="";
+function tierOf(n){n=+n||0;return n<=1?0:(n<=3?1:2)}
+function fmtSize(gb){if(!isFinite(gb))return "-";gb=+gb;if(gb>=1024)return(gb/1024).toFixed(2)+" TB";return gb.toFixed(2)+" GB"}
+function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;")}
+function buildHead(){
+var h='<th style="width:28px;"><input type="checkbox" id="chkAll"></th>';
+for(var i=0;i<COLS.length;i++){var c=COLS[i];var hide=c.visible===false?" hide":"";
+var ind="";if(sortKey===c.sortk)ind=sortDir<0?" \u25BC":" \u25B2";
+h+='<th class="'+(c.r?"right ":"")+(sortKey===c.sortk?" sorted":"")+hide+'" data-col="'+c.k+'" data-sortk="'+c.sortk+'" style="width:'+c.w+'px;">'+c.t+'<span class="sortind">'+ind+'</span><span class="resize"></span></th>';}
+h+='<th style="width:60px;">操作</th>';
+document.getElementById("head").innerHTML=h;bindHead();
+}
+function bindHead(){
+document.querySelectorAll("th .resize").forEach(function(hd){hd.onmousedown=function(e){e.preventDefault();e.stopPropagation();
+var th=hd.parentElement,sx=e.clientX,sw=th.offsetWidth;
+function mv(ev){var w=Math.max(40,sw+ev.clientX-sx);th.style.width=w+"px";var col=th.dataset.col;if(col)document.querySelectorAll('td[data-col="'+col+'"]').forEach(function(td){td.style.width=w+"px"})}
+function up(){document.removeEventListener("mousemove",mv);document.removeEventListener("mouseup",up)}
+document.addEventListener("mousemove",mv);document.addEventListener("mouseup",up)}});
+document.querySelectorAll("th[data-sortk]").forEach(function(th){th.onclick=function(){var sk=this.dataset.sortk;if(sortKey===sk){sortDir=-sortDir}else{sortKey=sk;sortDir=-1}doSort();buildHead();render()}});
+document.getElementById("chkAll").onchange=function(){var v=this.checked;filtered.forEach(function(s){sel[s.title]=v});render()};
+}
+function doSort(){
+seeds.sort(function(a,b){
+var va=a[sortKey]||0,vb=b[sortKey]||0;
+if(typeof va==="string")return va.localeCompare(vb)*sortDir;
+return(va-vb)*sortDir;
+});
+}
+function cellVal(c,s,t){
+if(c.k==="c_sid")return s.seed_id||"-";
+if(c.k==="c_name")return '<span title="'+esc(s.title)+'">'+esc(s.title)+"</span>";
+if(c.k==="c_size")return fmtSize(s.size);
+if(c.k==="c_init")return s.seeders;
+if(c.k==="c_now")return s.now_seeders!=null?s.now_seeders:"-";
+if(c.k==="c_tier")return '<span class="'+["tier0","tier1","tier2"][t]+'">'+["0-1人","2-3人","4-5人"][t]+"</span>";
+if(c.k==="c_done_at")return esc(s.completed_at||"-");
+if(c.k==="c_last_settle")return esc(s.last_settle||"-");
+if(c.k==="c_today_hours")return esc(s.today_hours||"-");
+if(c.k==="c_qualified"){var q=s.qualified||"";var ok=(q.indexOf("\u5df2\u8fbe")>=0||q==="\u662f"||q==="Y"||q==="\u2713"||q==="\u2714"||q.indexOf("\u2714")>=0||q.indexOf("OK")>=0);return '<span class="'+(ok?"qual-yes":"")+'">'+esc(q||"-")+"</span>";}
+return "";
+}
+function render(){
+var f=seeds.filter(function(s){if(curTier!=="all"&&String(tierOf(s.seeders))!==curTier)return false;if(query&&(s.title||"").toLowerCase().indexOf(query)<0)return false;return true});
+filtered=f;
+var html="";
+for(var i=0;i<f.length;i++){var s=f[i];var t=tierOf(s.seeders);var seled=!!sel[s.title];
+html+='<tr class="'+(seled?"sel":"")+'">';
+html+='<td><input type="checkbox" data-idx="'+i+'" '+(seled?"checked":"")+"></td>";
+for(var j=0;j<COLS.length;j++){var c=COLS[j];if(c.visible===false)continue;
+html+='<td class="'+(c.r?"right ":"")+'" data-col="'+c.k+'">'+cellVal(c,s,t)+"</td>";}
+html+='<td><a style="color:#ff8080;cursor:pointer;" data-del="'+i+'">删除</a></td></tr>';}
+if(!f.length)html='<tr><td colspan="20" style="text-align:center;padding:40px;color:#888">无匹配种子</td></tr>';
+document.getElementById("tbody").innerHTML=html;
+document.querySelectorAll("#tbody input[type=checkbox]").forEach(function(cb){cb.onchange=function(){var i=+this.dataset.idx;var t=filtered[i].title;sel[t]=this.checked;renderFooter()}});
+document.querySelectorAll("#tbody [data-del]").forEach(function(a){a.onclick=function(){delOne(filtered[+this.dataset.del].title)}});
+renderFooter();
+}
+function renderFooter(){
+var sn=0,sgb=0;seeds.forEach(function(s){if(sel[s.title]){sn++;sgb+=+s.size||0}});
+document.getElementById("seln").textContent=sn;document.getElementById("selgb").textContent=sgb.toFixed(1);
+document.getElementById("totaln").textContent=seeds.length;document.getElementById("totalgb").textContent=seeds.reduce(function(a,b){return a+(+b.size||0)},0).toFixed(1);
+var c0=0,c1=0,c2=0;seeds.forEach(function(s){var t=tierOf(s.seeders);if(t===0)c0++;else if(t===1)c1++;else c2++});
+document.getElementById("cnt_all").textContent=seeds.length;
+document.getElementById("cnt_t0").textContent=c0;document.getElementById("cnt_t1").textContent=c1;document.getElementById("cnt_t2").textContent=c2;
+}
+async function load(){
+try{
+var r=await fetch("/api/v1/plugin/HHClubButler/list_rescue_seeds?apikey="+encodeURIComponent(APIKEY));
+var j=await r.json();
+if(!j.success){alert("加载失败:"+(j.message||""));return}
+seeds=j.data||[];doSort();render();
+}catch(e){alert("请求失败:"+e)}}
+async function delOne(title){
+if(!confirm("确认删除种子:\\n"+title+"\\n\\n将同时删除下载器任务和文件!"))return;
+await doDel([title])}
+async function delSel(){
+var ts=Object.keys(sel).filter(function(k){return sel[k]});
+if(!ts.length){alert("未选中任何种子");return}
+if(!confirm("确认删除选中的 "+ts.length+" 个种子?\\n将同时删除下载器任务和文件!"))return;
+await doDel(ts)}
+async function doDel(titles){
+for(var i=0;i<titles.length;i++){
+try{var r=await fetch("/api/v1/plugin/HHClubButler/delete_rescue_seed?apikey="+encodeURIComponent(APIKEY),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({title:titles[i]})});var j=await r.json();if(!j.success)alert("删除失败:"+titles[i]+" -> "+(j.message||""));delete sel[titles[i]]}
+catch(e){alert("删除异常:"+titles[i]+" "+e)}}
+await load()}
+document.getElementById("btnDel").onclick=delSel;
+document.getElementById("q").oninput=function(){query=this.value.trim().toLowerCase();render()};
+document.querySelectorAll(".topbar .chip").forEach(function(c){c.onclick=function(){document.querySelectorAll(".topbar .chip").forEach(function(x){x.classList.remove("active")});this.classList.add("active");curTier=this.dataset.tier;render()}});
+var cp=document.getElementById("colpicker");
+var LS_KEY="hhclubbutler_colcfg_v1";
+function loadColCfg(){
+try{
+var raw=localStorage.getItem(LS_KEY);
+if(!raw)return;
+var cfg=JSON.parse(raw);
+if(cfg&&typeof cfg==="object"){
+for(var i=0;i<COLS.length;i++){if(cfg[COLS[i].k]!==undefined)COLS[i].visible=cfg[COLS[i].k]}
+}
+}catch(e){}
+}
+function saveColCfg(){
+try{var cfg={};for(var i=0;i<COLS.length;i++)cfg[COLS[i].k]=COLS[i].visible!==false;localStorage.setItem(LS_KEY,JSON.stringify(cfg))}catch(e){}
+}
+function syncColChecks(){
+cp.querySelectorAll("input[type=checkbox]").forEach(function(cb){
+for(var i=0;i<COLS.length;i++){if(COLS[i].k===cb.dataset.col){cb.checked=COLS[i].visible!==false;break}}
+});
+}
+document.getElementById("colsBtn").onclick=function(e){e.stopPropagation();syncColChecks();cp.classList.toggle("show")};
+document.addEventListener("click",function(e){if(!cp.contains(e.target))cp.classList.remove("show")});
+cp.querySelectorAll("input[type=checkbox]").forEach(function(cb){cb.onchange=function(){var col=cb.dataset.col;var def=null;for(var i=0;i<COLS.length;i++)if(COLS[i].k===col)def=COLS[i];if(def){def.visible=cb.checked;saveColCfg();buildHead();render()}}});
+loadColCfg();
+var THEME_KEY="hhclubbutler_theme_v1";
+function applyTheme(t){document.body.setAttribute("data-theme",t);try{localStorage.setItem(THEME_KEY,t)}catch(e){}}
+try{var lt=localStorage.getItem(THEME_KEY);if(lt)applyTheme(lt);else applyTheme("dark");}catch(e){applyTheme("dark");}
+var sel=document.getElementById("themeSel");
+sel.value=document.body.getAttribute("data-theme")||"dark";
+sel.onchange=function(){applyTheme(this.value)};
+buildHead();load();
+</script></body></html>"""
+        return html.replace("__APIKEY__", ak)
+
+    def api_delete_rescue_seed(self, title: str = None):
+        if not title:
+            return {"success": False, "message": "缺少 title 参数"}
+        logger.info(f"手动删除请求：{title}")
+        try:
+            service = self._get_downloader_obj()
+            if not service:
+                return {"success": False, "message": "未配置有效下载器"}
+            torrents, error = service.instance.get_torrents()
+            if error:
+                return {"success": False, "message": "下载器获取种子列表失败"}
+            target_norm = HHClubButler._norm_title(title)
+            del_ids = []
+            matched_name = None
+            for t in torrents:
+                try:
+                    tname = t.get("name") if isinstance(t, dict) else getattr(t, "name", "")
+                    thash = (t.get("hash") if isinstance(t, dict)
+                             else getattr(t, "hash", None) or getattr(t, "hashString", ""))
+                except Exception:
+                    continue
+                if HHClubButler._norm_match(tname, {target_norm}):
+                    del_ids.append(thash)
+                    matched_name = tname
+            if not del_ids:
+                return {"success": False, "message": f"下载器中未找到匹配种子：{title}"}
+            service.instance.delete_torrents(delete_file=True, ids=del_ids)
+            logger.info(f"已手动删除种子：{matched_name}（{len(del_ids)}个任务，含文件）")
+            try:
+                self._refresh_overview(manual=False)
+            except Exception:
+                pass
+            return {"success": True, "message": f"已删除：{matched_name or title}"}
+        except Exception as e:
+            logger.error(f"手动删除种子失败：{e}")
+            return {"success": False, "message": f"删除失败：{e}"}
+
     def run(self):
-        """执行优选流程"""
         if self._running:
             logger.info("憨憨保种区管家正在运行中，跳过本次触发")
             return
         cookie = self._get_site_cookie()
         if not cookie:
-            self._last_result = "未获取到站点Cookie（MP站点管理未配置憨憨站，或未手动填写）"
+            self._last_result = "未获取到站点Cookie"
             logger.warning(self._last_result)
             return
         self._running = True
@@ -1113,13 +1093,10 @@ class HHClubButler(_PluginBase):
             self._last_result = f"运行异常：{e}"
             if self._notify:
                 try:
-                    self.post_message(
-                        mtype=NotificationType.Plugin,
-                        title="【憨憨保种区管家】运行异常",
-                        text=str(e)
-                    )
-                except Exception as ex:
-                    logger.error(f"憨憨保种区管家异常通知发送失败：{ex}")
+                    self.post_message(mtype=NotificationType.Plugin,
+                                      title="【憨憨保种区管家】运行异常", text=str(e))
+                except Exception:
+                    pass
         finally:
             self._running = False
 
@@ -1128,108 +1105,57 @@ class HHClubButler(_PluginBase):
         logger.info(f"憨憨保种区管家运行开始（代码版本 v{self.plugin_version}）")
         logs.append("=== 憨憨保种区管家保种优选开始 ===")
 
-        # 1. 抓取保种区全部种子
         seeds = self._fetch_rescue_all(logs)
         if not seeds:
             self._last_result = "保种区未获取到种子（检查Cookie是否有效）"
             logger.warning(self._last_result)
             self._save_log(logs)
             return
-        # v0.30：全量备份（含0做种/不满足条件的），供在途种子积分/体积反查
         seeds_full = list(seeds)
-        # 全量种子标题（含0做种/不满足做种人数条件的），供自动清理兜底识别：
-        # 只要任务名来自保种区，无论当前做种人数如何都能识别为本站种子
         all_site_titles = {HHClubButler._norm_title(s.get("title") or "") for s in seeds}
 
-        # 排除0做种人数
         if self._exclude_zero:
             before = len(seeds)
             seeds = [s for s in seeds if s.get("seeders", 0) > 0]
             logs.append(f"已排除0做种种子 {before - len(seeds)} 个，剩 {len(seeds)} 个")
 
-        # 2. 获取当前保种情况（完成页+下载器交集）
         current = self._get_current_seeding(logs)
         if current.get("error"):
             msg = f"无法获取当前保种情况（{current['error']}），为防止误推送已停止运行"
-            logs.append(f"❌ {msg}")
             self._last_result = msg
             logger.warning(msg)
             self._save_log(logs)
             return
-        current_pt = current.get("total_pt", 0.0)
         current_gb = current.get("total_gb", 0.0)
-        # v1.2.2: 候选种子的 A 份额日贡献以当前保种集合为基准归一（单独按候选池算会虚高）
-        if not current.get("degraded") and seeds and current.get("seeds"):
-            try:
-                cur_seeds = current["seeds"]
-                ref_a = sum(seed_a_factor(s.get("seeders", 0) or 1, s.get("size", 0),
-                                          s.get("pub_weeks", 4.0),
-                                          s.get("seeders_now", 0) or (s.get("seeders", 0) or 1))
-                            for s in cur_seeds if (s.get("seeders", 0) or 1) <= 5)
-                ref_n = sum(1 for s in cur_seeds if (s.get("seeders", 0) or 1) <= 5)
-                if ref_a > 0:
-                    ref_b = beans_per_hour(ref_a, ref_n, b0=29.0)
-                    for s in seeds:
-                        n = s.get("seeders", 0) or 1
-                        if n > 5:
-                            s["daily_pt"] = s["daily_bean"] = 0.0
-                            s["pt_per_gb"] = 0.0
-                            continue
-                        a = seed_a_factor(n, s.get("size", 0), s.get("pub_weeks", 4.0), n)
-                        bm, pm = multiplier(n)
-                        s["daily_bean"] = ref_b * (a / ref_a) * bm * HOURS
-                        s["daily_pt"] = ref_b * (a / ref_a) * pm * HOURS
-                        s["pt_per_gb"] = s["daily_pt"] / max(s.get("size", 0.1), 0.1)
-            except Exception as e:
-                logs.append(f"候选种子按当前集合归一跳过：{e}")
-        logs.append(f"当前保种：{current.get('count', 0)} 个，预计每日积分 {current_pt:.1f}，体积 {current_gb:.1f} GB")
+        logs.append(f"当前保种：{current.get('count', 0)} 个，体积 {current_gb:.1f} GB")
 
-        # 2.4 v0.33：自动清理超时未完成的下载任务（本站相关：tracker匹配/本站标签/保种区种子名三重识别）。
-        # 置于在途计算与达标判断之前：①无论本次是否达标/推送，启用即执行（此前达标提前 return 会跳过清理）；
-        # ②清理后再算在途，被清理的超时任务不再虚计入在途，避免误判达标而不推
         logger.info(f"自动清理配置：{self._auto_clean_days:g} 天（{'启用' if self._auto_clean_days > 0 else '未启用'}）")
         cleaned = 0
         if self._auto_clean_days > 0:
             cleaned = self._clean_stale_downloads(logs, seeds, all_site_titles)
 
-        # 2.5 v0.30：在途种子（下载中未完成）计算 + 候选剔除已在下载器的种子
-        # 目的：①优选不再选中在途种子（防重复推送）；②达标评估计入在途（防过度推送）
         dl_all = self._get_downloader_seeds(logs, only_completed=False, any_tracker=True)
-        in_flight_pt = 0.0
         in_flight_gb = 0.0
         if dl_all is None:
             dl_norm_all = set()
-            logs.append("⚠️ 下载器种子列表获取失败，在途与去重均无法判定，本次暂停推送新增以防重复")
+            logs.append("⚠️ 下载器种子列表获取失败，本次暂停推送以防重复")
         else:
             dl_done = self._get_downloader_seeds(logs, only_completed=True, any_tracker=True) or set()
-            # 归一化名集合：下载器任务名与保种区标题常有点/空格/括号差异（如 QB 点分隔 vs 站点空格），
-            # 必须归一化后再做差集与积分反查，否则在途积分/体积会全部落空（原始名查不到归一化 key）
             dl_norm_all = {HHClubButler._norm_title(n) for n in dl_all}
             dl_done_norm = {HHClubButler._norm_title(n) for n in dl_done}
             in_flight_norms = dl_norm_all - dl_done_norm
             if in_flight_norms:
-                pt_map = {}
                 gb_map = {}
                 for s in seeds_full:
-                    nm = HHClubButler._norm_title(s.get("title") or "")
-                    pt_map[nm] = s.get("daily_pt", 0.0)
-                    gb_map[nm] = s.get("size", 0.0)
-                for nm in in_flight_norms:
-                    in_flight_pt += pt_map.get(nm, 0.0)
-                    in_flight_gb += gb_map.get(nm, 0.0)
-            logs.append(f"在途（下载中未完成）{len(in_flight_norms)} 个，预计积分 {in_flight_pt:.1f}，"
-                        f"体积 {in_flight_gb:.1f} GB")
-            logger.info(f"憨憨保种区管家：在途（下载中未完成）{len(in_flight_norms)} 个，"
-                        f"预计积分 {in_flight_pt:.1f}，体积 {in_flight_gb:.1f} GB")
-            # 候选剔除：已在下载器的种子（含在途）不再作为新增候选，从源头防重复推送
+                    gb_map[HHClubButler._norm_title(s.get("title") or "")] = s.get("size", 0.0)
+                in_flight_gb = sum(gb_map.get(nm, 0.0) for nm in in_flight_norms)
+            logs.append(f"在途（下载中未完成）{len(in_flight_norms)} 个，体积 {in_flight_gb:.1f} GB")
             before = len(seeds)
             seeds = [s for s in seeds if HHClubButler._norm_title(s.get("title") or "") not in dl_norm_all]
             removed = before - len(seeds)
             if removed:
                 logs.append(f"已剔除 {removed} 个已在下载器中的候选（含下载中），剩 {len(seeds)} 个")
-                logger.info(f"憨憨保种区管家：已剔除 {removed} 个已在下载器中的候选（含下载中），剩 {len(seeds)} 个")
 
-        # 缓存概况数据（设置页顶部卡片用，免二次抓取）；降级运行不覆盖上次正常概况
         if not current.get("degraded"):
             try:
                 self._last_overview = self._build_overview_from_current(current)
@@ -1237,165 +1163,112 @@ class HHClubButler(_PluginBase):
             except Exception as e:
                 logger.error(f"构建概况缓存失败：{e}")
 
-        # 3. 计算目标（按积分/按体积 二选一）；v0.30：达标评估计入在途，当前+在途达标则本次不推不删
-        target = self._target_pt if not self._use_volume else self._target_volume
-        if not self._use_volume:
-            committed = current_pt + in_flight_pt
-            # v1.1：wash 换种模式即使当前+在途已达标也放行，允许删低补高；
-            #       增量模式仍按"已达标就停"避免重复推送
-            if committed >= target - 1e-6 and self._mode != "wash":
-                msg = f"当前保种+在途预计已达标（{committed:.1f} ≥ 目标 {target:.0f}），本次不推不删"
+        target = self._target_volume
+        committed_gb = current_gb + in_flight_gb
+        if target and target > 0:
+            if committed_gb >= target - 1e-6 and self._mode != "wash":
+                msg = f"当前保种+在途已达标（{committed_gb:.1f} GB ≥ 目标 {target:.0f} GB），本次不推不删"
                 logs.append(msg)
-                self._last_result = f"已达目标（当前+在途 {committed:.1f}/{target:.0f} 积分）"
+                self._last_result = f"已达目标（{committed_gb:.1f}/{target:.0f} GB）"
                 logger.info(f"憨憨保种区管家：{msg}")
                 self._save_log(logs)
                 return
-            eff_target = max(0.0, target - committed)
-            logs.append(f"目标积分 {target}，当前保种预计 {current_pt:.1f}，在途预计 {in_flight_pt:.1f}，"
-                        f"差额 {eff_target:.1f}")
+            eff_target = max(0.0, target - committed_gb)
+            logs.append(f"目标体积（总保种上限）{target:g}，当前 {current_gb:.1f}，在途 {in_flight_gb:.1f}，"
+                        f"剩余可增 {eff_target:.1f} GB")
         else:
-            committed = current_gb + in_flight_gb
-            # v1.1：wash 换种模式即使已达标也放行（同积分分支）
-            if committed >= target - 1e-6 and self._mode != "wash":
-                msg = f"当前保种+在途预计已达标（{committed:.1f} GB ≥ 目标 {target:.0f} GB），本次不推不删"
-                logs.append(msg)
-                self._last_result = f"已达目标（当前+在途 {committed:.1f}/{target:.0f} GB）"
-                logger.info(f"憨憨保种区管家：{msg}")
-                self._save_log(logs)
-                return
-            eff_target = max(0.0, target - committed)
-            logs.append(f"目标体积（总保种上限）{target}，当前保种体积 {current_gb:.1f} GB，"
-                        f"在途预计 {in_flight_gb:.1f} GB，剩余可增 {eff_target:.1f} GB")
+            eff_target = 0.0
 
-        # 4. 做种人数条件过滤（增量/换种两种模式均生效）
         if self._seeder_cond:
             rng = HHClubButler._parse_seeder_range(self._seeder_cond)
             if rng is None:
-                logs.append(f"做种人数条件无法解析：{self._seeder_cond!r}，本次按不限处理")
+                logs.append(f"做种人数条件无法解析：{self._seeder_cond!r}，按不限处理")
             else:
                 before = len(seeds)
                 seeds = [s for s in seeds if rng[0] <= s.get("seeders", 0) <= rng[1]]
                 logs.append(f"做种人数条件 {rng[0]}~{rng[1]}：候选 {before} → {len(seeds)} 个")
 
-        # 5. 优选（增量/换种）
         if self._mode == "wash" and current.get("seeds"):
-            wash_target = max(0.0, target - (in_flight_pt if not self._use_volume else in_flight_gb))
-            result = self._optimize_with_wash(seeds, current.get("seeds"), eff_target, wash_target, logs)
+            result = self._optimize_wash(seeds, current.get("seeds"), eff_target, logs)
         else:
             result = self._optimize_incremental(seeds, eff_target, current_gb, logs)
             result["del_seeds"] = []
-            result["keep_count"] = 0
 
         picked = result.get("picked", [])
-        # 6. 删除低效种子（择优换种）
         if result.get("del_seeds"):
             self._delete_seeds(result["del_seeds"], logs)
             for s in result["del_seeds"]:
-                logger.info(f"优选删除种子: {s.get('title','')} | "
-                            f"{s.get('size',0.0):.1f} GB | "
-                            f"初始做种 {s.get('seeders','?')} 人 | "
-                            f"-{s.get('daily_pt',0.0):.1f} 积分")
-        # 6.5 过滤已在下载器中的种子，避免重复推送（取全部种子含下载中/暂停/tracker缺失的，
-        #     不按tracker筛选——tracker字段可能因暂停未连接等缺失，按tracker筛选会漏掉已在下载器的种子）
-        # v0.30：复用 2.5 步抓取的 dl_all；获取失败时保守暂停推送防重复
+                logger.info(f"优选删除种子: {s.get('title','')} | {s.get('size',0.0):.1f} GB | "
+                            f"初始做种 {s.get('seeders','?')} 人")
+
         filtered = 0
-        if picked:
-            if dl_all is None:
-                logs.append("⚠️ 去重检查失败（下载器列表获取失败），本次暂停推送防重复")
-                picked = []
-            else:
-                # 归一化标题比较：站点标题与下载器任务名常有空格/点/括号差异，原始文本匹配会漏
-                before = len(picked)
-                picked = [s for s in picked if HHClubButler._norm_title(s["title"]) not in dl_norm_all]
-                filtered = before - len(picked)
-                if filtered:
-                    logs.append(f"已过滤 {filtered} 个已在下载器的种子，实际推送 {len(picked)} 个")
-        # 7. 推送新增种子
+        if picked and dl_all is not None:
+            before = len(picked)
+            picked = [s for s in picked if HHClubButler._norm_title(s["title"]) not in dl_norm_all]
+            filtered = before - len(picked)
+            if filtered:
+                logs.append(f"已过滤 {filtered} 个已在下载器的种子，实际推送 {len(picked)} 个")
+
         ok_count = fail_count = 0
         fail_list = []
         if picked:
             ok_count, fail_count, fail_list = self._push_seeds(picked, logs)
             for s in picked:
-                logger.info(f"优选新增种子: {s.get('title','')} | "
-                            f"{s.get('size',0.0):.1f} GB | "
-                            f"初始做种 {s.get('seeders','?')} 人 | "
-                            f"+{s.get('daily_pt',0.0):.1f} 积分")
+                logger.info(f"优选新增种子: {s.get('title','')} | {s.get('size',0.0):.1f} GB | "
+                            f"初始做种 {s.get('seeders','?')} 人")
         else:
             logs.append("无需新增下载")
 
-        # 推送失败记录与告警：run_log 汇总行 + 系统日志 error 级（便于排查）
         if fail_list:
             logs.append(f"❌ 推送失败 {len(fail_list)} 个：")
             for f in fail_list:
                 logger.error(f"推送失败种子: {f['title']} | {f['reason']}")
                 logs.append(f"   {f['title']}（{f['reason']}）")
 
-        # 汇总（按实际推送的种子重算积分/体积——去重过滤后可能与优选结果不同）
-        total_pt = sum(s.get("daily_pt", 0.0) for s in picked)
         total_gb = sum(s.get("size", 0.0) for s in picked)
         mode_name = "换种" if self._mode == "wash" else "增量"
-        summary = (f"{mode_name}优选 {len(picked)} 个 | "
-                   f"新增积分 {total_pt:.1f} | "
-                   f"新增体积 {total_gb:.1f} GB")
+        summary = (f"{mode_name}优选 {len(picked)} 个 | 新增体积 {total_gb:.1f} GB")
         if result.get("del_seeds"):
             summary += f" | 删除 {len(result['del_seeds'])} 个"
         logs.append("=== " + summary + " ===")
         self._last_result = summary
         self._save_log(logs)
         logger.info(f"憨憨保种区管家优选完成：{summary}")
+
         if self._notify:
             try:
-                notify = self._build_notify(mode_name, current, current_pt, current_gb,
-                                            target, eff_target, picked, total_pt, total_gb,
-                                            filtered, ok_count, fail_count, fail_list,
-                                            result, cleaned)
-                self.post_message(
-                    mtype=NotificationType.Plugin,
-                    title=f"【憨憨保种区管家】{mode_name}优选完成",
-                    text="\n".join(notify)
-                )
-                logger.info("憨憨保种区管家通知已发送（按MP『消息通知』配置的渠道分发：企微/Telegram/站内信等）")
+                notify = self._build_notify(mode_name, current, target, eff_target, picked, total_gb,
+                                            filtered, ok_count, fail_count, fail_list, result, cleaned)
+                self.post_message(mtype=NotificationType.Plugin,
+                                  title=f"【憨憨保种区管家】{mode_name}优选完成",
+                                  text="\n".join(notify))
             except Exception as e:
                 logger.error(f"憨憨保种区管家发送通知失败：{e}")
-        else:
-            logger.info("憨憨保种区管家通知未开启（『发送通知』开关为关），已跳过发送")
 
-        # v1.1：wash 删除后，从当前保种快照中扣掉已删种子再更新概况缓存。
-        # 不重新抓取完成页/下载器（零新增网络请求，对 PT 站更友好）；
-        # 新推送的种子仍在下载中，本就不计入"在保种子"，故只减不增。
         del_done = result.get("del_seeds") or []
         if del_done and not current.get("degraded"):
             del_titles = {s.get("title") for s in del_done}
             remain = [s for s in current.get("seeds", []) if s.get("title") not in del_titles]
             current["seeds"] = remain
             current["count"] = len(remain)
-            current["total_pt"] = sum(s.get("daily_pt", 0.0) for s in remain)
             current["total_gb"] = sum(s.get("size", 0.0) for s in remain)
             try:
                 self._last_overview = self._build_overview_from_current(current)
                 self._last_overview_ts = time.time()
-                logger.info(f"憨憨保种区管家：概况已按删除后更新（{len(remain)} 个 / "
-                            f"{current['total_gb']:.1f} GB / {current['total_pt']:.1f} 积分）")
             except Exception as e:
                 logger.error(f"删除后更新概况失败：{e}")
 
-    def _build_notify(self, mode_name: str, current: dict, current_pt: float,
-                      current_gb: float, target: float, eff_target: float,
-                      picked: list, total_pt: float, total_gb: float,
-                      filtered: int, ok_count: int, fail_count: int,
-                      fail_list: list, result: dict, cleaned: int = 0) -> list:
-        """构造精简通知正文（手机阅读友好，去掉过程性日志）"""
+    def _build_notify(self, mode_name, current, target, eff_target, picked, total_gb,
+                      filtered, ok_count, fail_count, fail_list, result, cleaned=0) -> list:
         lines = ["──────────────"]
-        lines.append(f"当前保种：{current.get('count', 0)} 个")
-        lines.append(f"预计积分：{current_pt:.1f} / 日")
-        if self._use_volume:
+        lines.append(f"当前保种：{current.get('count', 0)} 个 / {current.get('total_gb', 0.0):.1f} GB")
+        if target and target > 0:
             lines.append(f"目标体积：{target:.0f} GB（剩余可增 {eff_target:.1f} GB）")
         else:
-            lines.append(f"目标积分：{target:.0f}（差额 {eff_target:.1f}）")
-        lines.append(f"保种体积：{current_gb:.1f} GB")
+            lines.append("目标体积：不限")
         lines.append("──────────────")
         if picked:
-            lines.append(f"新增 {len(picked)} 个种子：+{total_pt:.1f} 积分/日 · +{total_gb:.1f} GB")
+            lines.append(f"新增 {len(picked)} 个种子：+{total_gb:.1f} GB")
             for s in picked[:5]:
                 t = (s.get("title") or "").strip()
                 t = t if len(t) <= 36 else t[:36] + "…"
@@ -1404,37 +1277,23 @@ class HHClubButler(_PluginBase):
                 lines.append(f"  …等共 {len(picked)} 个")
             if fail_count:
                 lines.append(f"⚠️ 推送失败：{fail_count} 个（成功 {ok_count}）")
-                for f in fail_list[:5]:
-                    t = (f.get('title') or '').strip()
-                    t = t if len(t) <= 30 else t + "…"
-                    lines.append(f"  ✗ {t}（{f.get('reason','')}）")
-                if len(fail_list) > 5:
-                    lines.append(f"  …等共 {len(fail_list)} 个失败")
             else:
                 lines.append(f"推送成功：{ok_count}/{len(picked)}")
         else:
             lines.append("无需新增下载")
             if filtered > 0:
                 lines.append(f"已过滤 {filtered} 个已在下载器的种子")
-            elif eff_target <= 0:
-                lines.append("当前保种已达标")
         if result.get("del_seeds"):
-            lines.append(f"删除低效种子：{len(result['del_seeds'])} 个")
+            lines.append(f"删除低档位种子：{len(result['del_seeds'])} 个")
             for s in result["del_seeds"][:5]:
                 t = (s.get("title") or "").strip()
                 t = t if len(t) <= 32 else t[:32] + "…"
                 lines.append(f"  - {t}（做种{s.get('seeders','?')}人/{s.get('size',0.0):.0f}GB）")
-            if len(result["del_seeds"]) > 5:
-                lines.append(f"  …等共 {len(result['del_seeds'])} 个")
         if cleaned > 0:
-            lines.append(f"清理超时未完成：{cleaned} 个（含未完成文件）")
+            lines.append(f"清理超时未完成：{cleaned} 个")
         return lines
 
-    # ============================================================
-    # 站点抓取
-    # ============================================================
     def _get_mp_site(self):
-        """从MP站点管理自动获取憨憨站配置（cookie/ua/url），无需手动填"""
         try:
             site_oper = SiteOper()
             for site in site_oper.list_active():
@@ -1448,8 +1307,6 @@ class HHClubButler(_PluginBase):
         return None
 
     def _get_site_cookie(self) -> str:
-        """获取站点Cookie：优先MP站点管理，其次配置页手动填写。
-        v1.2：读到后缓存到 self._cookie，避免每次推送种子都重复读MP+重复打日志"""
         if not self._cookie:
             site = self._get_mp_site()
             if site and site.cookie:
@@ -1458,120 +1315,7 @@ class HHClubButler(_PluginBase):
                 return self._cookie
         return self._cookie or ""
 
-    def _recompute_daily(self, seeds: list):
-        """v1.2.2: 按 A 份额模型重算每颗种子的日憨豆/积分贡献（两遍计算，自洽于卡片总量）。
-
-        公式: A总 = Σ (1-10^(-T/8))×S×(1+2×10^(-(N-1)/9))  (N=初始保种人数, T=发布时间周数)
-              B总 = 0.02×min(N,500) + 29×(2/π)×arctan(A总/300-5) + 20
-              单种子日贡献 = B总 × (aᵢ/A总) × 档位倍率 × 18h
-        """
-        if not seeds:
-            return
-        total_a = 0.0
-        total_n = 0
-        for s in seeds:
-            n = s.get("seeders", 0) or 1
-            if n > 5:
-                continue
-            n_now = s.get("seeders_now", 0) or n
-            total_a += seed_a_factor(n, s.get("size", 0), s.get("pub_weeks", 4.0), n_now)
-            total_n += 1
-        if total_a <= 0 or total_n <= 0:
-            return
-        # v1.2.3: 憨豆/积分 B0 分离（4天结算真值反推，保种区A口径）：憨豆 31.5、积分 30.5
-        # wiki 标注"保种区B0为25"，但数学上 B0=25 最大 B=0.02N+25+20=47.5/h 达不到实结，已证伪
-        b_total_bean = beans_per_hour(total_a, total_n, b0=31.5)
-        b_total_pt = beans_per_hour(total_a, total_n, b0=30.5)
-        for s in seeds:
-            n = s.get("seeders", 0) or 1
-            if n > 5:
-                s["daily_pt"] = 0.0
-                s["daily_bean"] = 0.0
-                s["pt_per_gb"] = 0.0
-                continue
-            n_now = s.get("seeders_now", 0) or n
-            a = seed_a_factor(n, s.get("size", 0), s.get("pub_weeks", 4.0), n_now)
-            bm, pm = multiplier(n)
-            s["daily_bean"] = b_total_bean * (a / total_a) * bm * HOURS
-            s["daily_pt"] = b_total_pt * (a / total_a) * pm * HOURS
-            s["pt_per_gb"] = s["daily_pt"] / max(s.get("size", 0.1), 0.1)
-        # v1.3.0: 保种区额外积分上限 1800（用户实证），超出按比例缩放
-        _pt_sum = sum(s.get("daily_pt", 0.0) for s in seeds)
-        if _pt_sum > 1800:
-            _ratio = 1800.0 / _pt_sum
-            for s in seeds:
-                s["daily_pt"] = s.get("daily_pt", 0.0) * _ratio
-                s["pt_per_gb"] = s["daily_pt"] / max(s.get("size", 0.1), 0.1)
-
-    def _save_pubtime_cache(self):
-        """持久化发布时间缓存（位置参数，跟网友插件一致）"""
-        try:
-            self.save_data("pubtime_cache", self._pubtime_cache)
-        except Exception:
-            pass
-
-    def _batch_resolve_pubtime(self, seeds: list, logs: list):
-        """批量补全种子发布时间：有缓存直接用，没缓存的并发请求 details.php"""
-        if not seeds:
-            return
-        missing = [s for s in seeds if s.get("seed_id")]
-        if not missing:
-            return
-        # 先查缓存
-        need_fetch = []
-        for s in missing:
-            key = str(s["seed_id"])
-            cached = self._pubtime_cache.get(key)
-            if cached:
-                try:
-                    dt = datetime.strptime(str(cached).strip(), "%Y-%m-%d %H:%M:%S")
-                    s["pub_weeks"] = max(0.0, (datetime.now() - dt).total_seconds() / 604800.0)
-                    s["pub_dt"] = str(cached)
-                    continue
-                except Exception:
-                    pass
-            need_fetch.append(s)
-        if not need_fetch:
-            return
-        # 并发请求详情页（最多5个并发）
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        def fetch_one(s):
-            sid = s["seed_id"]
-            try:
-                session = self._session()
-                url = f"{self._get_site_url()}/details.php?id={sid}"
-                r = session.get(url, timeout=8)
-                m = re.search(r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})', r.text)
-                if m:
-                    return sid, m.group(1)
-            except Exception:
-                pass
-            return sid, None
-        logger.info(f"发布时间补全开始：{len(need_fetch)} 颗种子待拉详情页（10并发）")
-        done = 0
-        with ThreadPoolExecutor(max_workers=10) as ex:
-            futures = {ex.submit(fetch_one, s): s for s in need_fetch}
-            for fut in as_completed(futures):
-                sid, pub_str = fut.result()
-                done += 1
-                if done % 20 == 0:
-                    logger.info(f"发布时间补全进度：{done}/{len(need_fetch)}")
-                if pub_str:
-                    self._pubtime_cache[str(sid)] = pub_str
-                    # 每补全20个就存一次，防止中断丢失
-                    if done % 20 == 0:
-                        self._save_pubtime_cache()
-                    dt = datetime.strptime(pub_str, "%Y-%m-%d %H:%M:%S")
-                    w = max(0.0, (datetime.now() - dt).total_seconds() / 604800.0)
-                    for s in need_fetch:
-                        if s["seed_id"] == sid:
-                            s["pub_weeks"] = w
-                            s["pub_dt"] = pub_str
-        self._save_pubtime_cache()
-        logs.append(f"发布时间缓存补全完成：{len(self._pubtime_cache)} 颗种子")
-
     def _get_site_url(self) -> str:
-        """获取站点地址：优先MP站点管理，其次配置页"""
         url = self._site_url
         if not url or url == "https://hhanclub.net":
             site = self._get_mp_site()
@@ -1580,8 +1324,6 @@ class HHClubButler(_PluginBase):
         return url
 
     def _update_cfg(self, **kwargs):
-        """合并式更新配置：MP的update_config是全量覆盖，直接调用会把其他配置项清空。
-        这里先读取当前完整配置，合并要修改的键后再整体写回。"""
         cfg = self.get_config() or {}
         if not isinstance(cfg, dict):
             cfg = {}
@@ -1589,31 +1331,25 @@ class HHClubButler(_PluginBase):
         self.update_config(cfg)
 
     def _get_site_uid(self) -> Optional[str]:
-        """获取站点UID：优先配置缓存值，其次访问站点主页自动解析（NexusPHP导航含 userdetails.php?id=xxx）
-
-        自动获取失败时不再回退任何默认值（默认UID属于他人账号，误用会拉错完成列表），
-        返回 None 由调用方中止运行。"""
         if self._uid:
             return self._uid
         try:
             session = self._session()
-            url = self._get_site_url()
-            r = session.get(url, timeout=15)
+            r = session.get(self._get_site_url(), timeout=15)
             m = re.search(r"userdetails\.php\?id=(\d+)", r.text)
             if m:
                 uid = m.group(1)
                 if self._uid != uid:
                     self._uid = uid
                     try:
-                        # 自动获取成功即回写配置缓存（合并式更新，不覆盖其他配置项）
                         self._update_cfg(uid=uid)
-                    except Exception as e:
-                        logger.error(f"UID自动回写配置失败：{e}")
+                    except Exception:
+                        pass
                 logger.info(f"已从站点主页自动获取UID：{uid}")
                 return uid
         except Exception as e:
             logger.error(f"自动获取站点UID失败：{e}")
-        logger.warning("未自动获取到站点UID，为防止误用他人UID已停止运行，请检查站点Cookie/UA是否有效后重试")
+        logger.warning("未自动获取到站点UID，请检查站点Cookie/UA是否有效")
         return None
 
     def _session(self) -> requests.Session:
@@ -1622,7 +1358,6 @@ class HHClubButler(_PluginBase):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                           "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         }
-        # 优先用MP站点管理的UA（部分站点校验UA）
         site = self._get_mp_site()
         if site and site.ua:
             headers["User-Agent"] = site.ua
@@ -1632,42 +1367,85 @@ class HHClubButler(_PluginBase):
         s.headers.update(headers)
         return s
 
+    def _fetch_last_settlement(self) -> Tuple[Optional[float], Optional[float], str]:
+        uid = self._get_site_uid()
+        if not uid:
+            return None, None, ""
+        try:
+            session = self._session()
+            url = f"{self._get_site_url()}/rescuesettleinfo.php?id={uid}"
+            r = session.get(url, timeout=20)
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "html.parser")
+            table = None
+            for tb in soup.find_all("table"):
+                if "获得的憨豆" in tb.get_text() and "结算时间" in tb.get_text():
+                    table = tb
+                    break
+            if not table:
+                return None, None, ""
+            rows = table.select("tr")
+            best = None
+            best_date = ""
+            for tr in rows:
+                tds = tr.find_all(["td", "th"])
+                if len(tds) < 8:
+                    continue
+                cells = [c.get_text(strip=True) for c in tds]
+                try:
+                    bean = float(re.sub(r'[^\d.]', '', cells[4]) or 0)
+                    pt = float(re.sub(r'[^\d.]', '', cells[5]) or 0)
+                    dstr = cells[7]
+                    dmatch = re.search(r'\d{4}-\d{2}-\d{2}', dstr)
+                    if not dmatch:
+                        continue
+                    d = dmatch.group(0)
+                    if d >= best_date:
+                        best_date = d
+                        best = (bean, pt)
+                except (ValueError, IndexError):
+                    continue
+            if best:
+                return best[0], best[1], best_date
+        except Exception as e:
+            logger.warning(f"抓取上次结算失败：{e}")
+        return None, None, ""
+
     def _fetch_rescue_all(self, logs: list) -> List[dict]:
-        """抓取保种区全部页面种子"""
         seeds = []
         session = self._session()
         max_page = 1
-        # 先取第一页确定总页数
         site_url = self._get_site_url()
-        try:
-            r = session.get(f"{site_url}/rescue.php?page=0", timeout=30)
+
+        def _try_get(u):
+            r = session.get(u, timeout=30)
             r.raise_for_status()
-            html = r.text
+            return r.text
+
+        try:
+            html = _try_get(f"{site_url}/rescue.php?page=0")
             page_seeds, max_page = self._parse_rescue_page(html)
             seeds.extend(page_seeds)
             logs.append(f"保种区第1页获取 {len(page_seeds)} 条数据")
         except Exception as e:
-            # 域名容错：主域不可解析时尝试备用域
-            alt = site_url.replace("hhanclub.net", "hhancclub.net") if "hhanclub.net" in site_url                 else site_url.replace("hhancclub.net", "hhanclub.net")
+            alt = site_url.replace("hhanclub.net", "hhancclub.net") if "hhanclub.net" in site_url \
+                else site_url.replace("hhancclub.net", "hhanclub.net")
             if alt != site_url:
                 try:
-                    r = session.get(f"{alt}/rescue.php?page=0", timeout=30)
-                    r.raise_for_status()
-                    html = r.text
+                    html = _try_get(f"{alt}/rescue.php?page=0")
                     site_url = alt
                     page_seeds, max_page = self._parse_rescue_page(html)
                     seeds.extend(page_seeds)
-                    logs.append(f"保种区第1页已通过备用域名访问：{alt}，获取 {len(page_seeds)} 条数据")
+                    logs.append(f"保种区第1页已通过备用域名访问：{alt}")
                 except Exception as e2:
                     logs.append(f"保种区第1页获取失败（含备用域名）：{e2}")
                     return []
             else:
                 logs.append(f"保种区第1页获取失败：{e}")
                 return []
-        # 翻页
         for page in range(1, max_page + 1):
             try:
-                r = session.get(f"{self._get_site_url()}/rescue.php?page={page}", timeout=30)
+                r = session.get(f"{site_url}/rescue.php?page={page}", timeout=30)
                 r.raise_for_status()
                 page_seeds, _ = self._parse_rescue_page(r.text)
                 seeds.extend(page_seeds)
@@ -1676,27 +1454,16 @@ class HHClubButler(_PluginBase):
                 logs.append(f"保种区第{page + 1}页获取失败：{e}")
                 break
             time.sleep(0.5)
-        # v1.2.1: 候选区种子补全发布时间（缓存/详情页）
-        if seeds:
-            try:
-                self._batch_resolve_pubtime(seeds, logs)
-            except Exception as e:
-                logs.append(f"候选区发布时间补全跳过：{e}")
-        # v1.2.2: 按 A 份额模型重算单种子日贡献（旧 arctan 单种子公式对普通体积全为0）
-        self._recompute_daily(seeds)
         return seeds
 
     def _parse_rescue_page(self, html: str) -> Tuple[List[dict], int]:
-        """解析保种区单页，返回(种子列表, 最大页码)"""
         seeds = []
         max_page = 1
         soup = BeautifulSoup(html, "html.parser")
-        # 分页链接：rescue.php?page=N（0基）
         for a in soup.select('a[href*="page="]'):
             m = re.search(r'[?&]page=(\d+)', a.get("href", ""))
             if m:
                 max_page = max(max_page, int(m.group(1)))
-        # 种子行
         for row in soup.select("div.torrent-table-sub-info"):
             s = self._parse_seed_row(row)
             if s:
@@ -1704,11 +1471,9 @@ class HHClubButler(_PluginBase):
         return seeds, max_page
 
     def _parse_seed_row(self, row) -> Optional[dict]:
-        """解析单个种子行（带兜底，避免选择器匹配失败丢种子）"""
         a_title = row.select_one("a.torrent-info-text-name")
         title = a_title.get_text(strip=True) if a_title else ""
         if not title:
-            # 兜底：任意包含种子的链接文本
             for a in row.find_all("a"):
                 t = a.get_text(strip=True)
                 if len(t) > 10:
@@ -1716,10 +1481,8 @@ class HHClubButler(_PluginBase):
                     break
         a_dl = row.select_one('a[href*="download.php"]')
         href = a_dl.get("href", "") if a_dl else ""
-        # 提取大小与数字（做种人数）
         size = None
         nums = []
-        # 主路径：统计区叶子文本
         stats_el = row.select_one(".w-\\[20\\%\\]")
         leaves = []
         if stats_el:
@@ -1732,7 +1495,6 @@ class HHClubButler(_PluginBase):
                 continue
             if re.match(r'^\d+(\.\d+)?$', leaf):
                 nums.append(float(leaf))
-        # 兜底：全行找大小文本
         if size is None:
             for el in row.find_all(True):
                 txt = el.get_text(strip=True)
@@ -1742,20 +1504,9 @@ class HHClubButler(_PluginBase):
         if size is None:
             return None
         seeders = int(nums[0]) if nums else 0
-        bean_mul, pt_mul = multiplier(seeders)
-        if pt_mul <= 0:
+        now_seeders = int(nums[1]) if len(nums) > 1 else 0
+        if tier_of(seeders) >= 99:
             return None
-        # v1.2.1: 解析发布时间（torrent-info-text-adde 的 title 属性）
-        pub_dt = None
-        adde_el = row.select_one(".torrent-info-text-adde span[title]") or row.select_one(".torrent-info-text-adde")
-        if adde_el:
-            pub_str = adde_el.get("title") or adde_el.get_text(strip=True)
-            try:
-                pub_dt = datetime.strptime(pub_str.strip(), "%Y-%m-%d %H:%M:%S")
-            except Exception:
-                pub_dt = None
-        pub_weeks = max(0.0, (datetime.now() - pub_dt).total_seconds() / 604800.0) if pub_dt else 4.0
-        # v1.2.1: 种子ID 从 details.php?id=xxx 提取
         seed_id = None
         m_id = re.search(r'details\.php\?id=(\d+)', str(a_title.get("href") if a_title else ""))
         if m_id:
@@ -1765,147 +1516,76 @@ class HHClubButler(_PluginBase):
             "href": href,
             "size": size,
             "seeders": seeders,
+            "now_seeders": now_seeders,
             "seed_id": seed_id,
-            "pub_dt": pub_dt.isoformat() if pub_dt else None,
-            "pub_weeks": pub_weeks,
-            "bean_mul": bean_mul,
-            "pt_mul": pt_mul,
-            "daily_pt": seed_daily_pt(seeders, size, pub_weeks),
-            "daily_bean": seed_daily_bean(seeders, size, pub_weeks),
-            "pt_per_gb": seed_daily_pt(seeders, size, 4.0) / max(size, 0.1),
         }
 
     def _get_current_seeding(self, logs: list) -> dict:
-        """获取当前保种情况：完成页 ∩ 下载器做种中"""
-        result = {"count": 0, "total_pt": 0.0, "total_gb": 0.0, "seeds": []}
-        # 1. 抓完成页
+        result = {"count": 0, "total_gb": 0.0, "seeds": []}
         completed = self._fetch_completed(logs)
         if not completed:
-            logs.append("完成页未获取到数据，本次按空保种降级处理，仅执行增量优选（不删除）")
-            result["degraded"] = "完成页未获取到数据（站点Cookie失效或域名不可达）"
+            logs.append("完成页未获取到数据，本次按空保种降级处理")
+            result["degraded"] = "完成页未获取到数据"
             return result
-        # 2. 取下载器做种种子
         dl_seeds = self._get_downloader_seeds(logs)
         if dl_seeds is None:
-            logs.append("下载器未获取到种子")
-            result["error"] = "下载器未获取到种子（检查下载器配置/连接）"
+            logs.append("下载器未获取到种子，按站点完成页全量显示")
+            result["count"] = len(completed)
+            result["total_gb"] = sum(x.get("size", 0.0) for x in completed)
+            result["seeds"] = completed
             return result
-        # 3. 交集（种子名归一化模糊匹配）
         dl_names = set(dl_seeds)
         norm_map = {}
-        for c in completed:
-            norm_map.setdefault(HHClubButler._norm_title(c["title"]), c)
+        for x in completed:
+            norm_map.setdefault(HHClubButler._norm_title(x["title"]), x)
         matched_map = {}
-        matched_dl = set()
         for dn in dl_names:
             nd = HHClubButler._norm_title(dn)
             hit = None
             if nd in norm_map:
                 hit = norm_map[nd]
             elif len(nd) >= 15:
-                # 长名包含匹配（如完成页名带额外后缀）
-                for nd_key, c in norm_map.items():
+                for nd_key, x in norm_map.items():
                     if len(nd_key) >= 15 and (nd in nd_key or nd_key in nd):
-                        hit = c
+                        hit = x
                         break
             if hit is not None:
-                matched_dl.add(dn)
                 matched_map.setdefault(hit["title"], hit)
         matched = list(matched_map.values())
-        # v1.2.2: 对交集集合重算 A 份额日贡献（与卡片总量 rescue_total_pt 完全自洽）
-        self._recompute_daily(matched)
         result["count"] = len(matched)
-        result["total_pt"] = sum(c["daily_pt"] for c in matched)
-        result["total_bean"] = sum(c["daily_bean"] for c in matched)
-        result["total_gb"] = sum(c["size"] for c in matched)
+        result["total_gb"] = sum(x["size"] for x in matched)
         result["seeds"] = matched
         logs.append(f"完成页 {len(completed)} 个 ∩ 下载器做种 {len(dl_names)} 个 = 当前保种 {len(matched)} 个")
-        # 未匹配明细（前10条），便于定位名称格式差异
-        if len(matched) < min(len(completed), len(dl_names)):
-            miss_dl = sorted(dl_names - matched_dl)[:10]
-            miss_c = [c["title"] for c in completed
-                      if c["title"] not in matched_map][:10]
-            if miss_dl:
-                logs.append("未匹配（下载器侧）前10：" + " | ".join(miss_dl))
-            if miss_c:
-                logs.append("未匹配（完成页侧）前10：" + " | ".join(miss_c))
-        if not matched and completed and dl_names:
-            logs.append("完成页与下载器交集为空（下载器内暂无保种区已完成种子），"
-                        "当前保种按 0 个计（数据真实，概况正常显示，不误报为数据异常）")
         return result
 
     def _build_overview_from_current(self, cur: dict) -> dict:
-        """由当前保种结果直接构建概况（口径与 _build_seeding_overview 一致，免二次抓取）"""
         seeds = cur.get("seeds", [])
-        dist = {
-            "0-1人": {"count": 0, "gb": 0.0},
-            "2-3人": {"count": 0, "gb": 0.0},
-            "4-5人": {"count": 0, "gb": 0.0},
-        }
-        total_bean = 0.0
+        dist = {"0-1人": {"count": 0, "gb": 0.0},
+                "2-3人": {"count": 0, "gb": 0.0},
+                "4-5人": {"count": 0, "gb": 0.0}}
         for s in seeds:
-            n = s.get("seeders", 0)
-            if n <= 1:
-                key = "0-1人"
-            elif n <= 3:
-                key = "2-3人"
-            else:
-                key = "4-5人"
-            dist[key]["count"] += 1
-            dist[key]["gb"] += s.get("size", 0.0)
+            t = tier_of(s.get("seeders", 0))
+            if t > 2:
+                t = 2
+            dist[TIER_NAMES[t]]["count"] += 1
+            dist[TIER_NAMES[t]]["gb"] += s.get("size", 0.0)
         total_gb = cur.get("total_gb", 0.0)
-        # v1.2.1: 总量用 B 公式汇总（只调一次，含 +20 和 0.02×N）
-        total_bean = rescue_total_beans(seeds) * HOURS
-        total_pt = rescue_total_pt(seeds) * HOURS
+        last_bean, last_pt, last_date = self._fetch_last_settlement()
         return {
             "count": cur.get("count", 0),
             "total_gb": total_gb,
             "total_tb": total_gb / 1024.0,
-            "total_bean": total_bean,
-            "total_pt": total_pt,
-            "dist": dist,
-            "ok": not cur.get("error") and not cur.get("degraded"),
-        }
-
-    def _build_seeding_overview(self, logs: list) -> dict:
-        """今日保种概况：完成页 ∩ 下载器做种交集，按初始做种人数分档统计"""
-        cur = self._get_current_seeding(logs)
-        seeds = cur.get("seeds", [])
-        dist = {
-            "0-1人": {"count": 0, "gb": 0.0},
-            "2-3人": {"count": 0, "gb": 0.0},
-            "4-5人": {"count": 0, "gb": 0.0},
-        }
-        total_bean = 0.0
-        for s in seeds:
-            n = s.get("seeders", 0)
-            if n <= 1:
-                key = "0-1人"
-            elif n <= 3:
-                key = "2-3人"
-            else:
-                key = "4-5人"
-            dist[key]["count"] += 1
-            dist[key]["gb"] += s.get("size", 0.0)
-        total_gb = cur.get("total_gb", 0.0)
-        # v1.2.1: 总量用 B 公式汇总（只调一次，含 +20 和 0.02×N）
-        total_bean = rescue_total_beans(seeds) * HOURS
-        total_pt = rescue_total_pt(seeds) * HOURS
-        return {
-            "count": cur.get("count", 0),
-            "total_gb": total_gb,
-            "total_tb": total_gb / 1024.0,
-            "total_bean": total_bean,
-            "total_pt": total_pt,
+            "last_bean": last_bean,
+            "last_pt": last_pt,
+            "last_date": last_date,
             "dist": dist,
             "ok": not cur.get("error") and not cur.get("degraded"),
         }
 
     def _fetch_completed(self, logs: list) -> List[dict]:
-        """抓取完成的保种区种子（userdetails.php?id=xxx&action=7）"""
         uid = self._get_site_uid()
         if not uid:
-            logs.append("未获取到站点UID（自动解析失败且未手动填写），为防止误用他人UID已停止运行")
+            logs.append("未获取到站点UID")
             return []
         items = []
         session = self._session()
@@ -1916,8 +1596,8 @@ class HHClubButler(_PluginBase):
             r.raise_for_status()
             items, max_page = self._parse_completed_page(r.text)
         except Exception as e:
-            # 域名容错：主域不可解析时尝试备用域（hhancclub.net <-> hhanclub.net）
-            alt = url.replace("hhanclub.net", "hhancclub.net") if "hhanclub.net" in url                 else url.replace("hhancclub.net", "hhanclub.net")
+            alt = url.replace("hhanclub.net", "hhancclub.net") if "hhanclub.net" in url \
+                else url.replace("hhancclub.net", "hhanclub.net")
             if alt != url:
                 try:
                     r = session.get(alt, timeout=30)
@@ -1941,38 +1621,22 @@ class HHClubButler(_PluginBase):
                 logs.append(f"完成页第{page + 1}页获取失败：{e}")
                 break
             time.sleep(0.5)
-        # v1.2.1: 完成页种子补全发布时间（缓存/详情页）
-        if items:
-            try:
-                self._batch_resolve_pubtime(items, logs)
-            except Exception as e:
-                logs.append(f"完成页发布时间补全跳过：{e}")
-        # v1.2.2: 按 A 份额模型重算单种子日贡献
-        self._recompute_daily(items)
         return items
 
     @staticmethod
     def _norm_title(s) -> str:
-        """种子名归一化：小写 + 仅保留字母/数字/中文，消除所有分隔符、括号与符号差异。
-
-        站点完成页与下载器（QB/TR）的种子名常存在空格/点/连字符/下划线/括号等
-        差异（如 The.Ball.Bing vs The Ball Bing、H.265 vs H 265），全部剥离后
-        仅剩字母数字中文，可最大程度消除漏匹配。"""
         if not s:
             return ""
         s = str(s).lower()
         return re.sub(r'[^0-9a-z\u4e00-\u9fff]', '', s)
 
     def _parse_completed_page(self, html: str) -> Tuple[List[dict], int]:
-        """解析完成页，返回(种子列表, 最大页码)"""
         items = []
         max_page = 0
         soup = BeautifulSoup(html, "html.parser")
-        # 最大页码：页面内置 var maxpage=N（0基）
         m = re.search(r"var\s+maxpage\s*=\s*(\d+)", html)
         if m:
             max_page = int(m.group(1))
-        # 找表格
         table = None
         for tb in soup.find_all("table"):
             if "种子ID" in tb.get_text() and tb.select("tr.text-center"):
@@ -1980,25 +1644,22 @@ class HHClubButler(_PluginBase):
                 break
         if not table:
             return items, max_page
-        # 表头列映射
         header_tr = table.find("tr")
         headers = [th.get_text(strip=True) for th in header_tr.find_all(["th", "td"])] if header_tr else []
         idx_size = 2
         idx_n = 3
-        idx_now = 4
         for i, h in enumerate(headers):
             if "大小" in h:
                 idx_size = i
             if "初始保种" in h:
                 idx_n = i
-            if "现在保种" in h:
-                idx_now = i
-        # 数据行
         for tr in table.select("tr.text-center"):
             tds = tr.find_all("td")
             if len(tds) <= max(idx_size, idx_n):
                 continue
-            a = tds[1].find("a") if len(tds) > 1 else None
+            a = tds[idx_n - 1].find("a") if len(tds) > 1 else None
+            if a is None:
+                a = tds[1].find("a")
             title = a.get_text(strip=True) if a else tds[1].get_text(strip=True)
             size = size_to_gb(tds[idx_size].get_text(strip=True))
             n_str = tds[idx_n].get_text(strip=True)
@@ -2006,93 +1667,59 @@ class HHClubButler(_PluginBase):
                 n = int(n_str)
             except ValueError:
                 n = 1
-            # v1.3.0: 解析"现在保种人数"（A公式人数因子用当前人数）
-            n_now = n
-            try:
-                n_now = int(tds[idx_now].get_text(strip=True))
-            except ValueError:
-                pass
-            if not size:
+            if not size or tier_of(n) >= 99:
                 continue
-            bean_mul, pt_mul = multiplier(n)
-            if pt_mul <= 0:
-                continue
-            # v1.2.1: 种子ID 从第一列 td 提取
             seed_id = None
             try:
                 sid_txt = tds[0].get_text(strip=True)
                 seed_id = int(sid_txt) if sid_txt.isdigit() else None
             except Exception:
                 pass
-            # v1.2.1: 完成页无发布时间，先用默认 4 周（后续从缓存补）
-            pub_weeks = 4.0
+            # column indices: 0=ID,1=name,2=size,3=init,4=now,5=完成时间,6=上次结算,7=今日做种,8=今日达标
+            now_seeders = 0
+            try:
+                now_seeders = int(tds[4].get_text(strip=True))
+            except Exception:
+                pass
+            completed_at = tds[5].get_text(strip=True) if len(tds) > 5 else ""
+            last_settle = tds[6].get_text(strip=True) if len(tds) > 6 else ""
+            today_hours = tds[7].get_text(strip=True) if len(tds) > 7 else ""
+            qualified = tds[8].get_text(strip=True) if len(tds) > 8 else ""
             items.append({
-                "title": title,
-                "size": size,
-                "seeders": n,
-                "seeders_now": n_now,
-                "seed_id": seed_id,
-                "pub_weeks": pub_weeks,
-                "bean_mul": bean_mul,
-                "pt_mul": pt_mul,
-                "daily_pt": seed_daily_pt(n, size, pub_weeks),
-                "daily_bean": seed_daily_bean(n, size, pub_weeks),
-                "pt_per_gb": seed_daily_pt(n, size, 4.0) / max(size, 0.1),
+                "title": title, "size": size, "seeders": n, "seed_id": seed_id,
+                "now_seeders": now_seeders,
+                "completed_at": completed_at,
+                "last_settle": last_settle,
+                "today_hours": today_hours,
+                "qualified": qualified,
             })
         return items, max_page
 
-    # ============================================================
-    # 下载器操作
-    # ============================================================
     def _get_downloader_obj(self):
-        """获取下载器实例"""
         if not self._downloader:
             return None
         try:
             services = DownloaderHelper().get_services(name_filters=[self._downloader])
             if not services:
-                logger.warning(f"下载器 {self._downloader} 未配置")
                 return None
             service = services.get(self._downloader)
             if not service or not service.instance:
-                logger.warning(f"下载器 {self._downloader} 实例获取失败")
                 return None
             if service.instance.is_inactive():
-                logger.warning(f"下载器 {self._downloader} 未连接")
                 return None
             return service
-        except Exception as e:
-            logger.error(f"获取下载器 {self._downloader} 失败：{e}")
+        except Exception:
             return None
 
     @staticmethod
-    def _get_tname(t) -> str:
-        """取下载器种子对象的任务名（兼容 dict / qbittorrent-api / transmission-rpc 对象）"""
-        try:
-            return str(t.get("name") if isinstance(t, dict) else getattr(t, "name", "") or "")
-        except Exception:
-            return ""
-
-    @staticmethod
     def _extract_tracker_text(t, dl_type: str = "") -> str:
-        """从下载器种子对象提取 tracker 相关文本（兼容 qBittorrent 与 Transmission）
-
-        QB（dict 或 qbittorrent-api Torrent）：tracker / tracker_v2 为 URL 字符串，
-        trackers 为 URL 列表；magnet_uri 含 tr= 参数。
-        TR（MP v3 的 transmission-rpc Torrent）：无 tracker 字段，tracker 信息在
-        trackerList（分号分隔的 announce 字符串）与 trackerStats（对象数组含 announce），
-        trackers 为 Tracker 命名元组列表；且无 magnet_uri，需用 magnetLink()/magnet
-        生成磁力链兜底（含 tr= 参数）。"""
         try:
             parts = []
             if isinstance(t, dict):
                 parts.append(str(t.get("tracker") or ""))
-                parts.append(str(t.get("tracker_v2") or ""))
                 tr = t.get("trackers")
                 if isinstance(tr, (list, tuple)):
                     parts.extend(str(x) for x in tr)
-                else:
-                    parts.append(str(tr or ""))
                 parts.append(str(t.get("trackerList") or ""))
                 stats = t.get("trackerStats") or []
                 if isinstance(stats, list):
@@ -2102,34 +1729,25 @@ class HHClubButler(_PluginBase):
                 parts.append(str(t.get("magnet_uri") or ""))
             else:
                 parts.append(str(getattr(t, "tracker", "") or ""))
-                parts.append(str(getattr(t, "tracker_v2", "") or ""))
                 tr = getattr(t, "trackers", None)
                 if isinstance(tr, (list, tuple)):
                     parts.extend(str(x) for x in tr)
-                else:
-                    parts.append(str(tr or ""))
                 parts.append(str(getattr(t, "trackerList", "") or ""))
-                parts.append(str(getattr(t, "tracker_list", "") or ""))
                 stats = getattr(t, "trackerStats", None) or []
                 if isinstance(stats, list):
                     for s in stats:
-                        announce = None
                         try:
-                            if isinstance(s, dict):
-                                announce = s.get("announce")
-                            else:
-                                announce = getattr(s, "announce", None) or getattr(s, "url", None)
+                            announce = s.get("announce") if isinstance(s, dict) else getattr(s, "announce", None)
+                            if announce:
+                                parts.append(str(announce))
                         except Exception:
-                            announce = None
-                        if announce:
-                            parts.append(str(announce))
-                # TR 无 magnet_uri 属性，用 magnetLink()/magnet 生成磁力链兜底（含 tr= 参数）
+                            pass
                 try:
-                    m = getattr(t, "magnet_uri", None) or getattr(t, "magnet", None)
-                    if callable(m):
-                        m = m()
-                    if m:
-                        parts.append(str(m))
+                    mg = getattr(t, "magnet_uri", None) or getattr(t, "magnet", None)
+                    if callable(mg):
+                        mg = mg()
+                    if mg:
+                        parts.append(str(mg))
                 except Exception:
                     pass
             return " ".join(p for p in parts if p)
@@ -2138,12 +1756,6 @@ class HHClubButler(_PluginBase):
 
     @staticmethod
     def _get_progress_ratio(t, dl_type: str = "") -> Optional[float]:
-        """返回归一化下载进度（0~1，下载完成=1.0）。兼容 qBittorrent 与 Transmission。
-
-        QB（qbittorrent-api）：progress 字段本身就是 0~1（完成=1.0），直接使用；
-        TR（transmission-rpc）：progress 字段是 0~100 百分比（完成=100.0），
-        需除以 100 归一化；部分版本 percent_done 已是 0~1，做双保险。
-        返回 None 表示无法取得进度（调用方按各自保守策略处理）。"""
         try:
             if isinstance(t, dict):
                 progress = t.get("progress")
@@ -2155,29 +1767,16 @@ class HHClubButler(_PluginBase):
                     progress = getattr(t, "percent_done", None)
             if progress is None:
                 return None
-            try:
-                progress = float(progress)
-            except (TypeError, ValueError):
-                return None
+            progress = float(progress)
             dl = (dl_type or "").lower()
-            if "transmission" in dl or "tr_" in dl:
-                # TR 的 progress 为 0~100 百分比；若已是 0~1（部分版本）则无需换算
-                if progress > 1.0:
-                    progress = progress / 100.0
-            # QB 的 progress 本身就是 0~1，保持不变
+            if ("transmission" in dl or "tr_" in dl) and progress > 1.0:
+                progress /= 100.0
             return max(0.0, min(1.0, progress))
         except Exception:
             return None
 
     def _get_downloader_seeds(self, logs: list, only_completed: bool = True,
-                              any_tracker: bool = False) -> Optional[set]:
-        """获取下载器中种子名集合
-
-        only_completed=True（默认，当前保种/概况统计用）：只统计已下载完成（进度100%）的种子，
-        未下载完成的不参与做种、不计入；
-        only_completed=False（推送前去重用）：返回全部种子名（含下载中、暂停、tracker缺失的），
-        避免重复推送同一种子；any_tracker=True 时不按 tracker 筛选（tracker 字段可能因
-        暂停未连接/站点tracker替换等而缺失，按 tracker 筛选会漏掉已在下载器的种子）。"""
+                                any_tracker: bool = False) -> Optional[set]:
         service = self._get_downloader_obj()
         if not service:
             logs.append("未配置有效的下载器")
@@ -2203,52 +1802,30 @@ class HHClubButler(_PluginBase):
                 if any_tracker or ("hhanclub" in tracker or "hhclub" in tracker
                                    or "hanclub" in tracker):
                     site_total += 1
-                    # 已完成判定：归一化进度必须为 1.0（100%）才算下载完成
-                    # （QB progress 0~1；TR progress 0~100，由 _get_progress_ratio 归一化）
-                    if only_completed:
-                        progress = HHClubButler._get_progress_ratio(t, dl_type)
-                        if progress is not None and progress < 1.0:
-                            continue
-                    try:
-                        name = t.get("name") if isinstance(t, dict) else getattr(t, "name", "")
-                    except Exception:
-                        name = ""
-                    if name:
-                        names.add(name)
-            if only_completed:
-                logs.append(f"下载器共 {len(torrents)} 个种子，本站tracker {site_total} 个，已完成做种 {len(names)} 个")
-            else:
-                logs.append(f"下载器全部种子 {len(names)} 个（含下载中/暂停/tracker缺失，用于推送去重）")
-            if not any_tracker and site_total == 0:
-                logs.append("下载器未匹配到本站tracker种子（tracker字段缺失或格式异常），"
-                            "按空保种降级处理，仅执行增量优选（下载器类型：%s）" % (dl_type or "未知"))
-                try:
-                    samples = []
-                    for t in list(torrents)[:3]:
-                        samples.append("%s → %s" % (
-                            (HHClubButler._get_tname(t) or "?").strip()[:50],
-                            HHClubButler._extract_tracker_text(t, dl_type)[:100] or "(空)"))
-                    if samples:
-                        logs.append("tracker样例：" + " | ".join(samples))
-                except Exception:
-                    pass
-                return set()
-            if not names:
                 if only_completed:
-                    logs.append("下载器本站种子均未下载完成，当前无已完成做种种子，按0处理")
-                return set()
+                    progress = HHClubButler._get_progress_ratio(t, dl_type)
+                    if progress is not None and progress < 1.0:
+                        continue
+                try:
+                    name = t.get("name") if isinstance(t, dict) else getattr(t, "name", "")
+                except Exception:
+                    name = ""
+                if name:
+                    names.add(name)
+            if only_completed:
+                logs.append(f"下载器 {len(torrents)} 个种子，本站tracker {site_total} 个，已完成做种 {len(names)} 个")
             return names
         except Exception as e:
             logs.append(f"获取下载器种子失败：{e}")
             return None
+
     def _push_seeds(self, seeds: list, logs: list):
-        """推送种子到下载器，返回 (成功数, 失败数, 失败明细列表)"""
         service = self._get_downloader_obj()
         if not service:
             logs.append("未配置有效的下载器，无法推送")
             return 0, 0, []
         session = self._session()
-        push_cookie = self._get_site_cookie() or None  # v1.2：循环外取一次，避免每个种子重复读MP
+        push_cookie = self._get_site_cookie() or None
         ok_count = 0
         fail_list = []
         for s in seeds:
@@ -2256,11 +1833,9 @@ class HHClubButler(_PluginBase):
             title = s.get("title", "")
             if not href:
                 fail_list.append({"title": title, "reason": "缺少下载链接"})
-                logs.append(f"❌ 缺少下载链接：{title}")
                 continue
             url = href if href.startswith("http") else f"{self._get_site_url()}/{href.lstrip('/')}"
             try:
-                # 用站点Cookie下载种子文件内容，直接喂给下载器（避免下载器无Cookie导致403）
                 r = session.get(url, timeout=60)
                 if r.status_code == 200 and r.content:
                     dl_type = ""
@@ -2270,37 +1845,29 @@ class HHClubButler(_PluginBase):
                         pass
                     kwargs = {}
                     if self._tag:
-                        dl_type_l = str(dl_type).lower()
-                        if "qbittorrent" in dl_type_l:
+                        dl_l = str(dl_type).lower()
+                        if "qbittorrent" in dl_l:
                             kwargs["tag"] = self._tag
-                        elif "transmission" in dl_type_l:
+                        elif "transmission" in dl_l:
                             kwargs["labels"] = [self._tag]
                         else:
                             kwargs["tag"] = self._tag
                     success = service.instance.add_torrent(
-                        content=r.content,
-                        download_dir=self._save_path or None,
-                        cookie=push_cookie,
-                        **kwargs
-                    )
+                        content=r.content, download_dir=self._save_path or None,
+                        cookie=push_cookie, **kwargs)
                     if success:
                         ok_count += 1
                         logs.append(f"✅ 已添加：{title}")
                     else:
-                        fail_list.append({"title": title, "reason": "下载器拒绝添加（可能已存在相同任务）"})
-                        logs.append(f"❌ 添加失败：{title}")
+                        fail_list.append({"title": title, "reason": "下载器拒绝添加"})
                 else:
                     fail_list.append({"title": title, "reason": f"种子文件下载失败(HTTP {r.status_code})"})
-                    logs.append(f"❌ 种子下载失败({r.status_code})：{title}")
             except Exception as e:
                 fail_list.append({"title": title, "reason": f"推送异常：{e}"})
-                logs.append(f"❌ 推送异常：{title} - {e}")
             time.sleep(1)
-        logs.append(f"推送完成：成功 {ok_count}/{len(seeds)}")
         return ok_count, len(seeds) - ok_count, fail_list
+
     def _delete_seeds(self, seeds: list, logs: list):
-        """删除被换出的低效保种种子：任务与文件一起删除（释放硬盘空间）。
-        匹配用归一化模糊匹配（与当前保种交集口径一致），防止格式差异漏删。"""
         service = self._get_downloader_obj()
         if not service:
             logs.append("未配置有效的下载器，无法删除")
@@ -2308,7 +1875,6 @@ class HHClubButler(_PluginBase):
         try:
             torrents, error = service.instance.get_torrents()
             if error:
-                logs.append("获取下载器种子列表出错，无法删除")
                 return
             del_norms = set()
             for s in seeds:
@@ -2329,24 +1895,12 @@ class HHClubButler(_PluginBase):
                     del_ids.append(thash)
             if del_ids:
                 service.instance.delete_torrents(delete_file=True, ids=del_ids)
-                logs.append(f"已删除 {len(del_ids)} 个低效种子（任务+文件）")
-                for t in torrents:
-                    try:
-                        tname = t.get("name") if isinstance(t, dict) else getattr(t, "name", "")
-                        thash = (t.get("hash") if isinstance(t, dict)
-                                 else getattr(t, "hash", None) or getattr(t, "hashString", ""))
-                    except Exception:
-                        continue
-                    if thash in del_ids:
-                        logs.append(f"  - 实际删除: {tname}")
+                logs.append(f"已删除 {len(del_ids)} 个低档位种子（任务+文件）")
         except Exception as e:
             logs.append(f"删除种子失败：{e}")
 
     @staticmethod
     def _norm_match(name: str, targets: set) -> bool:
-        """归一化匹配：完全相等，或长名（>=15字符）互相包含。与计算当前保种
-        (_get_current_seeding) 的交集口径一致，避免下载器任务名与站点标题
-        存在空格/点/括号等格式差异时漏删。"""
         n = HHClubButler._norm_title(name)
         if not n:
             return False
@@ -2359,18 +1913,8 @@ class HHClubButler(_PluginBase):
         return False
 
     def _clean_stale_downloads(self, logs: list, seeds: list, extra_titles: set = None):
-        """自动清理超过 N 天仍未下载完成的任务（仅限本站相关，防误删其他站）
-
-        本站识别：
-        1. tracker 字段含憨憨站关键词（hhanclub/hhclub/hanclub）；
-        2. magnet_uri 磁力链含本站 tracker 域名（tracker 字段在暂停/从未联系时为空，
-           而 magnet_uri 对任何任务都存在且必带 tr= 参数，是最可靠的兜底）；
-        3. 任务名归一化后命中本次保种区全量种子标题。
-        删除动作：连未完成文件一起删除（半成品无保留价值）。"""
         service = self._get_downloader_obj()
         if not service:
-            logs.append("未配置有效的下载器，跳过未完成清理")
-            logger.info("未完成清理：未配置有效的下载器，跳过")
             return 0
         dl_type = ""
         try:
@@ -2380,11 +1924,8 @@ class HHClubButler(_PluginBase):
         try:
             torrents, error = service.instance.get_torrents()
             if error:
-                logs.append("获取下载器种子列表出错，跳过未完成清理")
-                logger.info("未完成清理：获取下载器种子列表出错，跳过")
                 return 0
-        except Exception as e:
-            logs.append(f"获取下载器种子失败：{e}")
+        except Exception:
             return 0
         try:
             site_titles = {HHClubButler._norm_title(s.get("title") or "") for s in seeds}
@@ -2395,201 +1936,63 @@ class HHClubButler(_PluginBase):
         now = time.time()
         threshold = self._auto_clean_days * 86400
         stale = []
-        stat_total = 0
-        stat_site = 0
-        stat_done = 0
-        stat_noadd = 0
-        stat_probe = 0
         for t in torrents:
             try:
-                # 统一提取 tracker/magnet 文本（兼容 QB 与 TR 的字段差异）
                 tracker = HHClubButler._extract_tracker_text(t)
                 if isinstance(t, dict):
                     name = str(t.get("name") or "")
                     progress = t.get("progress")
-                    added = (t.get("added_on") or t.get("added_time")
-                             or t.get("added_date") or t.get("addedDate") or 0)
-                    tags = str(t.get("tags") or t.get("labels") or "")
+                    added = (t.get("added_on") or t.get("added_time") or t.get("added_date") or 0)
                     tid = t.get("hash") or t.get("id")
-                    raw_keys = list(t.keys()) if stat_probe < 3 else None
                 else:
                     name = str(getattr(t, "name", "") or "")
                     progress = HHClubButler._get_progress_ratio(t, dl_type)
                     added = (getattr(t, "added_on", 0) or getattr(t, "added_time", 0)
-                             or getattr(t, "added_date", 0) or getattr(t, "addedDate", 0) or 0)
-                    tags = str(getattr(t, "tags", "") or getattr(t, "labels", "") or "")
+                             or getattr(t, "added_date", 0) or 0)
                     tid = getattr(t, "hash", None) or getattr(t, "hashString", None) or getattr(t, "id", None)
-                    raw_keys = None
-                    added_probe = {k: getattr(t, k, "MISS")
-                                   for k in ("added_on", "added_time", "added_date", "addedDate")}
             except Exception:
                 continue
-            stat_total += 1
-            # 本站识别（tracker 文本已含 tracker/magnet_uri/magnetLink 等来源；
-            # tracker 字段在暂停/从未联系时为空，此时靠磁力链里的 announce 地址兜底）
             is_site = ("hhanclub" in tracker or "hhclub" in tracker or "hanclub" in tracker)
             if not is_site and site_titles:
                 n = HHClubButler._norm_title(name)
                 if n and n in site_titles:
                     is_site = True
-            # 诊断：打印打黑/绝命等疑似测试任务的关键字段
-            low = name.lower()
-            if ("打黑" in name or "black.storm" in low or "绝命" in name
-                    or "kill" in low or "test" in low or "测试" in name) and stat_probe < 6:
-                stat_probe += 1
-                tracker_host = tracker.split("/")[0] if tracker else ""
-                logger.info(f"清理诊断[{stat_probe}] name={name[:60]!r} tracker_host={tracker_host!r} "
-                            f"tracker_has_hh={'hhanclub' in tracker or 'hhclub' in tracker} "
-                            f"tags={tags!r} progress={progress!r} added={added!r} is_site={is_site} "
-                            f"keys={raw_keys} added_probe={added_probe if raw_keys is None else None}")
             if not is_site:
                 continue
-            stat_site += 1
             try:
                 progress = float(progress) if progress is not None else 1.0
             except (TypeError, ValueError):
                 progress = 1.0
-            # TR progress 为 0~100 百分比时的兜底归一化（正常已由 _get_progress_ratio 处理）
             if progress > 1.0:
-                progress = progress / 100.0
+                progress /= 100.0
             if progress >= 1.0:
-                stat_done += 1
-                continue  # 已下载完成的不动
+                continue
             try:
-                # transmission-rpc 4.x 的 added_date 是 datetime 对象（带 tzinfo），
-                # 需先转成秒级时间戳再参与比较
                 if hasattr(added, "timestamp"):
                     added = added.timestamp()
                 added = float(added)
             except (TypeError, ValueError, OSError, OverflowError):
                 added = 0.0
             if added <= 0:
-                stat_noadd += 1
-                continue  # 无添加时间信息，不处理
+                continue
             if now - added >= threshold:
                 stale.append((tid, name))
-        logger.info(f"未完成清理：共扫描 {stat_total} 个任务，本站识别 {stat_site} 个"
-                    f"（完成跳过 {stat_done}、无添加时间 {stat_noadd}、超时 {len(stale)}）")
         if not stale:
             logs.append(f"未完成清理：无超过 {self._auto_clean_days:g} 天未完成的任务")
-            logger.info(f"未完成清理：扫描完成，无超过 {self._auto_clean_days:g} 天的未完成任务")
             return 0
         ids = [tid for tid, _ in stale if tid]
         if not ids:
-            logs.append(f"未完成清理：识别到 {len(stale)} 个超时任务但无法取得ID，跳过")
             return 0
         try:
             service.instance.delete_torrents(delete_file=True, ids=ids)
-            logs.append(f"未完成清理：已删除 {len(ids)} 个超过 {self._auto_clean_days:g} 天未完成的任务（含未完成文件）")
-            logger.info(f"未完成清理：已删除 {len(ids)} 个超过 {self._auto_clean_days:g} 天的未完成任务")
+            logs.append(f"未完成清理：已删除 {len(ids)} 个超时任务（含未完成文件）")
             return len(ids)
         except Exception as e:
             logs.append(f"未完成清理失败：{e}")
-            logger.info(f"未完成清理失败：{e}")
             return 0
 
-    # ============================================================
-    # 优选算法
-    # ============================================================
     @staticmethod
     def _parse_seeder_range(raw) -> Optional[tuple]:
-        """解析做种人数条件：单值"3"=恰好3人；区间"0-2"=0~2人。返回(min,max)，解析失败返回None"""
-        if raw is None:
-            return None
-        s = str(raw).strip()
-        if "-" in s:
-            parts = s.split("-", 1)
-            try:
-                lo = int(parts[0].strip())
-                hi = int(parts[1].strip())
-                return (min(lo, hi), max(lo, hi))
-            except (ValueError, IndexError):
-                return None
-        try:
-            n = int(s)
-            return (n, n)
-        except (ValueError, TypeError):
-            return None
-
-    def _optimize_incremental(self, seeds: list, eff_target: float, current_gb: float, logs: list) -> dict:
-        """增量优选：不删除已做种任务。按积分=补齐差额最小体积；按体积=剩余空间内积分最大化"""
-        if self._use_volume:
-            cap = max(0.0, self._target_volume - current_gb)
-            if cap <= 0:
-                logs.append("当前保种体积已达目标上限，无需新增")
-                return {"picked": [], "total_pt": 0.0, "total_gb": 0.0, "del_seeds": [], "keep_count": 0}
-            logs.append(f"按体积增量：剩余可增 {cap:.0f} GB（目标总保种 {self._target_volume:.0f} GB"
-                        f" - 已保种 {current_gb:.0f} GB），新增种子积分最大化")
-            picked = HHClubButler._maximize_pt_with_cap(seeds, cap)
-            total_pt = sum(s["daily_pt"] for s in picked)
-            total_gb = sum(s["size"] for s in picked)
-            logs.append(f"增量优选 {len(picked)} 个，新增积分 {total_pt:.1f}，新增体积 {total_gb:.1f} GB")
-            return {"picked": picked, "total_pt": total_pt, "total_gb": total_gb,
-                    "del_seeds": [], "keep_count": 0}
-        # 按积分
-        if eff_target <= 0:
-            logs.append("当前保种积分已达标，无需新增下载")
-            return {"picked": [], "total_pt": 0.0, "total_gb": 0.0, "del_seeds": [], "keep_count": 0}
-        logs.append(f"按积分增量：差额 {eff_target:.1f} 积分，最小体积达标")
-        opt = HHClubButler._optimize(seeds, eff_target)
-        opt["del_seeds"] = []
-        opt["keep_count"] = 0
-        logs.append(f"增量优选 {len(opt['picked'])} 个，新增积分 {opt['total_pt']:.1f}，"
-                    f"新增体积 {opt['total_gb']:.1f} GB")
-        return opt
-
-    @staticmethod
-    def _maximize_pt_with_cap(seeds: list, cap: float) -> list:
-        """体积上限内积分最大化（0/1背包：dp[j]=达到积分j的最小体积，找 dp[j]<=cap 的最大j）"""
-        if cap <= 0 or not seeds:
-            return []
-        SCALE = 10
-        n = len(seeds)
-        total_w = sum(int(round(s["daily_pt"] * SCALE)) for s in seeds)
-        if total_w <= 0:
-            return []
-        dp_len = total_w + 1
-        if n * dp_len > 8000000:
-            # 内存保护：贪心按积分效率
-            picked = []
-            used = 0.0
-            for s in sorted(seeds, key=lambda x: x["pt_per_gb"], reverse=True):
-                if used + s["size"] <= cap:
-                    picked.append(s)
-                    used += s["size"]
-            return picked
-        INF = float("inf")
-        dp = [INF] * dp_len
-        dp[0] = 0.0
-        keep = bytearray(n * dp_len)
-        for i, s in enumerate(seeds):
-            w = int(round(s["daily_pt"] * SCALE))
-            if w <= 0:
-                continue
-            v = s["size"]
-            for j in range(dp_len - 1, w - 1, -1):
-                if dp[j - w] + v < dp[j]:
-                    dp[j] = dp[j - w] + v
-                    keep[i * dp_len + j] = 1
-        best_j = -1
-        for j in range(dp_len - 1, -1, -1):
-            if dp[j] != INF and dp[j] <= cap:
-                best_j = j
-                break
-        if best_j < 0:
-            return []
-        picked = []
-        j = best_j
-        for i in range(n - 1, -1, -1):
-            if keep[i * dp_len + j]:
-                picked.append(seeds[i])
-                j -= int(round(seeds[i]["daily_pt"] * SCALE))
-        picked.reverse()
-        return picked
-
-    @staticmethod
-    def _parse_seeder_range(raw) -> Optional[tuple]:
-        """解析做种人数：单值"3"=恰好3人；区间"0-5"=0~5人。返回(min,max)，解析失败返回None"""
         if raw is None:
             return None
         s = str(raw).strip()
@@ -2608,292 +2011,74 @@ class HHClubButler(_PluginBase):
             return None
 
     @staticmethod
-    def _optimize(seeds: list, target_pt: float, volume_cap: Optional[float] = None) -> dict:
-        """DP 0/1背包：达到目标积分所需的最小体积（允许略微超出目标，体积最小优先）"""
-        if target_pt <= 0:
-            return {"picked": [], "total_pt": 0.0, "total_gb": 0.0}
-        SCALE = 10
-        n = len(seeds)
-        max_j = int(target_pt * SCALE)
-        if n == 0 or max_j <= 0:
-            return {"picked": [], "total_pt": 0.0, "total_gb": 0.0}
-        # 最大种子积分（用于扩展DP上限，允许组合略微超出目标）
-        max_w = 0
-        for s in seeds:
-            w = int(round(s["daily_pt"] * SCALE))
-            if w > max_w:
-                max_w = w
-        dp_len = max_j + max_w + 1
-        # 内存保护：超过阈值降级贪心
-        if n * dp_len > 8000000:
-            return HHClubButler._greedy(seeds, target_pt)
-        INF = float("inf")
-        dp = [INF] * dp_len
-        dp[0] = 0.0
-        keep = bytearray(n * dp_len)
-        for i, s in enumerate(seeds):
-            w = int(round(s["daily_pt"] * SCALE))
-            if w <= 0:
-                continue
-            v = s["size"]
-            for j in range(dp_len - 1, w - 1, -1):
-                if dp[j - w] + v < dp[j]:
-                    dp[j] = dp[j - w] + v
-                    keep[i * dp_len + j] = 1
-        # 找 >= max_j 的最小体积可达点（允许略微超出目标；有体积上限时须满足 dp[j] <= volume_cap）
-        best_j = -1
-        best_vol = INF
-        for j in range(max_j, dp_len):
-            if dp[j] != INF and dp[j] < best_vol:
-                if volume_cap is None or dp[j] <= volume_cap:
-                    best_vol = dp[j]
-                    best_j = j
-        # 有体积上限且无解：退而求其次，在上限内找积分最大的可行解（尽力达标）
-        if best_j < 0 and volume_cap is not None:
-            for j in range(dp_len - 1, -1, -1):
-                if dp[j] != INF and dp[j] <= volume_cap:
-                    best_j = j
-                    break
-        if best_j < 0:
-            return {"picked": [], "total_pt": 0.0, "total_gb": 0.0}
+    def _tier_sort_key(s: dict):
+        return (tier_of(s.get("seeders", 1)), -s.get("size", 0.0))
+
+    def _optimize_incremental(self, seeds: list, eff_target: float,
+                              current_gb: float, logs: list) -> dict:
+        cap = eff_target
+        if cap <= 0:
+            logs.append("当前保种体积已达目标，无需新增")
+            return {"picked": [], "total_gb": 0.0, "del_seeds": []}
+        candidates = sorted(seeds, key=HHClubButler._tier_sort_key)
         picked = []
-        j = best_j
-        for i in range(n - 1, -1, -1):
-            if keep[i * dp_len + j]:
-                picked.append(seeds[i])
-                j -= int(round(seeds[i]["daily_pt"] * SCALE))
-        picked.reverse()
-        total_pt = sum(s["daily_pt"] for s in picked)
-        total_gb = sum(s["size"] for s in picked)
-        return {"picked": picked, "total_pt": total_pt, "total_gb": total_gb}
+        used = 0.0
+        for s in candidates:
+            if used + s["size"] <= cap + 1e-6:
+                picked.append(s)
+                used += s["size"]
+        logs.append(f"增量优选：剩余可增 {cap:.1f} GB，按档位高→低补 {len(picked)} 个，新增 {used:.1f} GB")
+        for s in picked[:8]:
+            logs.append(f"  + {s.get('title','')} | {s.get('size',0.0):.1f} GB | "
+                        f"初始做种 {s.get('seeders','?')} 人")
+        if len(picked) > 8:
+            logs.append(f"  …等共 {len(picked)} 个")
+        return {"picked": picked, "total_gb": used, "del_seeds": []}
 
-    @staticmethod
-    def _greedy(seeds: list, target_pt: float) -> dict:
-        """贪心降级：按每GB积分降序"""
-        picked = []
-        total_pt = 0.0
-        total_gb = 0.0
-        for s in sorted(seeds, key=lambda x: x["pt_per_gb"], reverse=True):
-            if total_pt >= target_pt:
-                break
-            picked.append(s)
-            total_pt += s["daily_pt"]
-            total_gb += s["size"]
-        return {"picked": picked, "total_pt": total_pt, "total_gb": total_gb}
-
-    @staticmethod
-    def _tier(seeders) -> int:
-        """倍率档位（换种按体积模式的填充顺序，非准确性逻辑）：
-        0=0-1人(3倍), 1=2-3人(2倍), 2=4-5人(v1.2.2实测≈4倍，为最高倍率但保留原档序)"""
-        if seeders <= 1:
-            return 0
-        if seeders <= 3:
-            return 1
-        return 2
-
-    @staticmethod
-    def _pick_to_cover(candidates: list, need: float) -> tuple:
-        """达标补充选择：优先大种子，若大种子加入会明显超标且存在更小单颗
-        能更接近达标，则跳过大种子留给小种子拼凑；拼不够时兜底补回大种子。
-        返回 (选中列表, 总积分)。"""
-        cand = sorted(candidates, key=lambda x: x["size"], reverse=True)
-        picked = []
-        cur = 0.0
-        skipped = []
-        n = len(cand)
-        for i, s in enumerate(cand):
-            if cur >= need - 1e-6:
-                break
-            remain = need - cur
-            if cur + s["daily_pt"] >= need - 1e-6:
-                # 这颗加入即达标：若后面有更小单颗也能达标且超出更少 → 跳过，留给小种精调
-                better = -1
-                for j in range(i + 1, n):
-                    t = cand[j]
-                    if t["daily_pt"] >= remain - 1e-6 and t["daily_pt"] < s["daily_pt"]:
-                        if better < 0 or t["daily_pt"] < cand[better]["daily_pt"]:
-                            better = j
-                if better >= 0:
-                    skipped.append(i)
-                    continue
-            picked.append(s)
-            cur += s["daily_pt"]
-        # 兜底：仍不足则把跳过的大种子补回，直到达标
-        if cur < need - 1e-6:
-            for i in skipped:
-                if cur >= need - 1e-6:
-                    break
-                picked.append(cand[i])
-                cur += cand[i]["daily_pt"]
-        return picked, cur
-
-    def _wash_volume(self, cur_by_tier: dict, cand_by_tier: dict, current: list,
-                     logs: list) -> dict:
-        """换种优选（按体积）：总体积 <= 目标上限，尽量高倍率。
-        从高档到低档逐档：当前种子优先（从大到小塞入），当前全保留且还有
-        空间才补同档候选（从大到小塞满）；塞不下的当前种子删除（任务+文件）。"""
+    def _optimize_wash(self, candidates: list, current: list,
+                       eff_target: float, logs: list) -> dict:
         cap = self._target_volume
+        if not cap or cap <= 0:
+            logs.append("目标体积为0（不限），换种模式不删除任何种子")
+            return {"picked": [], "del_seeds": [], "total_gb": 0.0, "keep_count": len(current)}
+        cur_titles = {s["title"] for s in current}
+        pool = list(current)
+        for s in candidates:
+            if s["title"] not in cur_titles:
+                pool.append(s)
+        pool = sorted(pool, key=HHClubButler._tier_sort_key)
         final = []
-        total_pt = 0.0
         total_gb = 0.0
-        tier_names = ("0-1人", "2-3人", "4-5人")
-        for t in (0, 1, 2):
-            if total_gb >= cap - 1e-6:
-                break
-            tname = tier_names[t]
-            cur_t = sorted(cur_by_tier[t], key=lambda x: x["size"], reverse=True)
-            cur_picked = []
-            cur_del = []
-            for s in cur_t:
-                if total_gb + s["size"] <= cap + 1e-6:
-                    cur_picked.append(s)
-                    total_gb += s["size"]
-                    total_pt += s["daily_pt"]
-                else:
-                    cur_del.append(s)
-            for s in cur_picked:
-                final.append((s, False))
-            if cur_del:
-                # 有当前被体积上限挤出 → 同档不换，本档候选不补
-                logs.append(f"{tname}档：塞入当前 {len(cur_picked)} 个，"
-                            f"体积上限挤出 {len(cur_del)} 个（同档不换，不再补候选）")
-                continue
-            # 当前全保留且有空间 → 补同档候选（从大到小塞满）
-            cand_t = sorted(cand_by_tier[t], key=lambda x: x["size"], reverse=True)
-            picked_c = []
-            for s in cand_t:
-                if total_gb + s["size"] <= cap + 1e-6:
-                    picked_c.append(s)
-                    total_gb += s["size"]
-                    total_pt += s["daily_pt"]
-            for s in picked_c:
-                final.append((s, True))
-            logs.append(f"{tname}档：当前 {len(cur_picked)} 个 + 候选 {len(picked_c)} 个")
-        final_titles = {s["title"] for s, _ in final}
+        for s in pool:
+            if total_gb + s["size"] <= cap + 1e-6:
+                final.append(s)
+                total_gb += s["size"]
+        final_titles = {s["title"] for s in final}
         del_seeds = [s for s in current if s["title"] not in final_titles]
-        add_seeds = [s for s, is_new in final if is_new]
+        add_seeds = [s for s in final if s["title"] not in cur_titles]
         keep_count = len(final) - len(add_seeds)
-        logs.append(f"换种（按体积）上限 {cap:.0f} GB：构建 {len(final)} 个"
+        logs.append(f"换种优选（体积上限 {cap:g} GB）：构建 {len(final)} 个"
                     f"（保留当前 {keep_count} + 新增 {len(add_seeds)}），"
                     f"删除 {len(del_seeds)} 个，最终体积 {total_gb:.1f} GB")
-        for s in add_seeds:
+        for s in add_seeds[:8]:
             logs.append(f"  + 新增: {s.get('title','')} | {s.get('size',0.0):.1f} GB | "
-                        f"初始做种 {s.get('seeders','?')} 人 | +{s.get('daily_pt',0.0):.1f} 积分")
-        for s in del_seeds:
+                        f"初始做种 {s.get('seeders','?')} 人")
+        if len(add_seeds) > 8:
+            logs.append(f"  …等共 {len(add_seeds)} 个新增")
+        for s in del_seeds[:8]:
             logs.append(f"  - 删除: {s.get('title','')} | {s.get('size',0.0):.1f} GB | "
-                        f"初始做种 {s.get('seeders','?')} 人 | -{s.get('daily_pt',0.0):.1f} 积分")
-        return {
-            "picked": add_seeds,
-            "del_seeds": del_seeds,
-            "total_pt": total_pt,
-            "total_gb": total_gb,
-            "keep_count": keep_count,
-        }
-
-    def _optimize_with_wash(self, candidates: list, current: list, eff_target: float,
-                            target: float, logs: list) -> dict:
-        """换种优选v2（按积分）：从高倍率到低倍率逐档构建最终保种集合，
-        凑到目标积分即停；同档位不替换（档内优先保留当前，不足才补候选）；
-        补充候选优先大种子、超标跳小灵活拼凑；集合之外及达标后多余的当前
-        种子删除（任务+文件）；高倍率不够逐级用低倍率补充；全部资源仍不足
-        则如实报未达标且不删除任何当前种子。"""
-        cur_titles = {s["title"] for s in current}
-        cur_by_tier = {0: [], 1: [], 2: []}
-        for s in current:
-            cur_by_tier[HHClubButler._tier(s.get("seeders", 0))].append(s)
-        cand_by_tier = {0: [], 1: [], 2: []}
-        for s in candidates:
-            if s["title"] in cur_titles:
-                continue
-            cand_by_tier[HHClubButler._tier(s.get("seeders", 0))].append(s)
-
-        if self._use_volume:
-            return self._wash_volume(cur_by_tier, cand_by_tier, current, logs)
-
-        # ---- 按积分：逐档构建 ----
-        final = []          # [(seed, is_new)]
-        total_pt = 0.0
-        total_gb = 0.0
-        tier_names = ("0-1人", "2-3人", "4-5人")
-        for t in (0, 1, 2):
-            tname = tier_names[t]
-            # 档位内：先保留当前已保种子（同档位不替换）
-            for s in cur_by_tier[t]:
-                final.append((s, False))
-                total_pt += s["daily_pt"]
-                total_gb += s["size"]
-            if total_pt >= target - 1e-6:
-                logs.append(f"{tname}档当前 {len(cur_by_tier[t])} 个即达标")
-                break
-            # 当前不足：补充该档候选（优先大种子+灵活拼凑）
-            need = target - total_pt
-            cands = cand_by_tier[t]
-            if cands:
-                picked_c, added_pt = HHClubButler._pick_to_cover(cands, need)
-                for s in picked_c:
-                    final.append((s, True))
-                    total_pt += s["daily_pt"]
-                    total_gb += s["size"]
-                logs.append(f"{tname}档：当前 {len(cur_by_tier[t])} 个 + "
-                            f"候选补 {len(picked_c)} 个（+{added_pt:.1f} 积分）")
-            else:
-                logs.append(f"{tname}档：当前 {len(cur_by_tier[t])} 个，无候选可补")
-            if total_pt >= target - 1e-6:
-                break
-
-        # 删除：未纳入 final 的当前种子
-        final_titles = {s["title"] for s, _ in final}
-        del_seeds = [s for s in current if s["title"] not in final_titles]
-        # 本次是否有档位补充了候选（有=候选介入，保留的当前种子均为必要，不再删减）
-        add_tiers = {HHClubButler._tier(s.get("seeders", 0)) for s, is_new in final if is_new}
-        if total_pt >= target - 1e-6:
-            if not add_tiers:
-                # 未补候选即达标（当前保种本就达标/超标）：
-                # 从最低档(4-5)到最高档(0-1)、档内体积从大到小删到刚好达标。
-                # 只删当前已保种，绝不删新增候选。
-                removable = [(s, HHClubButler._tier(s.get("seeders", 0)))
-                             for s, is_new in final if not is_new]
-                removable.sort(key=lambda x: (-x[1], -x[0]["size"]))
-                for s, _t in removable:
-                    if total_pt - s["daily_pt"] >= target - 1e-6:
-                        final.remove((s, False))
-                        total_pt -= s["daily_pt"]
-                        total_gb -= s["size"]
-                        del_seeds.append(s)
-                    else:
-                        break
-            else:
-                logs.append("本次补充候选后才达标，保留全部已保种种子（不删减，避免同档替换）")
-        else:
-            logs.append("⚠️ 保种区全部资源用尽仍低于目标积分，本次不删除任何当前保种种子")
-
-        add_seeds = [s for s, is_new in final if is_new]
-        keep_count = len(final) - len(add_seeds)
-        logs.append(f"换种（按积分）目标 {target:.0f}：构建 {len(final)} 个"
-                    f"（保留当前 {keep_count} + 新增 {len(add_seeds)}），"
-                    f"删除 {len(del_seeds)} 个，最终积分 {total_pt:.1f}")
-        for s in add_seeds:
-            logs.append(f"  + 新增: {s.get('title','')} | {s.get('size',0.0):.1f} GB | "
-                        f"初始做种 {s.get('seeders','?')} 人 | +{s.get('daily_pt',0.0):.1f} 积分")
-        for s in del_seeds:
-            logs.append(f"  - 删除: {s.get('title','')} | {s.get('size',0.0):.1f} GB | "
-                        f"初始做种 {s.get('seeders','?')} 人 | -{s.get('daily_pt',0.0):.1f} 积分")
-        return {
-            "picked": add_seeds,
-            "del_seeds": del_seeds,
-            "total_pt": total_pt,
-            "total_gb": total_gb,
-            "keep_count": keep_count,
-        }
+                        f"初始做种 {s.get('seeders','?')} 人")
+        if len(del_seeds) > 8:
+            logs.append(f"  …等共 {len(del_seeds)} 个删除")
+        return {"picked": add_seeds, "del_seeds": del_seeds,
+                "total_gb": total_gb, "keep_count": keep_count}
 
     def _save_log(self, logs: list):
-        """保存运行日志到插件数据目录"""
         try:
             path = self.get_data_path()
             if not path.exists():
                 path.mkdir(parents=True, exist_ok=True)
-            log_path = path / "run_log.txt"
-            with open(log_path, "w", encoding="utf-8") as f:
+            with open(path / "run_log.txt", "w", encoding="utf-8") as f:
                 f.write("\n".join(logs))
         except Exception as e:
             logger.error(f"保存日志失败：{e}")
