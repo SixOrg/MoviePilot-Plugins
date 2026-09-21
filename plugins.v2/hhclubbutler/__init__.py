@@ -72,7 +72,7 @@ class HHClubButler(_PluginBase):
     plugin_name = "憨憨保种区管家"
     plugin_desc = "按目标体积与档位自动优选添加及换种工具"
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
-    plugin_version = "2.0"
+    plugin_version = "2.0.1"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "hhclubbutler_"
@@ -841,7 +841,7 @@ body[data-theme="hc"]{--bg:#000000;--fg:#ffffff;--topbar:#1a1a1a;--border:#40404
 .chip{background:var(--chip);padding:3px 10px;border-radius:12px;cursor:pointer;font-size:11px;user-select:none;color:var(--fg)}
 .chip.active{background:var(--chip-active);color:#fff}
 .chip:hover{background:var(--chip-hover)}
-.search{margin-left:auto;background:var(--input-bg);border:1px solid var(--input-border);color:var(--fg);padding:5px 10px;border-radius:3px;width:200px}
+.search{margin-left:auto;background:var(--input-bg);border:1px solid var(--input-border);color:var(--fg);padding:5px 10px;border-radius:3px;width:600px;max-width:40vw}
 .btn{background:var(--btn);color:#fff;border:none;padding:5px 12px;border-radius:3px;cursor:pointer;font-size:12px}
 .btn.danger{background:var(--btn-danger)}
 .btn.ghost{background:var(--btn-ghost);color:var(--fg)}
@@ -992,13 +992,13 @@ async function delOne(title){
 if(!confirm("确认删除种子:\\n"+title+"\\n\\n将同时删除下载器任务和文件!"))return;
 await doDel([title])}
 async function delSel(){
-var ts=Object.keys(sel).filter(function(k){return sel[k]});
+var ts=seeds.filter(function(s){return sel[s.title]}).map(function(s){return s.title});
 if(!ts.length){alert("未选中任何种子");return}
 if(!confirm("确认删除选中的 "+ts.length+" 个种子?\\n将同时删除下载器任务和文件!"))return;
 await doDel(ts)}
 async function doDel(titles){
 for(var i=0;i<titles.length;i++){
-try{var r=await fetch("/api/v1/plugin/HHClubButler/delete_rescue_seed?apikey="+encodeURIComponent(APIKEY),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({title:titles[i]})});var j=await r.json();if(!j.success)alert("删除失败:"+titles[i]+" -> "+(j.message||""));delete sel[titles[i]]}
+try{var r=await fetch("/api/v1/plugin/HHClubButler/delete_rescue_seed?apikey="+encodeURIComponent(APIKEY)+"&title="+encodeURIComponent(titles[i]),{method:"POST"});var j=await r.json();if(!j.success)alert("删除失败:"+titles[i]+" -> "+(j.message||""));delete sel[titles[i]]}
 catch(e){alert("删除异常:"+titles[i]+" "+e)}}
 await load()}
 document.getElementById("btnDel").onclick=delSel;
