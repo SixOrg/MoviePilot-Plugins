@@ -1277,8 +1277,18 @@ buildHead();load();
         else:
             lines.append("目标体积：不限")
         ov = self._last_overview or {}
-        dist = ov.get("dist") or {}
-        if dist:
+        # 档位分布直接从本次运行最新种子数据计算，不使用缓存
+        fresh_seeds = current.get("seeds", []) or []
+        dist = {"0-1人": {"count": 0, "gb": 0.0},
+                "2-3人": {"count": 0, "gb": 0.0},
+                "4-5人": {"count": 0, "gb": 0.0}}
+        for s in fresh_seeds:
+            t = tier_of(s.get("seeders", 0))
+            if t > 2:
+                t = 2
+            dist[TIER_NAMES[t]]["count"] += 1
+            dist[TIER_NAMES[t]]["gb"] += s.get("size", 0.0)
+        if fresh_seeds:
             lines.append("初始做种人数分布")
             for key in ("0-1人", "2-3人", "4-5人"):
                 d = dist.get(key) or {}
