@@ -1,0 +1,30 @@
+{
+          "HHClubButler": {
+                        "name": "憨憨保种区管家",
+                        "description": "自动优选添加及换种工具，独立页面[保种管理器]",
+                        "labels": "保种,优选,憨憨,管家",
+                        "version": "2.0",
+                        "icon": "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png",
+                        "author": "六个橙子",
+                        "author_url": "https://github.com/SixOrg",
+                        "level": 1,
+                        "v3": true,
+                        "release": true,
+                        "history": {
+                                          "2.0": "目标体积模式+档位优选+保种管理器"
+                        }
+          },
+          "HHClubDetailExporter": {
+                        "name": "憨憨保种区明细导出",
+                        "description": "每天定时导出憨憨站保种区完成种子明细为CSV，支持手动导出与删除",
+                        "labels": "保种,明细,导出,憨憨",
+                        "version": "1.0",
+                        "icon": "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png",
+                        "author": "六个橙子",
+                        "author_url": "https://github.com/SixOrg",
+                        "level": 1,
+                        "v3": true,
+                        "release": true,
+                        "history": {}
+          }
+}
