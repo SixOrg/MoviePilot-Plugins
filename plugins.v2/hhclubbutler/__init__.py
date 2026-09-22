@@ -72,7 +72,7 @@ class HHClubButler(_PluginBase):
     plugin_name = "憨憨保种区管家"
     plugin_desc = "按目标体积与档位自动优选添加及换种工具"
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
-    plugin_version = "2.0.1"
+    plugin_version = "2.0"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "hhclubbutler_"
@@ -329,10 +329,15 @@ class HHClubButler(_PluginBase):
                     ]}
 
         def legend_col(key, align):
+            color_map = {"0-1人": "#22c55e", "2-3人": "#3b82f6", "4-5人": "#ef4444"}
+            sq = color_map.get(key, "#999")
             return {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
                     'content': [{'component': 'div',
-                                 'props': {'style': f'font-size:11px;color:rgba(var(--v-theme-on-surface),.6);white-space:nowrap;text-align:{align};'},
-                                 'text': f'{key} {d[key]["count"]}个 {d[key]["gb"]:.1f}GB'}]}
+                                 'props': {'style': f'display:flex;align-items:center;justify-content:{align == "left" and "flex-start" or align == "right" and "flex-end" or "center"};font-size:11px;color:rgba(var(--v-theme-on-surface),.6);white-space:nowrap;'},
+                                 'content': [
+                                     {'component': 'div', 'props': {'style': f'width:8px;height:8px;background:{sq};margin-right:4px;flex-shrink:0;'}, 'text': ''},
+                                     {'component': 'span', 'props': {}, 'text': f'{key} {d[key]["count"]}个 {d[key]["gb"]:.1f}GB'},
+                                 ]}]}
 
         last_bean = ov.get("last_bean")
         last_pt = ov.get("last_pt")
@@ -374,7 +379,7 @@ class HHClubButler(_PluginBase):
                               {'component': 'VCol', 'props': {'cols': True},
                                'content': [{'component': 'div',
                                             'props': {'style': 'font-size:10.5px;color:rgba(var(--v-theme-on-surface),.4);text-align:right;'},
-                                            'text': '左下角 [查看数据] 内置 [立即刷新] 及 [保种管理台]'}]},
+                                            'text': '左下角 [查看数据] 内置 [立即刷新] 及 [保种管理器]'}]},
                           ]},
                      ]},
                     {'component': 'VAlert', 'props': {'type': 'info', 'variant': 'tonal',
@@ -556,7 +561,7 @@ class HHClubButler(_PluginBase):
             '<a href="/api/v1/plugin/HHClubButler/rescue_panel?apikey=' + getattr(settings, 'API_TOKEN', '') + '" target="_blank" '
             'style="display:inline-flex;align-items:center;gap:6px;padding:7px 18px;background:rgba(66,165,245,.12);'
             'color:#42A5F5;text-decoration:none;border-radius:4px;font-size:13px;font-weight:500;border:1px solid rgba(66,165,245,.3);">'
-            '🖥️ 保种管理台</a>'
+            '🖥️ 保种管理器</a>'
             '<span style="font-size:11px;color:rgba(var(--v-theme-on-surface),.45);">独立工作台 · 批量删除 · 搜索· 查看· 档位· 筛选· 列自定义 · 多皮肤等功能</span>'
             '</div>'
         )
@@ -836,7 +841,9 @@ body[data-theme="plum"]{--bg:#1a0f1f;--fg:#e0c8e8;--topbar:#2a1530;--border:#100
 body[data-theme="charcoal"]{--bg:#23201e;--fg:#e0dcd6;--topbar:#1a1715;--border:#0a0806;--chip:#3a3532;--chip-active:#d4a574;--chip-hover:#45403c;--input-bg:#1a1715;--input-border:#4a4440;--btn:#d4a574;--btn-danger:#e74c3c;--btn-ghost:#3a3532;--toolbar:#1e1a18;--picker-bg:#23201e;--picker-border:#4a4440;--th:#1e1a18;--th-hover:#2a2522;--td-border:#33302c;--tr-hover:#2a2624;--tr-sel:#8a6a44;--footer:#0a0806;--footer-border:#000;--muted:#8a8078;--muted2:#aaa098}
 body[data-theme="forest"]{--bg:#0f1f17;--fg:#c8e0d0;--topbar:#162a1f;--border:#0a1510;--chip:#1f3a2a;--chip-active:#66bb6a;--chip-hover:#2a4a35;--input-bg:#162a1f;--input-border:#2a4a35;--btn:#66bb6a;--btn-danger:#ef5350;--btn-ghost:#1f3a2a;--toolbar:#122519;--picker-bg:#0f1f17;--picker-border:#2a4a35;--th:#122519;--th-hover:#1a3525;--td-border:#1a3020;--tr-hover:#1a2e20;--tr-sel:#2e7d32;--footer:#0a1510;--footer-border:#000;--muted:#5a8a6a;--muted2:#8ab89a}
 body[data-theme="hc"]{--bg:#000000;--fg:#ffffff;--topbar:#1a1a1a;--border:#404040;--chip:#2a2a2a;--chip-active:#00ffff;--chip-hover:#3a3a3a;--input-bg:#000;--input-border:#888;--btn:#00ffff;--btn-danger:#ff0000;--btn-ghost:#2a2a2a;--toolbar:#1a1a1a;--picker-bg:#000;--picker-border:#888;--th:#1a1a1a;--th-hover:#2a2a2a;--td-border:#333;--tr-hover:#1a1a1a;--tr-sel:#006666;--footer:#000;--footer-border:#404040;--muted:#aaaaaa;--muted2:#cccccc}
-.topbar{background:var(--topbar);padding:8px 12px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--border);flex-wrap:wrap}
+.topbar{background:var(--topbar);padding:8px 12px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--border);flex-wrap:wrap;position:relative}
+.dot{display:inline-block;width:8px;height:8px;border-radius:0;margin-right:5px;vertical-align:middle}
+.chip b{margin-left:3px}
 .topbar h1{font-size:14px;color:var(--fg);margin-right:8px}
 .chip{background:var(--chip);padding:3px 10px;border-radius:12px;cursor:pointer;font-size:11px;user-select:none;color:var(--fg)}
 .chip.active{background:var(--chip-active);color:#fff}
@@ -846,7 +853,7 @@ body[data-theme="hc"]{--bg:#000000;--fg:#ffffff;--topbar:#1a1a1a;--border:#40404
 .btn.danger{background:var(--btn-danger)}
 .btn.ghost{background:var(--btn-ghost);color:var(--fg)}
 .toolbar2{background:var(--toolbar);padding:6px 12px;display:flex;gap:6px;border-bottom:1px solid var(--border);align-items:center;position:relative;flex-wrap:wrap}
-.colpicker{position:absolute;right:12px;top:42px;background:var(--picker-bg);border:1px solid var(--picker-border);border-radius:4px;padding:8px;z-index:100;min-width:160px;display:none;box-shadow:0 4px 16px rgba(0,0,0,0.5);max-height:70vh;overflow:auto}
+.colpicker{position:absolute;right:12px;top:50px;background:var(--picker-bg);border:1px solid var(--picker-border);border-radius:4px;padding:8px;z-index:100;min-width:160px;display:none;box-shadow:0 4px 16px rgba(0,0,0,0.5);max-height:70vh;overflow:auto}
 .colpicker.show{display:block}
 .colpicker h4{font-size:11px;color:var(--muted2);margin-bottom:6px;font-weight:normal}
 .colpicker label{display:flex;align-items:center;gap:6px;padding:3px 0;cursor:pointer;font-size:12px;color:var(--fg)}
@@ -858,7 +865,7 @@ th{background:var(--th);color:var(--muted2);text-align:left;font-weight:500;curs
 th:hover{background:var(--th-hover)}
 th.sorted{color:var(--muted2)}
 th .sortind{margin-left:4px;font-size:10px}
-th .resize{position:absolute;right:0;top:0;width:5px;height:100%;cursor:col-resize;background:transparent;z-index:3}
+th .resize{position:absolute;right:-3px;top:0;width:9px;height:100%;cursor:col-resize;background:transparent;z-index:3;touch-action:none}
 th .resize:hover{background:var(--chip-active)}
 tr:hover td{background:var(--tr-hover)}
 tr.sel td{background:var(--tr-sel);color:#fff}
@@ -868,21 +875,19 @@ tr.sel td{background:var(--tr-sel);color:#fff}
 .hide{display:none !important}
 .footer{background:var(--footer);padding:6px 14px;font-size:11px;color:var(--muted);border-top:1px solid var(--footer-border);display:flex;gap:18px;flex-wrap:wrap}
 .themebtn{background:var(--btn-ghost);color:var(--fg);border:1px solid var(--input-border);padding:3px 10px;border-radius:3px;cursor:pointer;font-size:11px}
+.chip .dot{display:inline-block;width:8px;height:8px;border-radius:0;margin-right:4px;vertical-align:middle}
 </style></head><body>
 <div class="topbar">
-<h1>憨憨保种区管理</h1>
-<span class="chip active" data-tier="all">全部 <b id="cnt_all">0</b></span>
-<span class="chip" data-tier="0">0-1人 <b id="cnt_t0">0</b></span>
-<span class="chip" data-tier="1">2-3人 <b id="cnt_t1">0</b></span>
-<span class="chip" data-tier="2">4-5人 <b id="cnt_t2">0</b></span>
+<h1>保种管理器</h1>
+<span class="chip active" data-tier="all"><i class="dot" style="background:#9e9e9e"></i>全部 <b id="cnt_all">0</b></span>
+<span class="chip" data-tier="0"><i class="dot" style="background:#22c55e"></i>0-1人 <b id="cnt_t0">0</b></span>
+<span class="chip" data-tier="1"><i class="dot" style="background:#4da3ff"></i>2-3人 <b id="cnt_t1">0</b></span>
+<span class="chip" data-tier="2"><i class="dot" style="background:#ff6b6b"></i>4-5人 <b id="cnt_t2">0</b></span>
 <input class="search" id="q" placeholder="搜索名称...">
 <button class="btn danger" id="btnDel">删除选中</button>
-<button class="btn ghost" onclick="load()">刷新</button>
+<button class="btn ghost" id="colsBtn">列选择</button>
 <select class="themebtn" id="themeSel" title="选择皮肤" style="cursor:pointer;"><option value="light">纯白</option><option value="cream">米黄暖</option><option value="sakura">樱花粉</option><option value="mint">薄荷绿</option><option value="sky">天空蓝</option><option value="lavender">薰衣草紫</option><option value="silver">银灰金属</option><option value="dark">深灰</option><option value="graphite">石墨蓝</option><option value="midnight">午夜蓝</option><option value="navy">深蓝</option><option value="plum">暗紫</option><option value="charcoal">炭灰暖</option><option value="forest">暗夜绿</option><option value="hc">高对比</option></select>
-</div>
-<div class="toolbar2">
-<span style="color:#888;font-size:11px;">点击表头排序</span>
-<span style="margin-left:auto;"><button class="btn ghost" id="colsBtn">列选择</button></span>
+<button class="btn ghost" id="btnExit" title="关闭管理器">退出</button>
 <div class="colpicker" id="colpicker"><h4>勾选要显示的列</h4>
 <label><input type="checkbox" data-col="c_sid" checked>种子ID</label>
 <label><input type="checkbox" data-col="c_name" checked>种子名称</label>
@@ -894,7 +899,8 @@ tr.sel td{background:var(--tr-sel);color:#fff}
 <label><input type="checkbox" data-col="c_last_settle">上次结算时间</label>
 <label><input type="checkbox" data-col="c_today_hours">今日做种时间</label>
 <label><input type="checkbox" data-col="c_qualified">今日是否达标</label>
-</div></div>
+</div>
+</div>
 <div class="table-wrap"><table id="tbl"><thead><tr id="head"></tr></thead><tbody id="tbody"></tbody></table></div>
 <div class="footer">
 <span>已选 <b id="seln">0</b> 个 / 共 <b id="totaln">0</b> 个</span>
@@ -929,12 +935,13 @@ h+='<th style="width:60px;">操作</th>';
 document.getElementById("head").innerHTML=h;bindHead();
 }
 function bindHead(){
+var dragMoved=false;
 document.querySelectorAll("th .resize").forEach(function(hd){hd.onmousedown=function(e){e.preventDefault();e.stopPropagation();
-var th=hd.parentElement,sx=e.clientX,sw=th.offsetWidth;
-function mv(ev){var w=Math.max(40,sw+ev.clientX-sx);th.style.width=w+"px";var col=th.dataset.col;if(col)document.querySelectorAll('td[data-col="'+col+'"]').forEach(function(td){td.style.width=w+"px"})}
-function up(){document.removeEventListener("mousemove",mv);document.removeEventListener("mouseup",up)}
+var th=hd.parentElement,sx=e.clientX,sw=th.offsetWidth;dragMoved=false;document.body.style.cursor='col-resize';
+function mv(ev){var dx=ev.clientX-sx;if(Math.abs(dx)>1)dragMoved=true;var w=Math.max(40,sw+dx);th.style.width=w+"px";var col=th.dataset.col;if(col)document.querySelectorAll('td[data-col="'+col+'"]').forEach(function(td){td.style.width=w+"px"})}
+function up(ev){document.removeEventListener("mousemove",mv);document.removeEventListener("mouseup",up);document.body.style.cursor='';if(dragMoved&&ev){ev.stopPropagation();ev.preventDefault()}}
 document.addEventListener("mousemove",mv);document.addEventListener("mouseup",up)}});
-document.querySelectorAll("th[data-sortk]").forEach(function(th){th.onclick=function(){var sk=this.dataset.sortk;if(sortKey===sk){sortDir=-sortDir}else{sortKey=sk;sortDir=-1}doSort();buildHead();render()}});
+document.querySelectorAll("th[data-sortk]").forEach(function(th){th.onclick=function(ev){if(dragMoved){dragMoved=false;return}var sk=this.dataset.sortk;if(sortKey===sk){sortDir=-sortDir}else{sortKey=sk;sortDir=-1}doSort();buildHead();render()}});
 document.getElementById("chkAll").onchange=function(){var v=this.checked;filtered.forEach(function(s){sel[s.title]=v});render()};
 }
 function doSort(){
@@ -997,10 +1004,12 @@ if(!ts.length){alert("未选中任何种子");return}
 if(!confirm("确认删除选中的 "+ts.length+" 个种子?\\n将同时删除下载器任务和文件!"))return;
 await doDel(ts)}
 async function doDel(titles){
+var okTitles=[];
 for(var i=0;i<titles.length;i++){
-try{var r=await fetch("/api/v1/plugin/HHClubButler/delete_rescue_seed?apikey="+encodeURIComponent(APIKEY)+"&title="+encodeURIComponent(titles[i]),{method:"POST"});var j=await r.json();if(!j.success)alert("删除失败:"+titles[i]+" -> "+(j.message||""));delete sel[titles[i]]}
+try{var r=await fetch("/api/v1/plugin/HHClubButler/delete_rescue_seed?apikey="+encodeURIComponent(APIKEY)+"&title="+encodeURIComponent(titles[i]),{method:"POST"});var j=await r.json();if(!j.success)alert("删除失败:"+titles[i]+" -> "+(j.message||""));else{okTitles.push(titles[i])}delete sel[titles[i]]}
 catch(e){alert("删除异常:"+titles[i]+" "+e)}}
-await load()}
+if(okTitles.length){seeds=seeds.filter(function(s){return okTitles.indexOf(s.title)<0});doSort();render();}
+}
 document.getElementById("btnDel").onclick=delSel;
 document.getElementById("q").oninput=function(){query=this.value.trim().toLowerCase();render()};
 document.querySelectorAll(".topbar .chip").forEach(function(c){c.onclick=function(){document.querySelectorAll(".topbar .chip").forEach(function(x){x.classList.remove("active")});this.classList.add("active");curTier=this.dataset.tier;render()}});
@@ -1034,6 +1043,7 @@ try{var lt=localStorage.getItem(THEME_KEY);if(lt)applyTheme(lt);else applyTheme(
 var sel=document.getElementById("themeSel");
 sel.value=document.body.getAttribute("data-theme")||"dark";
 sel.onchange=function(){applyTheme(this.value)};
+document.getElementById("btnExit").onclick=function(){try{window.close()}catch(e){}setTimeout(function(){window.close()},100);if(!window.closed)alert("濡傛湭鑷姩鍏抽棴锛岃鎵嬪姩鍏抽棴鏈爣绛鹃〉")};
 buildHead();load();
 </script></body></html>"""
         return html.replace("__APIKEY__", ak)
