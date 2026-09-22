@@ -1271,11 +1271,26 @@ buildHead();load();
     def _build_notify(self, mode_name, current, target, eff_target, picked, total_gb,
                       filtered, ok_count, fail_count, fail_list, result, cleaned=0) -> list:
         lines = ["──────────────"]
-        lines.append(f"当前保种：{current.get('count', 0)} 个 / {current.get('total_gb', 0.0):.1f} GB")
+        lines.append(f"在保种子：{current.get('count', 0)} 个 / {current.get('total_gb', 0.0):.1f} GB")
         if target and target > 0:
             lines.append(f"目标体积：{target:.0f} GB（剩余可增 {eff_target:.1f} GB）")
         else:
             lines.append("目标体积：不限")
+        ov = self._last_overview or {}
+        dist = ov.get("dist") or {}
+        if dist:
+            lines.append("初始做种人数分布")
+            for key in ("0-1人", "2-3人", "4-5人"):
+                d = dist.get(key) or {}
+                lines.append(f"  {key}  {d.get('count', 0)}个  {d.get('gb', 0.0):.1f} GB")
+        last_bean = ov.get("last_bean")
+        last_pt = ov.get("last_pt")
+        last_date = ov.get("last_date", "") or ""
+        if isinstance(last_bean, (int, float)) and isinstance(last_pt, (int, float)):
+            seg = f"上次结算：憨豆 {last_bean:.0f}  积分 {last_pt:.0f}"
+            if last_date:
+                seg += f"（{last_date}）"
+            lines.append(seg)
         lines.append("──────────────")
         if picked:
             lines.append(f"新增 {len(picked)} 个种子：+{total_gb:.1f} GB")
