@@ -1,9 +1,9 @@
 {
           "HHClubButler": {
                         "name": "憨憨保种区管家",
-                        "description": "自动优选添加及换种工具，独立页面[保种管理台]",
+                        "description": "自动优选添加及换种工具，独立页面[保种管理器]",
                         "labels": "保种,优选,憨憨,管家",
-                        "version": "2.0.1",
+                        "version": "2.0",
                         "icon": "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png",
                         "author": "六个橙子",
                         "author_url": "https://github.com/SixOrg",
@@ -11,8 +11,7 @@
                         "v3": true,
                         "release": true,
                         "history": {
-                                          "2.0.1": "修复删除接口参数、批量删除计数、搜索框宽度",
-                                          "2.0": "目标体积模式+档位优选+保种管理台"
+                                          "2.0": "目标体积模式+档位优选+保种管理器，通知含档位分布与上次结算"
                         }
           },
           "HHClubDetailExporter": {
