@@ -1,7 +1,7 @@
 {
           "HHClubButler": {
                         "name": "憨憨保种区管家",
-                        "description": "自动优选添加及换种工具，独立页面[保种管理器]",
+                        "description": "自动优选添加及换种工具，独立页面[保种管理台]",
                         "labels": "保种,优选,憨憨,管家",
                         "version": "2.0",
                         "icon": "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png",
