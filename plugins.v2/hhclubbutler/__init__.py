@@ -1271,24 +1271,38 @@ buildHead();load();
     def _build_notify(self, mode_name, current, target, eff_target, picked, total_gb,
                       filtered, ok_count, fail_count, fail_list, result, cleaned=0) -> list:
         lines = ["──────────────"]
-        lines.append(f"在保种子：{current.get('count', 0)} 个 / {current.get('total_gb', 0.0):.1f} GB")
+        # 计算换种/增量后的最终状态
+        del_seeds = result.get("del_seeds", []) or []
+        del_titles = {s["title"] for s in del_seeds}
+        final_seeds = []
+        seen = set()
+        for s in (current.get("seeds", []) or []):
+            if s["title"] not in del_titles and s["title"] not in seen:
+                final_seeds.append(s)
+                seen.add(s["title"])
+        for s in picked:
+            if s["title"] not in seen:
+                final_seeds.append(s)
+                seen.add(s["title"])
+        final_count = len(final_seeds)
+        final_gb = sum(s.get("size", 0.0) for s in final_seeds)
+        lines.append(f"在保种子：{final_count} 个 / {final_gb:.1f} GB")
         if target and target > 0:
-            lines.append(f"目标体积：{target:.0f} GB（剩余可增 {eff_target:.1f} GB）")
+            remain = max(0.0, target - final_gb)
+            lines.append(f"目标体积：{target:.0f} GB（剩余可增 {remain:.1f} GB）")
         else:
             lines.append("目标体积：不限")
         ov = self._last_overview or {}
-        # 档位分布直接从本次运行最新种子数据计算，不使用缓存
-        fresh_seeds = current.get("seeds", []) or []
         dist = {"0-1人": {"count": 0, "gb": 0.0},
                 "2-3人": {"count": 0, "gb": 0.0},
                 "4-5人": {"count": 0, "gb": 0.0}}
-        for s in fresh_seeds:
+        for s in final_seeds:
             t = tier_of(s.get("seeders", 0))
             if t > 2:
                 t = 2
             dist[TIER_NAMES[t]]["count"] += 1
             dist[TIER_NAMES[t]]["gb"] += s.get("size", 0.0)
-        if fresh_seeds:
+        if final_seeds:
             lines.append("初始做种人数分布")
             for key in ("0-1人", "2-3人", "4-5人"):
                 d = dist.get(key) or {}
@@ -2098,7 +2112,7 @@ buildHead();load();
             victims = [s for s in final
                        if tier_of(s.get("seeders", 1)) > cand_tier
                        and s["title"] not in del_map]
-            victims.sort(key=lambda s: s.get("size", 0.0))
+            victims.sort(key=lambda s: (-tier_of(s.get("seeders", 1)), s.get("size", 0.0)))
             evicted_this_round = []
             added = False
             for victim in victims:
