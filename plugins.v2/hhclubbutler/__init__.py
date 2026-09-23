@@ -2077,24 +2077,52 @@ buildHead();load();
             logs.append("目标体积为0（不限），换种模式不删除任何种子")
             return {"picked": [], "del_seeds": [], "total_gb": 0.0, "keep_count": len(current)}
         cur_titles = {s["title"] for s in current}
-        pool = list(current)
-        for s in candidates:
-            if s["title"] not in cur_titles:
-                pool.append(s)
-        pool = sorted(pool, key=HHClubButler._tier_sort_key)
-        final = []
-        total_gb = 0.0
-        for s in pool:
-            if total_gb + s["size"] <= cap + 1e-6:
-                final.append(s)
-                total_gb += s["size"]
-        final_titles = {s["title"] for s in final}
-        del_seeds = [s for s in current if s["title"] not in final_titles]
+        # 从当前在保种子开始，默认全部保留
+        final = list(current)
+        total_gb = sum(s.get("size", 0.0) for s in final)
+        # 新候选按档位优先级排序（高档位先处理，同档位大体积先）
+        new_cands = [s for s in candidates if s["title"] not in cur_titles]
+        new_cands.sort(key=lambda s: (tier_of(s.get("seeders", 1)), -s.get("size", 0.0)))
+        del_map = {}
+        for cand in new_cands:
+            csize = cand.get("size", 0.0)
+            if csize > cap:
+                continue
+            # 能直接放下就加
+            if total_gb + csize <= cap + 1e-6:
+                final.append(cand)
+                total_gb += csize
+                continue
+            # 放不下：只踢比候选档位更低的种子（低档优先、小体积优先）
+            cand_tier = tier_of(cand.get("seeders", 1))
+            victims = [s for s in final
+                       if tier_of(s.get("seeders", 1)) > cand_tier
+                       and s["title"] not in del_map]
+            victims.sort(key=lambda s: s.get("size", 0.0))
+            evicted_this_round = []
+            added = False
+            for victim in victims:
+                final.remove(victim)
+                evicted_this_round.append(victim)
+                total_gb -= victim["size"]
+                if total_gb + csize <= cap + 1e-6:
+                    final.append(cand)
+                    total_gb += csize
+                    for v in evicted_this_round:
+                        del_map[v["title"]] = v
+                    added = True
+                    break
+            if not added:
+                # 回滚本次尝试踢掉的种子
+                for v in evicted_this_round:
+                    final.append(v)
+                    total_gb += v.get("size", 0.0)
+        del_seeds = list(del_map.values())
         add_seeds = [s for s in final if s["title"] not in cur_titles]
         keep_count = len(final) - len(add_seeds)
         logs.append(f"换种优选（体积上限 {cap:g} GB）：构建 {len(final)} 个"
                     f"（保留当前 {keep_count} + 新增 {len(add_seeds)}），"
-                    f"删除 {len(del_seeds)} 个，最终体积 {total_gb:.1f} GB")
+                    f"删除低档位 {len(del_seeds)} 个，最终体积 {total_gb:.1f} GB")
         for s in add_seeds[:8]:
             logs.append(f"  + 新增: {s.get('title','')} | {s.get('size',0.0):.1f} GB | "
                         f"初始做种 {s.get('seeders','?')} 人")
