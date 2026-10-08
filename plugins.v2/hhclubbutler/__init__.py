@@ -72,7 +72,7 @@ class HHClubButler(_PluginBase):
     plugin_name = "憨憨保种区管家"
     plugin_desc = "自动优选添加及换种工具，独立页面[保种管理器]"
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
-    plugin_version = "2.1"
+    plugin_version = "2.2"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "hhclubbutler_"
@@ -719,6 +719,8 @@ class HHClubButler(_PluginBase):
     def api_list_rescue_seeds(self):
         try:
             cur = self._get_current_seeding([])
+            if cur.get("degraded"):
+                return {"success": False, "message": "站点数据获取失败，请稍后重试"}
             seeds = list(cur.get("seeds", []) or [])
             try:
                 detail = self._get_downloader_detail_map()
@@ -858,7 +860,15 @@ body[data-theme="hc"]{--bg:#000000;--fg:#ffffff;--topbar:#1a1a1a;--border:#40404
 .colpicker h4{font-size:11px;color:var(--muted2);margin-bottom:6px;font-weight:normal}
 .colpicker label{display:flex;align-items:center;gap:6px;padding:3px 0;cursor:pointer;font-size:12px;color:var(--fg)}
 .colpicker label:hover{color:var(--fg)}
-.table-wrap{flex:1;overflow:auto}
+.table-wrap{flex:1;overflow:auto;position:relative}
+.status{position:fixed;top:0;left:0;right:0;bottom:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:var(--bg);z-index:999;font-size:14px;color:var(--fg)}
+.status .spinner{width:32px;height:32px;border:3px solid var(--chip);border-top-color:var(--btn);border-radius:50%;animation:hhspin .8s linear infinite}
+@keyframes hhspin{to{transform:rotate(360deg)}}
+.status .bar{width:240px;height:4px;background:var(--chip);border-radius:2px;overflow:hidden;position:relative}
+.status .bar i{position:absolute;top:0;left:0;height:100%;width:38%;background:var(--btn);border-radius:2px;animation:hhslide 1.1s ease-in-out infinite}
+@keyframes hhslide{0%{left:-38%}100%{left:100%}}
+.status .errmsg{color:var(--btn-danger);font-size:14px;max-width:70%;text-align:center}
+.status .retrybtn{background:var(--btn);color:#fff;border:none;padding:7px 22px;border-radius:4px;cursor:pointer;font-size:14px;margin-top:6px}
 table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px;table-layout:fixed}
 th,td{padding:6px 10px;border-bottom:1px solid var(--td-border);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;position:relative}
 th{background:var(--th);color:var(--muted2);text-align:left;font-weight:500;cursor:pointer;user-select:none;position:sticky;top:0;z-index:2}
@@ -901,7 +911,7 @@ tr.sel td{background:var(--tr-sel);color:#fff}
 <label><input type="checkbox" data-col="c_qualified">今日是否达标</label>
 </div>
 </div>
-<div class="table-wrap"><table id="tbl"><thead><tr id="head"></tr></thead><tbody id="tbody"></tbody></table></div>
+<div class="table-wrap"><div id="status" class="status"><div class="spinner"></div><div class="bar"><i></i></div><span>正在加载保种数据，请稍候…</span></div><table id="tbl"><thead><tr id="head"></tr></thead><tbody id="tbody"></tbody></table></div>
 <div class="footer">
 <span>已选 <b id="seln">0</b> 个 / 共 <b id="totaln">0</b> 个</span>
 <span>已选体积 <b id="selgb">0</b> GB</span>
@@ -989,12 +999,17 @@ document.getElementById("cnt_all").textContent=seeds.length;
 document.getElementById("cnt_t0").textContent=c0;document.getElementById("cnt_t1").textContent=c1;document.getElementById("cnt_t2").textContent=c2;
 }
 async function load(){
+var st=document.getElementById("status");
+function showErr(msg){
+st.innerHTML='<div class="spinner"></div><span class="errmsg">'+esc(msg)+'</span><button class="retrybtn" onclick="load()">重试</button>';
+}
+st.style.display="flex";
 try{
 var r=await fetch("/api/v1/plugin/HHClubButler/list_rescue_seeds?apikey="+encodeURIComponent(APIKEY));
 var j=await r.json();
-if(!j.success){alert("加载失败:"+(j.message||""));return}
-seeds=j.data||[];doSort();render();
-}catch(e){alert("请求失败:"+e)}}
+if(!j.success){showErr(j.message||"数据加载失败");return}
+seeds=j.data||[];doSort();render();st.style.display="none";
+}catch(e){showErr("请求失败："+e)}}
 async function delOne(title){
 if(!confirm("确认删除种子:\\n"+title+"\\n\\n将同时删除下载器任务和文件!"))return;
 await doDel([title])}
@@ -1130,8 +1145,9 @@ buildHead();load();
             logs.append(f"已排除0做种种子 {before - len(seeds)} 个，剩 {len(seeds)} 个")
 
         current = self._get_current_seeding(logs)
-        if current.get("error"):
-            msg = f"无法获取当前保种情况（{current['error']}），为防止误推送已停止运行"
+        if current.get("error") or current.get("degraded"):
+            reason = current.get("error") or current.get("degraded")
+            msg = f"无法获取完整当前保种情况（{reason}），为防止误推送已停止运行"
             self._last_result = msg
             logger.warning(msg)
             self._save_log(logs)
@@ -1416,6 +1432,21 @@ buildHead();load();
         s.headers.update(headers)
         return s
 
+    @staticmethod
+    def _get_with_retry(session, url, timeout=30, retries=2, backoff=(3, 5)):
+        last_exc = None
+        for i in range(retries + 1):
+            try:
+                r = session.get(url, timeout=timeout)
+                r.raise_for_status()
+                return r
+            except Exception as e:
+                last_exc = e
+                if i < retries:
+                    wait = backoff[i] if i < len(backoff) else 5
+                    time.sleep(wait)
+        raise last_exc
+
     def _fetch_last_settlement(self) -> Tuple[Optional[float], Optional[float], str]:
         uid = self._get_site_uid()
         if not uid:
@@ -1423,8 +1454,7 @@ buildHead();load();
         try:
             session = self._session()
             url = f"{self._get_site_url()}/rescuesettleinfo.php?id={uid}"
-            r = session.get(url, timeout=20)
-            r.raise_for_status()
+            r = self._get_with_retry(session, url, timeout=20, retries=2, backoff=(3, 5))
             soup = BeautifulSoup(r.text, "html.parser")
             table = None
             for tb in soup.find_all("table"):
@@ -1467,8 +1497,7 @@ buildHead();load();
         site_url = self._get_site_url()
 
         def _try_get(u):
-            r = session.get(u, timeout=30)
-            r.raise_for_status()
+            r = self._get_with_retry(session, u, timeout=30, retries=2, backoff=(3, 5))
             return r.text
 
         try:
@@ -1494,14 +1523,15 @@ buildHead();load();
                 return []
         for page in range(1, max_page + 1):
             try:
-                r = session.get(f"{site_url}/rescue.php?page={page}", timeout=30)
-                r.raise_for_status()
+                r = self._get_with_retry(session, f"{site_url}/rescue.php?page={page}",
+                                         timeout=30, retries=2, backoff=(3, 5))
                 page_seeds, _ = self._parse_rescue_page(r.text)
                 seeds.extend(page_seeds)
                 logs.append(f"保种区第{page + 1}页获取 {len(page_seeds)} 条数据")
             except Exception as e:
-                logs.append(f"保种区第{page + 1}页获取失败：{e}")
-                break
+                logs.append(f"保种区第{page + 1}页获取失败（已重试）：{e}")
+                logs.append("候选池数据不完整，本次优选中止以防误操作")
+                return []
             time.sleep(0.5)
         return seeds
 
@@ -1620,6 +1650,10 @@ buildHead();load();
             dist[TIER_NAMES[t]]["gb"] += s.get("size", 0.0)
         total_gb = cur.get("total_gb", 0.0)
         last_bean, last_pt, last_date = self._fetch_last_settlement()
+        if last_bean is None and self._last_overview:
+            last_bean = self._last_overview.get("last_bean")
+            last_pt = self._last_overview.get("last_pt")
+            last_date = self._last_overview.get("last_date", "")
         return {
             "count": cur.get("count", 0),
             "total_gb": total_gb,
@@ -1641,34 +1675,33 @@ buildHead();load();
         url = f"{self._get_site_url()}/userdetails.php?id={uid}&action=7"
         max_page = 0
         try:
-            r = session.get(url, timeout=30)
-            r.raise_for_status()
+            r = self._get_with_retry(session, url, timeout=30, retries=2, backoff=(3, 5))
             items, max_page = self._parse_completed_page(r.text)
         except Exception as e:
             alt = url.replace("hhanclub.net", "hhancclub.net") if "hhanclub.net" in url \
                 else url.replace("hhancclub.net", "hhanclub.net")
             if alt != url:
                 try:
-                    r = session.get(alt, timeout=30)
-                    r.raise_for_status()
+                    r = self._get_with_retry(session, alt, timeout=30, retries=2, backoff=(3, 5))
                     url = alt
                     items, max_page = self._parse_completed_page(r.text)
                     logs.append(f"完成页已通过备用域名访问：{alt}")
                 except Exception as e2:
-                    logs.append(f"完成页第1页获取失败（含备用域名）：{e2}")
+                    logs.append(f"完成页第1页获取失败（含备用域名，已重试）：{e2}")
                     return []
             else:
-                logs.append(f"完成页第1页获取失败：{e}")
+                logs.append(f"完成页第1页获取失败（已重试）：{e}")
                 return []
         for page in range(1, max_page + 1):
             try:
-                r = session.get(f"{url}&page={page}", timeout=30)
-                r.raise_for_status()
+                r = self._get_with_retry(session, f"{url}&page={page}",
+                                         timeout=30, retries=2, backoff=(3, 5))
                 page_items, _ = self._parse_completed_page(r.text)
                 items.extend(page_items)
             except Exception as e:
-                logs.append(f"完成页第{page + 1}页获取失败：{e}")
-                break
+                logs.append(f"完成页第{page + 1}页获取失败（已重试）：{e}")
+                logs.append("完成页数据不完整，本次刷新作废保留上次数据")
+                return []
             time.sleep(0.5)
         return items
 
