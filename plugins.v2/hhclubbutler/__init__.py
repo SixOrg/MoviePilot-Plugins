@@ -72,7 +72,7 @@ class HHClubButler(_PluginBase):
     plugin_name = "憨憨保种区管家"
     plugin_desc = "自动优选添加及换种工具，独立页面[保种管理器]"
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
-    plugin_version = "2.2"
+    plugin_version = "2.3"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "hhclubbutler_"
@@ -716,14 +716,28 @@ class HHClubButler(_PluginBase):
             logger.error(f"立即刷新概况失败：{e}")
             return {"success": False, "message": f"概况刷新失败：{e}", "data": None}
 
+    def _prefetch_downloader_torrents(self) -> Optional[list]:
+        service = self._get_downloader_obj()
+        if not service:
+            return None
+        try:
+            torrents, error = service.instance.get_torrents()
+            if error:
+                return None
+            return torrents
+        except Exception as e:
+            logger.warning(f"预取下载器种子失败：{e}")
+            return None
+
     def api_list_rescue_seeds(self):
         try:
-            cur = self._get_current_seeding([])
+            torrents = self._prefetch_downloader_torrents()
+            cur = self._get_current_seeding([], torrents=torrents)
             if cur.get("degraded"):
                 return {"success": False, "message": "站点数据获取失败，请稍后重试"}
             seeds = list(cur.get("seeds", []) or [])
             try:
-                detail = self._get_downloader_detail_map()
+                detail = self._get_downloader_detail_map(torrents=torrents)
             except Exception as e:
                 logger.warning(f"下载器详情合并失败：{e}")
                 detail = {}
@@ -740,7 +754,7 @@ class HHClubButler(_PluginBase):
             logger.error(f"list_rescue_seeds 失败：{e}")
             return {"success": False, "message": str(e)}
 
-    def _get_downloader_detail_map(self) -> dict:
+    def _get_downloader_detail_map(self, torrents: Optional[list] = None) -> dict:
         out = {}
         service = self._get_downloader_obj()
         if not service:
@@ -749,13 +763,14 @@ class HHClubButler(_PluginBase):
             dl_type = str(service.type or service.config.type or "").lower()
         except Exception:
             dl_type = ""
-        try:
-            torrents, error = service.instance.get_torrents()
-            if error:
+        if torrents is None:
+            try:
+                torrents, error = service.instance.get_torrents()
+                if error:
+                    return out
+            except Exception as e:
+                logger.warning(f"详情map取种子失败：{e}")
                 return out
-        except Exception as e:
-            logger.warning(f"详情map取种子失败：{e}")
-            return out
 
         def g(t, *names):
             for n in names:
@@ -861,9 +876,7 @@ body[data-theme="hc"]{--bg:#000000;--fg:#ffffff;--topbar:#1a1a1a;--border:#40404
 .colpicker label{display:flex;align-items:center;gap:6px;padding:3px 0;cursor:pointer;font-size:12px;color:var(--fg)}
 .colpicker label:hover{color:var(--fg)}
 .table-wrap{flex:1;overflow:auto;position:relative}
-.status{position:fixed;top:0;left:0;right:0;bottom:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:var(--bg);z-index:999;font-size:14px;color:var(--fg)}
-.status .spinner{width:32px;height:32px;border:3px solid var(--chip);border-top-color:var(--btn);border-radius:50%;animation:hhspin .8s linear infinite}
-@keyframes hhspin{to{transform:rotate(360deg)}}
+.status{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;font-size:14px;color:var(--fg);text-align:center;max-width:420px;background:var(--bg);padding:28px 36px;border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,0.12)}
 .status .bar{width:240px;height:4px;background:var(--chip);border-radius:2px;overflow:hidden;position:relative}
 .status .bar i{position:absolute;top:0;left:0;height:100%;width:38%;background:var(--btn);border-radius:2px;animation:hhslide 1.1s ease-in-out infinite}
 @keyframes hhslide{0%{left:-38%}100%{left:100%}}
@@ -911,7 +924,7 @@ tr.sel td{background:var(--tr-sel);color:#fff}
 <label><input type="checkbox" data-col="c_qualified">今日是否达标</label>
 </div>
 </div>
-<div class="table-wrap"><div id="status" class="status"><div class="spinner"></div><div class="bar"><i></i></div><span>正在加载保种数据，请稍候…</span></div><table id="tbl"><thead><tr id="head"></tr></thead><tbody id="tbody"></tbody></table></div>
+<div class="table-wrap"><div id="status" class="status"><span>正在加载保种数据，请稍候…</span><div class="bar"><i></i></div></div><table id="tbl"><thead><tr id="head"></tr></thead><tbody id="tbody"></tbody></table></div>
 <div class="footer">
 <span>已选 <b id="seln">0</b> 个 / 共 <b id="totaln">0</b> 个</span>
 <span>已选体积 <b id="selgb">0</b> GB</span>
@@ -1001,15 +1014,19 @@ document.getElementById("cnt_t0").textContent=c0;document.getElementById("cnt_t1
 async function load(){
 var st=document.getElementById("status");
 function showErr(msg){
-st.innerHTML='<div class="spinner"></div><span class="errmsg">'+esc(msg)+'</span><button class="retrybtn" onclick="load()">重试</button>';
+st.innerHTML='<span class="errmsg">'+esc(msg)+'</span><button class="retrybtn" onclick="load()">重试</button>';
 }
 st.style.display="flex";
+st.innerHTML='<span>正在加载保种数据，请稍候…</span><div class="bar"><i></i></div>';
+var ctl=(typeof AbortController!=="undefined")?new AbortController():null;
+var to=ctl?setTimeout(function(){ctl.abort()},90000):null;
 try{
-var r=await fetch("/api/v1/plugin/HHClubButler/list_rescue_seeds?apikey="+encodeURIComponent(APIKEY));
+var r=await fetch("/api/v1/plugin/HHClubButler/list_rescue_seeds?apikey="+encodeURIComponent(APIKEY),ctl?{signal:ctl.signal}:{});
+if(to)clearTimeout(to);
 var j=await r.json();
 if(!j.success){showErr(j.message||"数据加载失败");return}
 seeds=j.data||[];doSort();render();st.style.display="none";
-}catch(e){showErr("请求失败："+e)}}
+}catch(e){if(to)clearTimeout(to);showErr((e&&e.name==="AbortError")?"加载超时，请稍后重试":"请求失败："+e)}}
 async function delOne(title){
 if(!confirm("确认删除种子:\\n"+title+"\\n\\n将同时删除下载器任务和文件!"))return;
 await doDel([title])}
@@ -1599,14 +1616,14 @@ buildHead();load();
             "seed_id": seed_id,
         }
 
-    def _get_current_seeding(self, logs: list) -> dict:
+    def _get_current_seeding(self, logs: list, torrents: Optional[list] = None) -> dict:
         result = {"count": 0, "total_gb": 0.0, "seeds": []}
         completed = self._fetch_completed(logs)
         if not completed:
             logs.append("完成页未获取到数据，本次按空保种降级处理")
             result["degraded"] = "完成页未获取到数据"
             return result
-        dl_seeds = self._get_downloader_seeds(logs)
+        dl_seeds = self._get_downloader_seeds(logs, torrents=torrents)
         if dl_seeds is None:
             logs.append("下载器未获取到种子，按站点完成页全量显示")
             result["count"] = len(completed)
@@ -1858,7 +1875,8 @@ buildHead();load();
             return None
 
     def _get_downloader_seeds(self, logs: list, only_completed: bool = True,
-                                any_tracker: bool = False) -> Optional[set]:
+                                any_tracker: bool = False,
+                                torrents: Optional[list] = None) -> Optional[set]:
         service = self._get_downloader_obj()
         if not service:
             logs.append("未配置有效的下载器")
@@ -1868,11 +1886,16 @@ buildHead();load();
             dl_type = str(service.type or service.config.type or "")
         except Exception:
             pass
-        try:
-            torrents, error = service.instance.get_torrents()
-            if error:
-                logs.append("获取下载器种子列表出错")
+        if torrents is None:
+            try:
+                torrents, error = service.instance.get_torrents()
+                if error:
+                    logs.append("获取下载器种子列表出错")
+                    return None
+            except Exception as e:
+                logs.append(f"获取下载器种子失败：{e}")
                 return None
+        try:
             names = set()
             site_total = 0
             for t in torrents:
@@ -1934,9 +1957,24 @@ buildHead();load();
                             kwargs["labels"] = [self._tag]
                         else:
                             kwargs["tag"] = self._tag
-                    success = service.instance.add_torrent(
-                        content=r.content, download_dir=self._save_path or None,
-                        cookie=push_cookie, **kwargs)
+                    # 修复跨盘/自定义保存路径不生效：qBittorrent 开启自动种子管理时会忽略
+                    # 传入的 save_path，导致填了其他盘的路径仍落在默认盘。
+                    # 对 qBittorrent 显式关闭自动管理（ignore_category_check=False），
+                    # 使下载目录严格按"保存路径"配置生效；Transmission 无此问题，透传即可。
+                    dl_l = str(dl_type).lower()
+                    if "qbittorrent" in dl_l:
+                        result = service.instance.add_torrent(
+                            content=r.content, download_dir=self._save_path or None,
+                            cookie=push_cookie, ignore_category_check=False, **kwargs)
+                        if isinstance(result, tuple):
+                            success = bool(result[0]) if result else False
+                        else:
+                            success = bool(result)
+                    else:
+                        result = service.instance.add_torrent(
+                            content=r.content, download_dir=self._save_path or None,
+                            cookie=push_cookie, **kwargs)
+                        success = result is not None if not isinstance(result, bool) else result
                     if success:
                         ok_count += 1
                         logs.append(f"✅ 已添加：{title}")
