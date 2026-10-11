@@ -72,7 +72,7 @@ class HHClubButler(_PluginBase):
     plugin_name = "憨憨保种区管家"
     plugin_desc = "自动优选添加及换种工具，独立页面[保种管理器]"
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
-    plugin_version = "2.3"
+    plugin_version = "2.4"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "hhclubbutler_"
@@ -90,7 +90,9 @@ class HHClubButler(_PluginBase):
     _target_volume: float = 0
     _seeder_cond: str = ""
     _exclude_zero: bool = False
-    _downloader: str = ""
+    _downloader: str = ""          # 兼容旧配置（单选）
+    _downloaders: list = []        # 管理下载器（多选）
+    _push_downloader: str = ""     # 推送下载器（单选）
     _save_path: str = ""
     _tag: str = ""
     _auto_clean_days: float = 0.0
@@ -123,7 +125,17 @@ class HHClubButler(_PluginBase):
             self._target_volume = 0
         self._seeder_cond = str(config.get("seeder_cond") or "").strip()
         self._exclude_zero = bool(config.get("exclude_zero"))
-        self._downloader = config.get("downloader") or ""
+        _dl_old = str(config.get("downloader") or "")
+        _dls = config.get("downloaders")
+        if isinstance(_dls, list):
+            _dls = [str(x) for x in _dls if str(x).strip()]
+        else:
+            _dls = []
+        if not _dls and _dl_old:
+            _dls = [_dl_old]
+        self._downloader = _dl_old
+        self._downloaders = _dls
+        self._push_downloader = str(config.get("push_downloader") or "") or (_dls[0] if _dls else "")
         self._save_path = config.get("save_path") or ""
         self._tag = config.get("tag") or ""
         try:
@@ -152,6 +164,8 @@ class HHClubButler(_PluginBase):
                 "cookie": self._cookie,
                 "site_url": self._site_url,
                 "downloader": self._downloader,
+                "downloaders": self._downloaders,
+                "push_downloader": self._push_downloader,
                 "save_path": self._save_path,
                 "tag": self._tag,
                 "auto_clean_days": self._auto_clean_days,
@@ -197,6 +211,12 @@ class HHClubButler(_PluginBase):
         }, {
             "path": "/rescue_panel", "endpoint": self.api_rescue_panel,
             "methods": ["GET"], "auth": "apikey", "summary": "仿QB保种管理页",
+        }, {
+            "path": "/monthly_stats", "endpoint": self.api_monthly_stats,
+            "methods": ["GET"], "auth": "apikey", "summary": "结算统计表独立页",
+        }, {
+            "path": "/monthly_stats_data", "endpoint": self.api_monthly_stats_data,
+            "methods": ["GET"], "auth": "apikey", "summary": "结算统计表数据",
         }]
 
     def get_service(self) -> List[Dict[str, Any]]:
@@ -242,17 +262,25 @@ class HHClubButler(_PluginBase):
                                  'placeholder': '30 14 * * *（每天14:30，保种区14:10更新后）'}}]},
                             {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
                              'content': [{'component': 'VSelect', 'props': {
-                                 'model': 'downloader', 'label': '下载器', 'items': downloaders}}]},
+                                 'model': 'downloaders', 'label': '管理下载器（多选）', 'items': downloaders,
+                                 'multiple': True,
+                                 'hint': '统计/优选/管理/删除覆盖所选下载器',
+                                 'persistent-hint': True}}]},
                         ]
                     },
                     {
                         'component': 'VRow',
                         'content': [
-                            {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                             'content': [{'component': 'VSelect', 'props': {
+                                 'model': 'push_downloader', 'label': '推送下载器（单选）', 'items': downloaders,
+                                 'hint': '新增任务的下载器，默认=管理下载器第一个',
+                                 'persistent-hint': True}}]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
                              'content': [{'component': 'VTextField', 'props': {
-                                 'model': 'save_path', 'label': '保存路径',
+                                 'model': 'save_path', 'label': '保存路径（跟随推送下载器）',
                                  'placeholder': '如 /downloads/下载/保种'}}]},
-                            {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
                              'content': [{'component': 'VTextField', 'props': {
                                  'model': 'tag', 'label': '自定义标签',
                                  'placeholder': '如 hhan（推送到下载器后自动打标）'}}]},
@@ -301,7 +329,8 @@ class HHClubButler(_PluginBase):
             "enabled": False, "onlyonce": False, "notify": True,
             "cron": "30 14 * * *", "mode": "incremental",
             "target_volume": 0, "seeder_cond": "", "exclude_zero": False,
-            "downloader": "", "save_path": "", "tag": "", "auto_clean_days": 0,
+            "downloader": "", "downloaders": [], "push_downloader": "",
+            "save_path": "", "tag": "", "auto_clean_days": 0,
         }
         return form, defaults
 
@@ -558,7 +587,11 @@ class HHClubButler(_PluginBase):
             logger.error(f"获取憨憨保种区管家概况失败：{e}")
         panel_link = (
             '<div style="padding:10px 0;display:flex;align-items:center;gap:10px;">'
-            '<a href="/api/v1/plugin/HHClubButler/rescue_panel?apikey=' + getattr(settings, 'API_TOKEN', '') + '" target="_blank" '
+            '<a href="/api/v1/plugin/HHClubButler/monthly_stats?apikey=' + getattr(settings, 'API_TOKEN', '') + '" target="_blank" '
+            'style="display:inline-flex;align-items:center;gap:6px;padding:7px 18px;background:rgba(66,165,245,.12);'
+            'color:#42A5F5;text-decoration:none;border-radius:4px;font-size:13px;font-weight:500;border:1px solid rgba(66,165,245,.3);">'
+            '📊 结算统计表</a>'
+            '<a href="/api/v1/plugin/HHClubButler/rescue_panel?apikey=' + getattr(settings, 'API_TOKEN', '') + '" target="_blank"'
             'style="display:inline-flex;align-items:center;gap:6px;padding:7px 18px;background:rgba(66,165,245,.12);'
             'color:#42A5F5;text-decoration:none;border-radius:4px;font-size:13px;font-weight:500;border:1px solid rgba(66,165,245,.3);">'
             '🖥️ 保种管理器</a>'
@@ -717,14 +750,9 @@ class HHClubButler(_PluginBase):
             return {"success": False, "message": f"概况刷新失败：{e}", "data": None}
 
     def _prefetch_downloader_torrents(self) -> Optional[list]:
-        service = self._get_downloader_obj()
-        if not service:
-            return None
         try:
-            torrents, error = service.instance.get_torrents()
-            if error:
-                return None
-            return torrents
+            torrents = self._fetch_all_downloader_torrents()
+            return torrents or None
         except Exception as e:
             logger.warning(f"预取下载器种子失败：{e}")
             return None
@@ -741,12 +769,34 @@ class HHClubButler(_PluginBase):
             except Exception as e:
                 logger.warning(f"下载器详情合并失败：{e}")
                 detail = {}
+            dl_norm_map = {}
+            for dl_name, t in (torrents or []):
+                try:
+                    tname = t.get("name") if isinstance(t, dict) else getattr(t, "name", "")
+                except Exception:
+                    tname = ""
+                nt = HHClubButler._norm_title(tname)
+                if nt and nt not in dl_norm_map:
+                    dl_norm_map[nt] = dl_name
             for s in seeds:
                 nm = HHClubButler._norm_title(s.get("title") or "")
+                dl_hit = dl_norm_map.get(nm)
+                if dl_hit is None and len(nm) >= 15:
+                    for dk, dn in dl_norm_map.items():
+                        if len(dk) >= 15 and (nm in dk or dk in nm):
+                            dl_hit = dn
+                            break
+                if dl_hit:
+                    s["downloader"] = dl_hit
                 d = detail.get(nm) or {}
+                if not d and len(nm) >= 15:
+                    for dk, dv in detail.items():
+                        if len(dk) >= 15 and (nm in dk or dk in nm):
+                            d = dv
+                            break
                 for k in ("upspeed", "dlspeed", "eta", "ratio", "path",
                           "cur_seeders", "cur_leechers", "tracker", "added",
-                          "progress", "hash"):
+                          "progress", "hash", "downloader"):
                     if k in d:
                         s[k] = d[k]
             return {"success": True, "data": seeds}
@@ -756,21 +806,21 @@ class HHClubButler(_PluginBase):
 
     def _get_downloader_detail_map(self, torrents: Optional[list] = None) -> dict:
         out = {}
-        service = self._get_downloader_obj()
-        if not service:
+        svcs = self._get_manage_services()
+        if not svcs:
             return out
-        try:
-            dl_type = str(service.type or service.config.type or "").lower()
-        except Exception:
+        sv_types = {}
+        for name, sv in svcs.items():
             dl_type = ""
-        if torrents is None:
             try:
-                torrents, error = service.instance.get_torrents()
-                if error:
-                    return out
-            except Exception as e:
-                logger.warning(f"详情map取种子失败：{e}")
-                return out
+                dl_type = str(sv.type or sv.config.type or "").lower()
+            except Exception:
+                pass
+            sv_types[name] = dl_type
+        if torrents is None:
+            torrents = self._fetch_all_downloader_torrents()
+        if not torrents:
+            return out
 
         def g(t, *names):
             for n in names:
@@ -782,11 +832,12 @@ class HHClubButler(_PluginBase):
                     pass
             return None
 
-        for t in torrents:
+        for dl_name, t in torrents:
             try:
                 name = g(t, "name") or ""
                 if not name:
                     continue
+                dl_type = sv_types.get(dl_name, "")
                 progress = HHClubButler._get_progress_ratio(t, dl_type)
                 if progress is not None and progress < 1.0:
                     continue
@@ -826,6 +877,7 @@ class HHClubButler(_PluginBase):
                     "tracker": dom,
                     "added": added_str,
                     "progress": progress,
+                    "downloader": dl_name,
                 }
             except Exception:
                 continue
@@ -840,7 +892,7 @@ class HHClubButler(_PluginBase):
         ak = _json.dumps(apikey)
         html = r"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>憨憨保种区管理</title><style>
+<title>保种管理器</title><style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:"Segoe UI","PingFang SC",Arial,sans-serif;background:var(--bg);color:var(--fg);font-size:12px;height:100vh;display:flex;flex-direction:column;overflow:hidden}
 body[data-theme="light"]{--bg:#ffffff;--fg:#1d1d1f;--topbar:#f5f5f7;--border:#e5e5ea;--chip:#e8e8ed;--chip-active:#0071e3;--chip-hover:#d1d1d6;--input-bg:#ffffff;--input-border:#d2d2d7;--btn:#0071e3;--btn-danger:#ff3b30;--btn-ghost:#e8e8ed;--toolbar:#f0f0f2;--picker-bg:#ffffff;--picker-border:#d2d2d7;--th:#f5f5f7;--th-hover:#e8e8ed;--td-border:#f0f0f2;--tr-hover:#f0f5ff;--tr-sel:#0071e3;--footer:#f5f5f7;--footer-border:#e5e5ea;--muted:#86868b;--muted2:#6e6e73}
@@ -922,6 +974,7 @@ tr.sel td{background:var(--tr-sel);color:#fff}
 <label><input type="checkbox" data-col="c_last_settle">上次结算时间</label>
 <label><input type="checkbox" data-col="c_today_hours">今日做种时间</label>
 <label><input type="checkbox" data-col="c_qualified">今日是否达标</label>
+<label><input type="checkbox" data-col="c_dl" checked>下载器</label>
 </div>
 </div>
 <div class="table-wrap"><div id="status" class="status"><span>正在加载保种数据，请稍候…</span><div class="bar"><i></i></div></div><table id="tbl"><thead><tr id="head"></tr></thead><tbody id="tbody"></tbody></table></div>
@@ -942,7 +995,8 @@ var COLS=[
 {k:"c_done_at",t:"完成时间",w:"140",sortk:"completed_at"},
 {k:"c_last_settle",t:"上次结算时间",w:"140",sortk:"last_settle"},
 {k:"c_today_hours",t:"今日做种时间",w:"90",sortk:"today_hours"},
-{k:"c_qualified",t:"今日达标",w:"70",sortk:"qualified"}
+{k:"c_qualified",t:"今日达标",w:"70",sortk:"qualified"},
+{k:"c_dl",t:"下载器",w:"110",sortk:"downloader"}
 ];
 var seeds=[],filtered=[],sel={};
 var curTier="all",sortKey="size",sortDir=-1,query="";
@@ -985,6 +1039,7 @@ if(c.k==="c_done_at")return esc(s.completed_at||"-");
 if(c.k==="c_last_settle")return esc(s.last_settle||"-");
 if(c.k==="c_today_hours")return esc(s.today_hours||"-");
 if(c.k==="c_qualified"){var q=s.qualified||"";var ok=(q.indexOf("\u5df2\u8fbe")>=0||q==="\u662f"||q==="Y"||q==="\u2713"||q==="\u2714"||q.indexOf("\u2714")>=0||q.indexOf("OK")>=0);return '<span class="'+(ok?"qual-yes":"")+'">'+esc(q||"-")+"</span>";}
+if(c.k==="c_dl")return esc(s.downloader||"-");
 return "";
 }
 function render(){
@@ -1085,34 +1140,39 @@ buildHead();load();
             return {"success": False, "message": "缺少 title 参数"}
         logger.info(f"手动删除请求：{title}")
         try:
-            service = self._get_downloader_obj()
-            if not service:
+            svcs = self._get_manage_services()
+            if not svcs:
                 return {"success": False, "message": "未配置有效下载器"}
-            torrents, error = service.instance.get_torrents()
-            if error:
-                return {"success": False, "message": "下载器获取种子列表失败"}
             target_norm = HHClubButler._norm_title(title)
-            del_ids = []
-            matched_name = None
-            for t in torrents:
+            for name, sv in svcs.items():
                 try:
-                    tname = t.get("name") if isinstance(t, dict) else getattr(t, "name", "")
-                    thash = (t.get("hash") if isinstance(t, dict)
-                             else getattr(t, "hash", None) or getattr(t, "hashString", ""))
+                    torrents, error = sv.instance.get_torrents()
+                    if error:
+                        continue
                 except Exception:
                     continue
-                if HHClubButler._norm_match(tname, {target_norm}):
-                    del_ids.append(thash)
-                    matched_name = tname
-            if not del_ids:
-                return {"success": False, "message": f"下载器中未找到匹配种子：{title}"}
-            service.instance.delete_torrents(delete_file=True, ids=del_ids)
-            logger.info(f"已手动删除种子：{matched_name}（{len(del_ids)}个任务，含文件）")
-            try:
-                self._refresh_overview(manual=False)
-            except Exception:
-                pass
-            return {"success": True, "message": f"已删除：{matched_name or title}"}
+                del_ids = []
+                matched_name = None
+                for t in torrents:
+                    try:
+                        tname = t.get("name") if isinstance(t, dict) else getattr(t, "name", "")
+                        thash = (t.get("hash") if isinstance(t, dict)
+                                 else getattr(t, "hash", None) or getattr(t, "hashString", ""))
+                    except Exception:
+                        continue
+                    if HHClubButler._norm_match(tname, {target_norm}):
+                        del_ids.append(thash)
+                        matched_name = tname
+                if not del_ids:
+                    continue
+                sv.instance.delete_torrents(delete_file=True, ids=del_ids)
+                logger.info(f"已手动删除种子：{matched_name}（{len(del_ids)}个任务，含文件，下载器 {name}）")
+                try:
+                    self._refresh_overview(manual=False)
+                except Exception:
+                    pass
+                return {"success": True, "message": f"已删除：{matched_name or title}"}
+            return {"success": False, "message": f"下载器中未找到匹配种子：{title}"}
         except Exception as e:
             logger.error(f"手动删除种子失败：{e}")
             return {"success": False, "message": f"删除失败：{e}"}
@@ -1507,6 +1567,319 @@ buildHead();load();
             logger.warning(f"抓取上次结算失败：{e}")
         return None, None, ""
 
+    # ---------- 结算统计表（保种结算日志翻页拉取 + 本地历史累计） ----------
+
+    def _monthly_stats_path(self):
+        try:
+            path = self.get_data_path()
+            if not path.exists():
+                path.mkdir(parents=True, exist_ok=True)
+            return path / "monthly_stats.json"
+        except Exception as e:
+            logger.error(f"获取插件数据目录失败：{e}")
+            return None
+
+    def _load_monthly_stats(self) -> dict:
+        p = self._monthly_stats_path()
+        if not p or not p.exists():
+            return {"last_fetch_date": "", "updated_at": "", "records": []}
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"读取结算统计表本地数据失败：{e}")
+            return {"last_fetch_date": "", "updated_at": "", "records": []}
+
+    def _save_monthly_stats(self, data: dict):
+        p = self._monthly_stats_path()
+        if not p:
+            return
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+        except Exception as e:
+            logger.error(f"保存结算统计表本地数据失败：{e}")
+
+    def _fetch_settlement_history(self) -> List[Tuple[str, float, float]]:
+        """翻页拉取保种结算日志：第1页无page参数，之后 page=1,2,...（0基），直至无更多数据"""
+        uid = self._get_site_uid()
+        if not uid:
+            return []
+        session = self._session()
+        site_url = self._get_site_url()
+        out: Dict[str, Tuple[float, float]] = {}
+        page = 0
+        while page <= 600:
+            try:
+                if page == 0:
+                    url = f"{site_url}/rescuesettleinfo.php?id={uid}"
+                else:
+                    url = f"{site_url}/rescuesettleinfo.php?id={uid}&page={page}"
+                html = self._get_with_retry(session, url, timeout=20, retries=2, backoff=(3, 5)).text
+            except Exception as e:
+                logger.warning(f"结算日志第{page + 1}页获取失败：{e}")
+                break
+            soup = BeautifulSoup(html, "html.parser")
+            table = None
+            for tb in soup.find_all("table"):
+                if "获得的憨豆" in tb.get_text() and "结算时间" in tb.get_text():
+                    table = tb
+                    break
+            if not table:
+                break
+            new_rows = 0
+            for tr in table.select("tr"):
+                tds = tr.find_all(["td", "th"])
+                if len(tds) < 8:
+                    continue
+                cells = [c.get_text(strip=True) for c in tds]
+                try:
+                    bean = float(re.sub(r'[^\d.]', '', cells[4]) or 0)
+                    pt = float(re.sub(r'[^\d.]', '', cells[5]) or 0)
+                    dstr = cells[7]
+                    dmatch = re.search(r'\d{4}-\d{2}-\d{2}', dstr)
+                    if not dmatch:
+                        continue
+                    out[dmatch.group(0)] = (bean, pt)
+                    new_rows += 1
+                except (ValueError, IndexError):
+                    continue
+            if new_rows == 0:
+                break
+            page += 1
+        if out:
+            logger.info(f"结算日志翻页拉取完成：共 {len(out)} 条（最新 {max(out.keys())}）")
+        return [(d, v[0], v[1]) for d, v in out.items()]
+
+    def _ensure_monthly_stats(self, force: bool = False) -> dict:
+        """返回本地历史；当日已成功拉取过则直接使用，不再请求站点"""
+        data = self._load_monthly_stats()
+        records = data.get("records") or []
+        tz = pytz.timezone(settings.TZ)
+        today = datetime.now(tz).strftime("%Y-%m-%d")
+        if not force and data.get("last_fetch_date") == today:
+            return data
+        fetched = self._fetch_settlement_history()
+        if fetched:
+            merged: Dict[str, dict] = {}
+            for r in records:
+                merged[str(r.get("date"))] = {
+                    "date": str(r.get("date")),
+                    "bean": float(r.get("bean") or 0),
+                    "pt": float(r.get("pt") or 0),
+                }
+            for d, b, p in fetched:
+                merged[d] = {"date": d, "bean": float(b or 0), "pt": float(p or 0)}
+            data["records"] = sorted(merged.values(), key=lambda x: x["date"])
+            data["last_fetch_date"] = today
+            data["updated_at"] = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+            self._save_monthly_stats(data)
+        else:
+            if not records:
+                logger.warning("结算日志拉取失败（或站点无记录），暂无本地历史")
+            else:
+                logger.warning("结算日志拉取失败，保留本地历史数据（当日可重试）")
+        return data
+
+    def _monthly_agg(self, data: dict) -> dict:
+        """聚合近12个月（含当月）月度憨豆/积分"""
+        records = data.get("records") or []
+        tz = pytz.timezone(settings.TZ)
+        now = datetime.now(tz)
+        ym_now = now.year * 12 + (now.month - 1)
+        labels, bean, pt, days, notes = [], [], [], [], []
+        for i in range(11, -1, -1):
+            t = ym_now - i
+            ty, tm = divmod(t, 12)
+            tm += 1
+            labels.append(f"{ty}-{tm:02d}")
+            bean.append(None)
+            pt.append(None)
+            days.append(0)
+            notes.append("")
+        monthly: Dict[str, List[float]] = {}
+        for r in records:
+            d = str(r.get("date") or "")
+            if len(d) < 7:
+                continue
+            key = d[:7]
+            if key not in monthly:
+                monthly[key] = [0.0, 0.0, 0]
+            monthly[key][0] += float(r.get("bean") or 0)
+            monthly[key][1] += float(r.get("pt") or 0)
+            monthly[key][2] += 1
+        now_key = now.strftime("%Y-%m")
+        for i, lab in enumerate(labels):
+            if lab in monthly:
+                bean[i] = round(monthly[lab][0], 1)
+                pt[i] = round(monthly[lab][1], 1)
+                days[i] = int(monthly[lab][2])
+                if lab == now_key:
+                    notes[i] = "进行中"
+                else:
+                    try:
+                        y, m = int(lab[:4]), int(lab[5:7])
+                        nxt = datetime(y + 1, 1, 1) if m == 12 else datetime(y, m + 1, 1)
+                        total = (nxt - datetime(y, m, 1)).days
+                    except Exception:
+                        total = 31
+                    notes[i] = f"仅{days[i]}天" if days[i] < total else "完整"
+        return {"labels": labels, "bean": bean, "pt": pt, "days": days, "notes": notes,
+                "updated_at": data.get("updated_at", ""),
+                "last_fetch_date": data.get("last_fetch_date", "")}
+
+    def api_monthly_stats(self):
+        apikey = getattr(settings, "API_TOKEN", "") or ""
+        return HTMLResponse(content=self._build_monthly_stats_html(apikey))
+
+    def api_monthly_stats_data(self):
+        try:
+            data = self._ensure_monthly_stats()
+            agg = self._monthly_agg(data)
+            records = data.get("records") or []
+            recent = sorted(records, key=lambda x: str(x.get("date", "")))[-40:]
+            return {
+                "labels": agg["labels"], "bean": agg["bean"], "pt": agg["pt"],
+                "days": agg["days"], "notes": agg["notes"],
+                "updated_at": agg["updated_at"], "last_fetch_date": agg["last_fetch_date"],
+                "records_total": len(records),
+                "records": [{"date": str(r.get("date", "")),
+                             "bean": float(r.get("bean") or 0),
+                             "pt": float(r.get("pt") or 0)} for r in recent],
+            }
+        except Exception as e:
+            logger.error(f"获取结算统计表数据失败：{e}")
+            return {"error": str(e)}
+
+    def _build_monthly_stats_html(self, apikey: str) -> str:
+        import json as _json
+        ak = _json.dumps(apikey)
+        html = r"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>统计结算表</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:"Segoe UI","PingFang SC",Arial,sans-serif;color:#F0ECFF;
+background:radial-gradient(800px 420px at 6% -8%,rgba(255,64,160,.13),transparent 55%),
+radial-gradient(900px 460px at 94% -6%,rgba(64,200,255,.15),transparent 55%),#0B0714;
+min-height:100vh;height:100vh;display:flex;flex-direction:column;overflow:hidden;font-size:12px}
+.wrap{width:100%;margin:0 auto;flex:1;overflow:auto;padding:20px 28px 16px;display:flex;flex-direction:column}
+.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}
+.head .t{font-size:22px;font-weight:700}
+.head .t b{color:#FF8A3C}
+.head .src{font-size:12px;color:#9A8FC0;margin-top:5px}
+.exit{border:1px solid rgba(255,64,160,.35);background:rgba(255,64,160,.06);color:#D9A0CF;font-size:13px;padding:7px 16px;border-radius:10px;cursor:pointer;font-family:inherit}
+.exit:hover{background:rgba(255,64,160,.16)}
+.topcard{background:rgba(16,10,28,.75);border:1px solid rgba(64,200,255,.25);border-radius:18px;padding:16px 18px 12px;
+box-shadow:0 0 30px rgba(64,200,255,.07);margin-bottom:18px}
+.ct{display:flex;align-items:baseline;gap:10px;margin-bottom:8px}
+.ct .nm{font-size:16px;font-weight:700}.ct .sb{font-size:11px;color:#9A8FC0}
+.chart{width:100%;height:300px}
+.low{display:grid;grid-template-columns:1fr 1.15fr;gap:18px}
+.card{background:rgba(16,10,28,.72);border:1px solid rgba(255,64,160,.28);border-radius:18px;padding:16px 18px;
+box-shadow:0 0 24px rgba(255,64,160,.07)}
+.duals{position:relative;width:100%;height:330px;display:flex;gap:14px}
+.duals .dbox{position:relative;flex:1 1 0;min-width:0}
+.duals .g{width:100%;height:330px}
+.duals .dlab{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);text-align:center;pointer-events:none}
+.duals .dlab .r{font-size:14px;color:#9A8FC0;margin-bottom:8px}
+.duals .dlab .v{font-size:26px;font-weight:700;line-height:1.15}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{text-align:left;font-weight:600;color:#9A8FC0;font-size:11px;padding:7px 10px;border-bottom:1px solid rgba(255,64,160,.16);position:sticky;top:0;background:#150D24}
+td{padding:8px 10px;border-bottom:1px solid rgba(120,90,220,.10);color:#DCD3F5;font-variant-numeric:tabular-nums}
+td.d{color:#9A8FC0}
+td.bean{color:#FF8A3C;font-weight:600}
+td.pt{color:#38D9FF;font-weight:600}
+.scroll30{height:330px;overflow-y:auto;border-radius:12px;border:1px solid rgba(120,90,220,.20)}
+.scroll30::-webkit-scrollbar{width:8px}.scroll30::-webkit-scrollbar-thumb{background:#4A3A78;border-radius:4px}
+.status{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;font-size:14px;color:#F0ECFF;text-align:center;max-width:460px;padding:28px 36px;border-radius:14px;border:1px solid rgba(255,64,160,.25);background:rgba(16,10,28,.85);box-shadow:0 0 30px rgba(255,64,160,.12)}
+.status .bar{width:260px;height:4px;background:rgba(120,90,220,.18);border-radius:2px;overflow:hidden;position:relative}
+.status .bar i{position:absolute;top:0;left:0;height:100%;width:38%;background:linear-gradient(90deg,#FF8A3C,#38D9FF);border-radius:2px;animation:hhslide 1.1s ease-in-out infinite;box-shadow:0 0 8px rgba(255,138,60,.6)}
+@keyframes hhslide{0%{left:-38%}100%{left:100%}}
+.status .err{color:#FF6B6B;font-size:13px;max-width:80%;text-align:center;line-height:1.6}
+.status .retrybtn{background:linear-gradient(90deg,#FF8A3C,#38D9FF);color:#0B0714;border:none;padding:8px 26px;border-radius:8px;cursor:pointer;font-size:13px;margin-top:4px;font-weight:600}
+.bodywrap{position:relative;flex:1;display:flex;flex-direction:column}
+.footer{margin-top:16px;font-size:11.5px;color:#9A8FC0;line-height:1.7;text-align:center}
+</style></head><body>
+<div class="wrap">
+<div class="head">
+<div><div class="t">统计<b>结算表</b></div>
+<div class="src">憨憨站保种结算日志 · 每日 0 点憨豆/积分实结</div></div>
+<button class="exit" title="关闭页面" onclick="window.close()">退出</button>
+</div>
+<div class="bodywrap">
+<div id="status" class="status"><span>正在获取每月结算数据，请稍候…</span><div class="bar"><i></i></div></div>
+<div id="main" style="display:none">
+<div class="topcard"><div class="ct"><span class="nm">近12个月收益</span><span class="sb">橙柱 = 憨豆 · 青柱 = 积分 · 带 * 的月份为部分数据（未满整月）</span></div>
+<div class="chart" id="mb"></div></div>
+<div class="low">
+<div class="card"><div class="ct"><span class="nm">累计统计</span><span class="sb">左环 = 憨豆 · 右环 = 积分</span></div>
+<div class="duals"><div class="dbox"><div class="g" id="dg1"></div><div class="dlab"><div class="r">憨豆累计</div><div class="v" id="cvb" style="color:#FF8A3C">—</div></div></div>
+<div class="dbox"><div class="g" id="dg2"></div><div class="dlab"><div class="r">积分累计</div><div class="v" id="cvp" style="color:#38D9FF">—</div></div></div></div></div>
+<div class="card"><div class="ct"><span class="nm">近 30 日收益</span><span class="sb">按结算日志每日实结填充</span></div>
+<div class="scroll30" id="tbl"></div></div>
+</div>
+</div>
+</div>
+<div class="footer">灰显月份暂无历史记录 · 统计结算表数据来自憨憨站保种结算日志</div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+<script>
+var APIKEY=__APIKEY__;
+var data=null,chb=null,chd=null;
+function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;")}
+function fmtBig(n){if(n===null||n===undefined)return "—";return Number(n).toLocaleString()}
+function showErr(msg){var st=document.getElementById('status');st.innerHTML='<span class="err">'+esc(msg)+'</span><button class="retrybtn" onclick="location.reload()">重试</button>';}
+function renderChart(){
+chb=echarts.init(document.getElementById('mb'));
+var months=data.labels,bean=data.bean,pt=data.pt;
+chb.setOption({backgroundColor:'transparent',
+tooltip:{trigger:'axis',triggerOn:'click',renderMode:'richText',confine:true,textStyle:{fontSize:11,color:'#F0ECFF',lineHeight:15},backgroundColor:'rgba(21,13,36,.95)',borderColor:'rgba(64,200,255,.3)',padding:[6,8]},
+grid:{left:8,right:14,top:36,bottom:28,containLabel:true},
+legend:{top:0,itemWidth:14,itemHeight:8,textStyle:{fontSize:11,color:'#A79BC9'}},
+xAxis:{type:'category',data:months,axisLabel:{fontSize:11,color:'#9A8FC0',interval:0}},
+yAxis:{type:'value',axisLabel:{fontSize:10,color:'#9A8FC0',formatter:function(v){return v>=10000?(v/10000).toFixed(1).replace('.0','')+'万':v}},splitLine:{lineStyle:{color:'rgba(64,200,255,.12)'}}},
+series:[
+{name:'憨豆',type:'bar',barWidth:22,data:bean,itemStyle:{color:'#FF8A3C',borderRadius:[6,6,0,0],shadowColor:'#FF8A3C',shadowBlur:10},
+label:{show:true,position:'top',fontSize:10,color:'#FF8A3C',distance:6,formatter:function(p){return (p.value===null||p.value===undefined)?'':fmtBig(p.value)}},labelLayout:{hideOverlap:true}},
+{name:'积分',type:'bar',barWidth:22,data:pt,itemStyle:{color:'#38D9FF',borderRadius:[6,6,0,0],shadowColor:'#38D9FF',shadowBlur:10},
+label:{show:true,position:'top',fontSize:10,color:'#38D9FF',distance:6,formatter:function(p){return (p.value===null||p.value===undefined)?'':fmtBig(p.value)}},labelLayout:{hideOverlap:true}}]});
+chd1=echarts.init(document.getElementById('dg1'));
+chd2=echarts.init(document.getElementById('dg2'));
+var tb=0,tp=0;
+for(var i=0;i<bean.length;i++){if(bean[i]!==null&&bean[i]!==undefined){tb+=bean[i];tp+=pt[i];}}
+document.getElementById('cvb').textContent=fmtBig(tb);
+document.getElementById('cvp').textContent=fmtBig(tp);
+chd1.setOption({backgroundColor:'transparent',series:[
+{type:'gauge',startAngle:210,endAngle:-30,min:0,max:Math.max(tb,1),radius:'84%',center:['50%','52%'],
+progress:{show:true,width:14,itemStyle:{color:'#FF8A3C',shadowColor:'#FF8A3C',shadowBlur:16}},
+axisLine:{lineStyle:{width:14,color:[[1,'rgba(255,138,60,.10)']]}},
+axisTick:{show:false},splitLine:{show:false},axisLabel:{show:false},pointer:{show:false},detail:{show:false},data:[{value:tb}]}]});
+chd2.setOption({backgroundColor:'transparent',series:[
+{type:'gauge',startAngle:210,endAngle:-30,min:0,max:Math.max(tp,1),radius:'84%',center:['50%','52%'],
+progress:{show:true,width:14,itemStyle:{color:'#38D9FF',shadowColor:'#38D9FF',shadowBlur:16}},
+axisLine:{lineStyle:{width:14,color:[[1,'rgba(56,217,255,.10)']]}},
+axisTick:{show:false},splitLine:{show:false},axisLabel:{show:false},pointer:{show:false},detail:{show:false},data:[{value:tp}]}]});
+window.addEventListener('resize',function(){if(chb)chb.resize();if(chd1)chd1.resize();if(chd2)chd2.resize();});
+}
+function renderTable(){
+var rec=(data.records||[]).slice(-30).reverse();
+var rows='',cb=0;
+for(var i=0;i<rec.length;i++){var r=rec[i];cb+=Number(r.bean||0);
+rows+='<tr><td class="d">'+esc(r.date||'')+'</td><td class="bean">'+fmtBig(r.bean)+'</td><td class="pt">'+fmtBig(r.pt)+'</td><td>'+fmtBig(cb)+'</td></tr>';}
+document.getElementById('tbl').innerHTML='<table><thead><tr><th>日期</th><th>憨豆</th><th>积分</th><th>累计憨豆</th></tr></thead><tbody>'+rows+'</tbody></table>';
+}
+fetch('/api/v1/plugin/HHClubButler/monthly_stats_data?apikey='+encodeURIComponent(APIKEY)).then(function(r){return r.json();}).then(function(j){
+if(j&&j.error){showErr(j.error);return;}
+data=j;
+var st=document.getElementById('status');st.style.display='none';
+document.getElementById('main').style.display='block';
+if(typeof echarts==='undefined'){renderTable();return;}
+renderChart();renderTable();
+}).catch(function(e){showErr('获取数据失败：'+e.message);});
+</script></body></html>"""
+        return html.replace("__APIKEY__", ak)
+
     def _fetch_rescue_all(self, logs: list) -> List[dict]:
         seeds = []
         session = self._session()
@@ -1794,14 +2167,56 @@ buildHead();load();
             })
         return items, max_page
 
+    def _get_manage_services(self) -> dict:
+        if not self._downloaders:
+            return {}
+        out = {}
+        try:
+            all_sv = DownloaderHelper().get_services()
+        except Exception:
+            all_sv = None
+        for name in self._downloaders:
+            sv = None
+            if all_sv:
+                sv = all_sv.get(name)
+            if sv is None:
+                try:
+                    got = DownloaderHelper().get_services(name_filters=[name])
+                    sv = got.get(name) if got else None
+                except Exception:
+                    sv = None
+            if not sv or not getattr(sv, "instance", None):
+                continue
+            try:
+                if sv.instance.is_inactive():
+                    continue
+            except Exception:
+                pass
+            out[name] = sv
+        return out
+
+    def _fetch_all_downloader_torrents(self) -> list:
+        out = []
+        for name, sv in self._get_manage_services().items():
+            try:
+                ts, error = sv.instance.get_torrents()
+                if error or not ts:
+                    continue
+                for t in ts:
+                    out.append((name, t))
+            except Exception:
+                continue
+        return out
+
     def _get_downloader_obj(self):
-        if not self._downloader:
+        name = self._push_downloader or (self._downloaders[0] if self._downloaders else "")
+        if not name:
             return None
         try:
-            services = DownloaderHelper().get_services(name_filters=[self._downloader])
+            services = DownloaderHelper().get_services(name_filters=[name])
             if not services:
                 return None
-            service = services.get(self._downloader)
+            service = services.get(name)
             if not service or not service.instance:
                 return None
             if service.instance.is_inactive():
@@ -1877,28 +2292,26 @@ buildHead();load();
     def _get_downloader_seeds(self, logs: list, only_completed: bool = True,
                                 any_tracker: bool = False,
                                 torrents: Optional[list] = None) -> Optional[set]:
-        service = self._get_downloader_obj()
-        if not service:
+        svcs = self._get_manage_services()
+        if not svcs:
             logs.append("未配置有效的下载器")
             return None
-        dl_type = ""
-        try:
-            dl_type = str(service.type or service.config.type or "")
-        except Exception:
-            pass
-        if torrents is None:
+        sv_types = {}
+        for name, sv in svcs.items():
+            dl_type = ""
             try:
-                torrents, error = service.instance.get_torrents()
-                if error:
-                    logs.append("获取下载器种子列表出错")
-                    return None
-            except Exception as e:
-                logs.append(f"获取下载器种子失败：{e}")
-                return None
+                dl_type = str(sv.type or sv.config.type or "")
+            except Exception:
+                pass
+            sv_types[name] = dl_type
         try:
             names = set()
             site_total = 0
-            for t in torrents:
+            total = 0
+
+            def scan(dl_name, dl_type, t):
+                nonlocal site_total, total
+                total += 1
                 tracker = ""
                 try:
                     tracker = HHClubButler._extract_tracker_text(t, dl_type)
@@ -1910,15 +2323,31 @@ buildHead();load();
                 if only_completed:
                     progress = HHClubButler._get_progress_ratio(t, dl_type)
                     if progress is not None and progress < 1.0:
-                        continue
+                        return
                 try:
-                    name = t.get("name") if isinstance(t, dict) else getattr(t, "name", "")
+                    nm = t.get("name") if isinstance(t, dict) else getattr(t, "name", "")
                 except Exception:
-                    name = ""
-                if name:
-                    names.add(name)
+                    nm = ""
+                if nm:
+                    names.add(nm)
+
+            if torrents is None:
+                for name, sv in svcs.items():
+                    try:
+                        ts, error = sv.instance.get_torrents()
+                        if error:
+                            logs.append(f"下载器 {name} 获取种子列表出错")
+                            continue
+                    except Exception as e:
+                        logs.append(f"下载器 {name} 获取种子失败：{e}")
+                        continue
+                    for t in ts:
+                        scan(name, sv_types.get(name, ""), t)
+            else:
+                for dl_name, t in torrents:
+                    scan(dl_name, sv_types.get(dl_name, ""), t)
             if only_completed:
-                logs.append(f"下载器 {len(torrents)} 个种子，本站tracker {site_total} 个，已完成做种 {len(names)} 个")
+                logs.append(f"下载器共 {total} 个种子，本站tracker {site_total} 个，已完成做种 {len(names)} 个")
             return names
         except Exception as e:
             logs.append(f"获取下载器种子失败：{e}")
@@ -1987,37 +2416,60 @@ buildHead();load();
             time.sleep(1)
         return ok_count, len(seeds) - ok_count, fail_list
 
+    def _do_delete_in_service(self, sv, seeds: list, logs: list) -> int:
+        try:
+            torrents, error = sv.instance.get_torrents()
+            if error:
+                return 0
+        except Exception:
+            return 0
+        del_norms = set()
+        for s in seeds:
+            n = HHClubButler._norm_title(s.get("title") or "")
+            if n:
+                del_norms.add(n)
+        if not del_norms:
+            return 0
+        del_ids = []
+        for t in torrents:
+            try:
+                tname = t.get("name") if isinstance(t, dict) else getattr(t, "name", "")
+                thash = (t.get("hash") if isinstance(t, dict)
+                         else getattr(t, "hash", None) or getattr(t, "hashString", ""))
+            except Exception:
+                continue
+            if HHClubButler._norm_match(tname, del_norms):
+                del_ids.append(thash)
+        if del_ids:
+            try:
+                sv.instance.delete_torrents(delete_file=True, ids=del_ids)
+                logs.append(f"已删除 {len(del_ids)} 个种子（任务+文件）")
+                return len(del_ids)
+            except Exception as e:
+                logs.append(f"删除种子失败：{e}")
+        return 0
+
     def _delete_seeds(self, seeds: list, logs: list):
-        service = self._get_downloader_obj()
-        if not service:
+        svcs = self._get_manage_services()
+        if not svcs:
             logs.append("未配置有效的下载器，无法删除")
             return
-        try:
-            torrents, error = service.instance.get_torrents()
-            if error:
-                return
-            del_norms = set()
-            for s in seeds:
-                n = HHClubButler._norm_title(s.get("title") or "")
-                if n:
-                    del_norms.add(n)
-            if not del_norms:
-                return
-            del_ids = []
-            for t in torrents:
-                try:
-                    tname = t.get("name") if isinstance(t, dict) else getattr(t, "name", "")
-                    thash = (t.get("hash") if isinstance(t, dict)
-                             else getattr(t, "hash", None) or getattr(t, "hashString", ""))
-                except Exception:
+        by_dl = {}
+        for s in seeds:
+            by_dl.setdefault(str(s.get("downloader") or ""), []).append(s)
+        total = 0
+        for dl_name, sub in by_dl.items():
+            if dl_name:
+                sv = svcs.get(dl_name)
+                if not sv:
+                    logs.append(f"下载器 {dl_name} 不可用，跳过其种子删除")
                     continue
-                if HHClubButler._norm_match(tname, del_norms):
-                    del_ids.append(thash)
-            if del_ids:
-                service.instance.delete_torrents(delete_file=True, ids=del_ids)
-                logs.append(f"已删除 {len(del_ids)} 个低档位种子（任务+文件）")
-        except Exception as e:
-            logs.append(f"删除种子失败：{e}")
+                total += self._do_delete_in_service(sv, sub, logs)
+            else:
+                for _, sv in svcs.items():
+                    total += self._do_delete_in_service(sv, sub, logs)
+        if total:
+            logs.append(f"删除低档位种子：共 {total} 个")
 
     @staticmethod
     def _norm_match(name: str, targets: set) -> bool:
@@ -2033,19 +2485,8 @@ buildHead();load();
         return False
 
     def _clean_stale_downloads(self, logs: list, seeds: list, extra_titles: set = None):
-        service = self._get_downloader_obj()
-        if not service:
-            return 0
-        dl_type = ""
-        try:
-            dl_type = str(service.type or service.config.type or "")
-        except Exception:
-            pass
-        try:
-            torrents, error = service.instance.get_torrents()
-            if error:
-                return 0
-        except Exception:
+        svcs = self._get_manage_services()
+        if not svcs:
             return 0
         try:
             site_titles = {HHClubButler._norm_title(s.get("title") or "") for s in seeds}
@@ -2055,61 +2496,79 @@ buildHead();load();
             site_titles = set(extra_titles or [])
         now = time.time()
         threshold = self._auto_clean_days * 86400
-        stale = []
-        for t in torrents:
+        total_deleted = 0
+        per_dl = {}
+        for name, service in svcs.items():
+            dl_type = ""
             try:
-                tracker = HHClubButler._extract_tracker_text(t)
-                if isinstance(t, dict):
-                    name = str(t.get("name") or "")
-                    progress = t.get("progress")
-                    added = (t.get("added_on") or t.get("added_time") or t.get("added_date") or 0)
-                    tid = t.get("hash") or t.get("id")
-                else:
-                    name = str(getattr(t, "name", "") or "")
-                    progress = HHClubButler._get_progress_ratio(t, dl_type)
-                    added = (getattr(t, "added_on", 0) or getattr(t, "added_time", 0)
-                             or getattr(t, "added_date", 0) or 0)
-                    tid = getattr(t, "hash", None) or getattr(t, "hashString", None) or getattr(t, "id", None)
+                dl_type = str(service.type or service.config.type or "")
+            except Exception:
+                pass
+            try:
+                torrents, error = service.instance.get_torrents()
+                if error:
+                    continue
             except Exception:
                 continue
-            is_site = ("hhanclub" in tracker or "hhclub" in tracker or "hanclub" in tracker)
-            if not is_site and site_titles:
-                n = HHClubButler._norm_title(name)
-                if n and n in site_titles:
-                    is_site = True
-            if not is_site:
+            stale = []
+            for t in torrents:
+                try:
+                    tracker = HHClubButler._extract_tracker_text(t)
+                    if isinstance(t, dict):
+                        tname = str(t.get("name") or "")
+                        progress = t.get("progress")
+                        added = (t.get("added_on") or t.get("added_time") or t.get("added_date") or 0)
+                        tid = t.get("hash") or t.get("id")
+                    else:
+                        tname = str(getattr(t, "name", "") or "")
+                        progress = HHClubButler._get_progress_ratio(t, dl_type)
+                        added = (getattr(t, "added_on", 0) or getattr(t, "added_time", 0)
+                                 or getattr(t, "added_date", 0) or 0)
+                        tid = getattr(t, "hash", None) or getattr(t, "hashString", None) or getattr(t, "id", None)
+                except Exception:
+                    continue
+                is_site = ("hhanclub" in tracker or "hhclub" in tracker or "hanclub" in tracker)
+                if not is_site and site_titles:
+                    n = HHClubButler._norm_title(tname)
+                    if n and n in site_titles:
+                        is_site = True
+                if not is_site:
+                    continue
+                try:
+                    progress = float(progress) if progress is not None else 1.0
+                except (TypeError, ValueError):
+                    progress = 1.0
+                if progress > 1.0:
+                    progress /= 100.0
+                if progress >= 1.0:
+                    continue
+                try:
+                    if hasattr(added, "timestamp"):
+                        added = added.timestamp()
+                    added = float(added)
+                except (TypeError, ValueError, OSError, OverflowError):
+                    added = 0.0
+                if added <= 0:
+                    continue
+                if now - added >= threshold:
+                    stale.append((tid, tname))
+            if not stale:
+                continue
+            ids = [tid for tid, _ in stale if tid]
+            if not ids:
                 continue
             try:
-                progress = float(progress) if progress is not None else 1.0
-            except (TypeError, ValueError):
-                progress = 1.0
-            if progress > 1.0:
-                progress /= 100.0
-            if progress >= 1.0:
-                continue
-            try:
-                if hasattr(added, "timestamp"):
-                    added = added.timestamp()
-                added = float(added)
-            except (TypeError, ValueError, OSError, OverflowError):
-                added = 0.0
-            if added <= 0:
-                continue
-            if now - added >= threshold:
-                stale.append((tid, name))
-        if not stale:
+                service.instance.delete_torrents(delete_file=True, ids=ids)
+                total_deleted += len(ids)
+                per_dl[name] = len(ids)
+            except Exception as e:
+                logs.append(f"未完成清理（下载器 {name}）失败：{e}")
+        if not per_dl:
             logs.append(f"未完成清理：无超过 {self._auto_clean_days:g} 天未完成的任务")
             return 0
-        ids = [tid for tid, _ in stale if tid]
-        if not ids:
-            return 0
-        try:
-            service.instance.delete_torrents(delete_file=True, ids=ids)
-            logs.append(f"未完成清理：已删除 {len(ids)} 个超时任务（含未完成文件）")
-            return len(ids)
-        except Exception as e:
-            logs.append(f"未完成清理失败：{e}")
-            return 0
+        detail = "，".join(f"{k} {v} 个" for k, v in per_dl.items())
+        logs.append(f"未完成清理：已删除 {total_deleted} 个超时任务（含未完成文件，{detail}）")
+        return total_deleted
 
     @staticmethod
     def _parse_seeder_range(raw) -> Optional[tuple]:
