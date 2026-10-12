@@ -76,7 +76,7 @@ HOSTS_MARK_END = '# <<< HHClubButler Hosts <<<'
 
 class HHClubButler(_PluginBase):
     plugin_name = "憨憨保种区管家"
-    plugin_desc = "自动优选添加及换种工具，独立页面[保种管理器]"
+    plugin_desc = "自动优选添加及换种工具\n保种管理器/Hosts加速"
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
     plugin_version = "2.5"
     plugin_author = "六个橙子"
