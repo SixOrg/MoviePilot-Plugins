@@ -8,6 +8,8 @@ v1.4：
 4. 新增仿QB风格保种管理页：列出在保种子，支持手动删除（同步删下载器任务+文件）
 """
 
+import json
+import os
 import re
 import time
 import threading
@@ -67,12 +69,16 @@ TIER_BADGE = {
     2: '<span style="display:inline-block;padding:1px 8px;border-radius:10px;background:#ef4444;color:#fff;font-size:11px;">4-5人 ×1.5</span>',
 }
 
+# Hosts 加速：标记区，只管理本插件写入的条目
+HOSTS_MARK_START = '# >>> HHClubButler Hosts >>>'
+HOSTS_MARK_END = '# <<< HHClubButler Hosts <<<'
+
 
 class HHClubButler(_PluginBase):
     plugin_name = "憨憨保种区管家"
     plugin_desc = "自动优选添加及换种工具，独立页面[保种管理器]"
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
-    plugin_version = "2.4"
+    plugin_version = "2.5"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "hhclubbutler_"
@@ -96,6 +102,9 @@ class HHClubButler(_PluginBase):
     _save_path: str = ""
     _tag: str = ""
     _auto_clean_days: float = 0.0
+    _hosts_enabled: bool = False
+    _hosts_config: str = ""
+    _hosts_errors: str = ""
     _scheduler = None
 
     _running: bool = False
@@ -143,6 +152,9 @@ class HHClubButler(_PluginBase):
         except (TypeError, ValueError):
             self._auto_clean_days = 0
         self._auto_clean_days = max(0.0, min(365.0, self._auto_clean_days))
+        self._hosts_enabled = bool(config.get("hosts_enabled"))
+        self._hosts_config = str(config.get("hosts_config") or "").strip()
+        self._apply_hosts()
         self._overview_hours = 6.0
         self._start_overview_thread()
 
@@ -245,22 +257,32 @@ class HHClubButler(_PluginBase):
                     {
                         'component': 'VRow',
                         'content': [
-                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 3},
                              'content': [{'component': 'VSwitch', 'props': {'model': 'enabled', 'label': '启用插件'}}]},
-                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 3},
+                             'content': [{'component': 'VSwitch', 'props': {'model': 'hosts_enabled', 'label': 'Hosts 加速'}}]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 3},
                              'content': [{'component': 'VSwitch', 'props': {'model': 'onlyonce', 'label': '立即运行一次'}}]},
-                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 3},
                              'content': [{'component': 'VSwitch', 'props': {'model': 'notify', 'label': '发送通知'}}]},
                         ]
                     },
                     {
                         'component': 'VRow',
                         'content': [
-                            {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
                              'content': [{'component': 'VCronField', 'props': {
                                  'model': 'cron', 'label': '执行周期',
                                  'placeholder': '30 14 * * *（每天14:30，保种区14:10更新后）'}}]},
-                            {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                             'content': [{'component': 'VTextarea', 'props': {
+                                 'model': 'hosts_config', 'label': 'Hosts配置（插件加载缓慢请配置）',
+                                 'rows': 1,
+                                 'no-resize': False,
+                                 'hint': '开启并填写可加速站点（支持配置其他站）',
+                                 'persistent-hint': True,
+                                 'placeholder': '格式：IP 域名，每行一条；留空不生效，关闭自动还原，适用其他站点加速\n示例：104.17.141.143 hhanclub.net'}}]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
                              'content': [{'component': 'VSelect', 'props': {
                                  'model': 'downloaders', 'label': '管理下载器（多选）', 'items': downloaders,
                                  'multiple': True,
@@ -331,8 +353,101 @@ class HHClubButler(_PluginBase):
             "target_volume": 0, "seeder_cond": "", "exclude_zero": False,
             "downloader": "", "downloaders": [], "push_downloader": "",
             "save_path": "", "tag": "", "auto_clean_days": 0,
+            "hosts_enabled": False, "hosts_config": "",
         }
         return form, defaults
+
+    def _get_hosts_path(self) -> str:
+        if os.name == "nt":
+            root = os.environ.get("SystemRoot") or "C:\\Windows"
+            return os.path.join(root, "System32", "drivers", "etc", "hosts")
+        return "/etc/hosts"
+
+    def _parse_hosts_config(self, text: str) -> Tuple[List[str], List[str]]:
+        import ipaddress
+        valid, errors = [], []
+        for line in (text or "").splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            parts = s.split()
+            try:
+                ipaddress.ip_address(parts[0])
+            except ValueError:
+                errors.append(f"{s} — IP 地址无效")
+                continue
+            if len(parts) < 2:
+                errors.append(f"{s} — 缺少域名")
+                continue
+            valid.append(" ".join(parts))
+        return valid, errors
+
+    def _read_hosts_lines(self, path: str) -> List[str]:
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read().splitlines()
+        except Exception:
+            return []
+
+    def _write_hosts_lines(self, path: str, lines: List[str]) -> bool:
+        try:
+            content = "\n".join(lines) + "\n"
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            return True
+        except Exception as e:
+            logger.warning(f"Hosts 文件写入失败（权限不足或只读）：{e}")
+            return False
+
+    @staticmethod
+    def _strip_hosts_block(lines: List[str]) -> List[str]:
+        out, in_block = [], False
+        for line in lines:
+            s = line.strip()
+            if s == HOSTS_MARK_START:
+                in_block = True
+                continue
+            if s == HOSTS_MARK_END:
+                in_block = False
+                continue
+            if not in_block:
+                out.append(line)
+        return out
+
+    def _apply_hosts(self):
+        try:
+            path = self._get_hosts_path()
+            if not self._hosts_enabled:
+                cur = self._read_hosts_lines(path)
+                if cur:
+                    stripped = self._strip_hosts_block(cur)
+                    if stripped != cur:
+                        if self._write_hosts_lines(path, stripped):
+                            logger.info("Hosts 加速已关闭，已还原系统 hosts 文件")
+                        else:
+                            self._hosts_errors = "Hosts 还原失败（写入被拒绝），请检查 hosts 文件权限"
+                    else:
+                        logger.info("Hosts 加速未启用，系统 hosts 无需还原")
+                self._hosts_errors = ""
+                return
+            valid, errors = self._parse_hosts_config(self._hosts_config)
+            self._hosts_errors = "；".join(errors[:5]) if errors else ""
+            if not valid:
+                logger.info("Hosts 加速已开启但配置为空或无效，未写入（留空不生效）")
+                return
+            cur = self._read_hosts_lines(path)
+            lines = self._strip_hosts_block(cur)
+            lines.append(HOSTS_MARK_START)
+            lines.extend(valid)
+            lines.append(HOSTS_MARK_END)
+            if self._write_hosts_lines(path, lines):
+                logger.info(f"Hosts 加速已写入 {len(valid)} 条 → {path}")
+                self._hosts_errors = ""
+            else:
+                self._hosts_errors = "Hosts 写入失败（权限不足），请以管理员/root 权限运行或手动配置"
+        except Exception as e:
+            logger.error(f"Hosts 加速应用异常：{e}")
+            self._hosts_errors = f"Hosts 加速应用异常：{e}"
 
     def _overview_form_cards(self) -> dict:
         if not self._last_overview or not self._last_overview.get("ok"):
@@ -682,15 +797,21 @@ class HHClubButler(_PluginBase):
             try:
                 if self._overview_stop is None or self._overview_stop.is_set():
                     return
+                # 结算日志重试驱动（每 5 分钟醒来检查一次，与概况刷新小时配置无关；
+                # _ensure_monthly_stats 内部有当日缓存/重试窗口守卫，未到点或已成功时不会真正请求）
+                try:
+                    self._ensure_monthly_stats()
+                except Exception as e:
+                    logger.error(f"结算日志重试检查失败：{e}")
                 hours = self._overview_hours
-                if hours <= 0:
-                    self._overview_stop.wait(3600)
-                    continue
-                wait = hours * 3600.0 - (time.time() - self._last_overview_ts)
-                if wait <= 0:
-                    self._refresh_overview()
-                    wait = hours * 3600.0
-                self._overview_stop.wait(min(wait, 3600.0))
+                if hours > 0:
+                    wait = hours * 3600.0 - (time.time() - self._last_overview_ts)
+                    if wait <= 0:
+                        self._refresh_overview()
+                        wait = hours * 3600.0
+                    self._overview_stop.wait(min(wait, 300.0))
+                else:
+                    self._overview_stop.wait(300)
             except Exception:
                 try:
                     if self._overview_stop is not None:
@@ -700,6 +821,12 @@ class HHClubButler(_PluginBase):
 
     def _refresh_overview(self, manual: bool = False):
         try:
+            # 顺带刷新结算统计表数据：当日已成功则直接命中本地缓存，未拉取过则翻页拉取一次并落盘；
+            # 与完成页刷新互相隔离，失败不影响概况
+            try:
+                self._ensure_monthly_stats()
+            except Exception as e:
+                logger.error(f"结算统计表数据顺带刷新失败：{e}")
             cur = self._get_current_seeding([])
             if cur.get("error"):
                 logger.warning(f"憨憨保种区管家概况刷新失败（{cur['error']}），保留上次数据")
@@ -894,7 +1021,7 @@ class HHClubButler(_PluginBase):
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>保种管理器</title><style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:"Segoe UI","PingFang SC",Arial,sans-serif;background:var(--bg);color:var(--fg);font-size:12px;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+body{font-family:"Segoe UI","PingFang SC",Arial,sans-serif;background:var(--bg);color:var(--fg);font-size:12px;height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidden}
 body[data-theme="light"]{--bg:#ffffff;--fg:#1d1d1f;--topbar:#f5f5f7;--border:#e5e5ea;--chip:#e8e8ed;--chip-active:#0071e3;--chip-hover:#d1d1d6;--input-bg:#ffffff;--input-border:#d2d2d7;--btn:#0071e3;--btn-danger:#ff3b30;--btn-ghost:#e8e8ed;--toolbar:#f0f0f2;--picker-bg:#ffffff;--picker-border:#d2d2d7;--th:#f5f5f7;--th-hover:#e8e8ed;--td-border:#f0f0f2;--tr-hover:#f0f5ff;--tr-sel:#0071e3;--footer:#f5f5f7;--footer-border:#e5e5ea;--muted:#86868b;--muted2:#6e6e73}
 body[data-theme="cream"]{--bg:#fdf6e3;--fg:#3e2f1c;--topbar:#f5e6c8;--border:#d4c5a0;--chip:#ead9b8;--chip-active:#b8860b;--chip-hover:#e0cf9f;--input-bg:#fff8e0;--input-border:#c4b080;--btn:#b8860b;--btn-danger:#c0392b;--btn-ghost:#ead9b8;--toolbar:#f0e0bc;--picker-bg:#fdf6e3;--picker-border:#c4b080;--th:#f0e0bc;--th-hover:#e8d5a0;--td-border:#e0d0a5;--tr-hover:#f5e6b8;--tr-sel:#8b6914;--footer:#e8d8a8;--footer-border:#d4c5a0;--muted:#8b7355;--muted2:#6b5535}
 body[data-theme="sakura"]{--bg:#fff5f7;--fg:#4a2a35;--topbar:#ffe4ec;--border:#f8c8d8;--chip:#ffd6e5;--chip-active:#e91e63;--chip-hover:#ffc2d6;--input-bg:#ffffff;--input-border:#f8b8cc;--btn:#e91e63;--btn-danger:#c0392b;--btn-ghost:#ffd6e5;--toolbar:#ffe0ec;--picker-bg:#fff5f7;--picker-border:#f8b8cc;--th:#ffe0ec;--th-hover:#ffd0e0;--td-border:#f8d0dc;--tr-hover:#ffe4ef;--tr-sel:#ad1457;--footer:#ffe4ec;--footer-border:#f8c8d8;--muted:#a06878;--muted2:#804858}
@@ -930,7 +1057,7 @@ body[data-theme="hc"]{--bg:#000000;--fg:#ffffff;--topbar:#1a1a1a;--border:#40404
 .table-wrap{flex:1;overflow:auto;position:relative}
 .status{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;font-size:14px;color:var(--fg);text-align:center;max-width:420px;background:var(--bg);padding:28px 36px;border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,0.12)}
 .status .bar{width:240px;height:4px;background:var(--chip);border-radius:2px;overflow:hidden;position:relative}
-.status .bar i{position:absolute;top:0;left:0;height:100%;width:38%;background:var(--btn);border-radius:2px;animation:hhslide 1.1s ease-in-out infinite}
+.status .bar i{position:absolute;top:0;left:0;height:100%;width:38%;background:var(--btn);border-radius:2px;animation:hhslide 1s linear infinite}
 @keyframes hhslide{0%{left:-38%}100%{left:100%}}
 .status .errmsg{color:var(--btn-danger);font-size:14px;max-width:70%;text-align:center}
 .status .retrybtn{background:var(--btn);color:#fff;border:none;padding:7px 22px;border-radius:4px;cursor:pointer;font-size:14px;margin-top:6px}
@@ -951,6 +1078,20 @@ tr.sel td{background:var(--tr-sel);color:#fff}
 .footer{background:var(--footer);padding:6px 14px;font-size:11px;color:var(--muted);border-top:1px solid var(--footer-border);display:flex;gap:18px;flex-wrap:wrap}
 .themebtn{background:var(--btn-ghost);color:var(--fg);border:1px solid var(--input-border);padding:3px 10px;border-radius:3px;cursor:pointer;font-size:11px}
 .chip .dot{display:inline-block;width:8px;height:8px;border-radius:0;margin-right:4px;vertical-align:middle}
+.dlpicker{position:absolute;left:auto;right:0;top:calc(100% + 6px);background:var(--picker-bg);border:1px solid var(--picker-border);border-radius:4px;padding:8px;z-index:100;min-width:190px;display:none;box-shadow:0 4px 16px rgba(0,0,0,0.5);max-height:70vh;overflow:auto}
+.dlpicker.show{display:block}
+.dlpicker h4{font-size:11px;color:var(--muted2);margin-bottom:6px;font-weight:normal}
+.dlpicker .qk{display:flex;gap:6px;margin-bottom:6px}
+.dlpicker .qk span{font-size:11px;color:var(--btn);cursor:pointer;border:1px solid var(--input-border);padding:2px 8px;border-radius:3px;user-select:none}
+.dlpicker .qk span:hover{background:var(--chip-hover)}
+.dlpicker label{display:flex;align-items:center;gap:6px;padding:3px 0;cursor:pointer;font-size:12px;color:var(--fg)}
+.dlpicker label:hover{color:var(--fg)}
+@media (max-width:720px){
+.search{width:100%;max-width:none;margin-left:0;order:99}
+.topbar h1{font-size:13px}
+.chip{font-size:10px;padding:3px 8px}
+.btn{padding:5px 9px}
+}
 </style></head><body>
 <div class="topbar">
 <h1>保种管理器</h1>
@@ -958,6 +1099,10 @@ tr.sel td{background:var(--tr-sel);color:#fff}
 <span class="chip" data-tier="0"><i class="dot" style="background:#22c55e"></i>0-1人 <b id="cnt_t0">0</b></span>
 <span class="chip" data-tier="1"><i class="dot" style="background:#4da3ff"></i>2-3人 <b id="cnt_t1">0</b></span>
 <span class="chip" data-tier="2"><i class="dot" style="background:#ff6b6b"></i>4-5人 <b id="cnt_t2">0</b></span>
+<span style="position:relative;display:inline-flex"><button class="btn ghost" id="dlBtn" title="按下载器筛选，可多选">筛选下载器</button>
+<div class="dlpicker" id="dlpicker"><h4>按下载器筛选（可多选）</h4>
+<div class="qk"><span id="dlAll">全选</span><span id="dlNone">清空</span></div>
+<div id="dlList"></div></div></span>
 <input class="search" id="q" placeholder="搜索名称...">
 <button class="btn danger" id="btnDel">删除选中</button>
 <button class="btn ghost" id="colsBtn">列选择</button>
@@ -998,7 +1143,7 @@ var COLS=[
 {k:"c_qualified",t:"今日达标",w:"70",sortk:"qualified"},
 {k:"c_dl",t:"下载器",w:"110",sortk:"downloader"}
 ];
-var seeds=[],filtered=[],sel={};
+var seeds=[],filtered=[],sel={},dlSel={};
 var curTier="all",sortKey="size",sortDir=-1,query="";
 function tierOf(n){n=+n||0;return n<=1?0:(n<=3?1:2)}
 function fmtSize(gb){if(!isFinite(gb))return "-";gb=+gb;if(gb>=1024)return(gb/1024).toFixed(2)+" TB";return gb.toFixed(2)+" GB"}
@@ -1017,7 +1162,12 @@ document.querySelectorAll("th .resize").forEach(function(hd){hd.onmousedown=func
 var th=hd.parentElement,sx=e.clientX,sw=th.offsetWidth;dragMoved=false;document.body.style.cursor='col-resize';
 function mv(ev){var dx=ev.clientX-sx;if(Math.abs(dx)>1)dragMoved=true;var w=Math.max(40,sw+dx);th.style.width=w+"px";var col=th.dataset.col;if(col)document.querySelectorAll('td[data-col="'+col+'"]').forEach(function(td){td.style.width=w+"px"})}
 function up(ev){document.removeEventListener("mousemove",mv);document.removeEventListener("mouseup",up);document.body.style.cursor='';if(dragMoved&&ev){ev.stopPropagation();ev.preventDefault()}}
-document.addEventListener("mousemove",mv);document.addEventListener("mouseup",up)}});
+document.addEventListener("mousemove",mv);document.addEventListener("mouseup",up)};
+hd.ontouchstart=function(e){e.preventDefault();e.stopPropagation();
+var th=hd.parentElement,sx=e.touches[0].clientX,sw=th.offsetWidth;dragMoved=false;document.body.style.cursor='col-resize';
+function tmv(ev){var dx=ev.touches[0].clientX-sx;if(Math.abs(dx)>1)dragMoved=true;var w=Math.max(40,sw+dx);th.style.width=w+"px";var col=th.dataset.col;if(col)document.querySelectorAll('td[data-col="'+col+'"]').forEach(function(td){td.style.width=w+"px"})}
+function tup(ev){document.removeEventListener("touchmove",tmv);document.removeEventListener("touchend",tup);document.body.style.cursor='';if(dragMoved&&ev){ev.stopPropagation();ev.preventDefault()}}
+document.addEventListener("touchmove",tmv);document.addEventListener("touchend",tup)}});
 document.querySelectorAll("th[data-sortk]").forEach(function(th){th.onclick=function(ev){if(dragMoved){dragMoved=false;return}var sk=this.dataset.sortk;if(sortKey===sk){sortDir=-sortDir}else{sortKey=sk;sortDir=-1}doSort();buildHead();render()}});
 document.getElementById("chkAll").onchange=function(){var v=this.checked;filtered.forEach(function(s){sel[s.title]=v});render()};
 }
@@ -1043,7 +1193,8 @@ if(c.k==="c_dl")return esc(s.downloader||"-");
 return "";
 }
 function render(){
-var f=seeds.filter(function(s){if(curTier!=="all"&&String(tierOf(s.seeders))!==curTier)return false;if(query&&(s.title||"").toLowerCase().indexOf(query)<0)return false;return true});
+var dlKeys=Object.keys(dlSel);
+var f=seeds.filter(function(s){if(curTier!=="all"&&String(tierOf(s.seeders))!==curTier)return false;if(query&&(s.title||"").toLowerCase().indexOf(query)<0)return false;if(dlKeys.length&&!dlSel[s.downloader||""])return false;return true});
 filtered=f;
 var html="";
 for(var i=0;i<f.length;i++){var s=f[i];var t=tierOf(s.seeders);var seled=!!sel[s.title];
@@ -1066,22 +1217,37 @@ var c0=0,c1=0,c2=0;seeds.forEach(function(s){var t=tierOf(s.seeders);if(t===0)c0
 document.getElementById("cnt_all").textContent=seeds.length;
 document.getElementById("cnt_t0").textContent=c0;document.getElementById("cnt_t1").textContent=c1;document.getElementById("cnt_t2").textContent=c2;
 }
+function updateDlBtn(){var n=Object.keys(dlSel).length;document.getElementById("dlBtn").textContent=n?"筛选下载器("+n+")":"筛选下载器";}
+function buildDlList(all){
+var names={};
+seeds.forEach(function(s){var d=s.downloader||"";if(d)names[d]=1});
+var list=Object.keys(names).sort();
+if(all){dlSel={};list.forEach(function(n){dlSel[n]=true})}
+var h='';
+for(var i=0;i<list.length;i++){var n=list[i];h+='<label><input type="checkbox" data-dl="'+esc(n)+'"'+(dlSel[n]?' checked':'')+'>'+esc(n)+'</label>';}
+document.getElementById("dlList").innerHTML=h||'<div style="font-size:11px;color:#888;padding:4px 0">暂无下载器数据</div>';
+document.querySelectorAll("#dlList input[type=checkbox]").forEach(function(cb){cb.onchange=function(){var n=cb.dataset.dl;if(cb.checked)dlSel[n]=true;else delete dlSel[n];updateDlBtn();render()}});
+updateDlBtn();
+}
 async function load(){
 var st=document.getElementById("status");
 function showErr(msg){
 st.innerHTML='<span class="errmsg">'+esc(msg)+'</span><button class="retrybtn" onclick="load()">重试</button>';
 }
 st.style.display="flex";
-st.innerHTML='<span>正在加载保种数据，请稍候…</span><div class="bar"><i></i></div>';
+var t0=Date.now(),tmr=null;
+st.innerHTML='<span>正在加载保种数据，请稍候… <b id="el">0</b> 秒</span><div class="bar"><i></i></div>';
+function tick(){var el=document.getElementById("el");if(el)el.textContent=Math.floor((Date.now()-t0)/1000);}
+tick();tmr=setInterval(tick,250);
 var ctl=(typeof AbortController!=="undefined")?new AbortController():null;
 var to=ctl?setTimeout(function(){ctl.abort()},90000):null;
 try{
 var r=await fetch("/api/v1/plugin/HHClubButler/list_rescue_seeds?apikey="+encodeURIComponent(APIKEY),ctl?{signal:ctl.signal}:{});
 if(to)clearTimeout(to);
 var j=await r.json();
-if(!j.success){showErr(j.message||"数据加载失败");return}
-seeds=j.data||[];doSort();render();st.style.display="none";
-}catch(e){if(to)clearTimeout(to);showErr((e&&e.name==="AbortError")?"加载超时，请稍后重试":"请求失败："+e)}}
+if(!j.success){if(tmr)clearInterval(tmr);showErr(j.message||"数据加载失败");return}
+seeds=j.data||[];doSort();buildDlList();render();if(tmr)clearInterval(tmr);st.style.display="none";
+}catch(e){if(to)clearTimeout(to);if(tmr)clearInterval(tmr);showErr((e&&e.name==="AbortError")?"加载超时，请稍后重试":"请求失败："+e)}}
 async function delOne(title){
 if(!confirm("确认删除种子:\\n"+title+"\\n\\n将同时删除下载器任务和文件!"))return;
 await doDel([title])}
@@ -1100,6 +1266,12 @@ if(okTitles.length){seeds=seeds.filter(function(s){return okTitles.indexOf(s.tit
 document.getElementById("btnDel").onclick=delSel;
 document.getElementById("q").oninput=function(){query=this.value.trim().toLowerCase();render()};
 document.querySelectorAll(".topbar .chip").forEach(function(c){c.onclick=function(){document.querySelectorAll(".topbar .chip").forEach(function(x){x.classList.remove("active")});this.classList.add("active");curTier=this.dataset.tier;render()}});
+var dp=document.getElementById("dlpicker");
+document.getElementById("dlBtn").onclick=function(e){e.stopPropagation();buildDlList();dp.classList.toggle("show")};
+dp.addEventListener("click",function(e){e.stopPropagation()});
+document.addEventListener("click",function(e){if(!dp.contains(e.target))dp.classList.remove("show")});
+document.getElementById("dlAll").onclick=function(e){e.stopPropagation();buildDlList(true);render()};
+document.getElementById("dlNone").onclick=function(e){e.stopPropagation();dlSel={};buildDlList();render()};
 var cp=document.getElementById("colpicker");
 var LS_KEY="hhclubbutler_colcfg_v1";
 function loadColCfg(){
@@ -1524,43 +1696,76 @@ buildHead();load();
                     time.sleep(wait)
         raise last_exc
 
+    def _last_settlement_from_stats(self) -> Tuple[Optional[float], Optional[float], str]:
+        """从结算统计表本地聚合数据取最新一条实结记录（records 按日期排序，取日期最大者）"""
+        try:
+            data = self._load_monthly_stats()
+            recs = data.get("records") or []
+            if not recs:
+                return None, None, ""
+            best = max(recs, key=lambda r: str(r.get("date") or ""))
+            return (float(best.get("bean") or 0), float(best.get("pt") or 0),
+                    str(best.get("date") or ""))
+        except Exception:
+            return None, None, ""
+
     def _fetch_last_settlement(self) -> Tuple[Optional[float], Optional[float], str]:
+        """翻页拉取保种结算日志至末页，取全局最新一条（日志按时间正序分页，最新在最后一页）"""
         uid = self._get_site_uid()
         if not uid:
             return None, None, ""
         try:
             session = self._session()
-            url = f"{self._get_site_url()}/rescuesettleinfo.php?id={uid}"
-            r = self._get_with_retry(session, url, timeout=20, retries=2, backoff=(3, 5))
-            soup = BeautifulSoup(r.text, "html.parser")
-            table = None
-            for tb in soup.find_all("table"):
-                if "获得的憨豆" in tb.get_text() and "结算时间" in tb.get_text():
-                    table = tb
-                    break
-            if not table:
-                return None, None, ""
-            rows = table.select("tr")
+            site_url = self._get_site_url()
             best = None
             best_date = ""
-            for tr in rows:
-                tds = tr.find_all(["td", "th"])
-                if len(tds) < 8:
-                    continue
-                cells = [c.get_text(strip=True) for c in tds]
+            page = 0
+            while page <= 600:
                 try:
-                    bean = float(re.sub(r'[^\d.]', '', cells[4]) or 0)
-                    pt = float(re.sub(r'[^\d.]', '', cells[5]) or 0)
-                    dstr = cells[7]
-                    dmatch = re.search(r'\d{4}-\d{2}-\d{2}', dstr)
-                    if not dmatch:
+                    if page == 0:
+                        url = f"{site_url}/rescuesettleinfo.php?id={uid}"
+                    else:
+                        url = f"{site_url}/rescuesettleinfo.php?id={uid}&page={page}"
+                    r = self._get_with_retry(session, url, timeout=20, retries=2, backoff=(3, 5))
+                except Exception as e:
+                    logger.warning(f"上次结算第{page + 1}页获取失败：{e}")
+                    break
+                soup = BeautifulSoup(r.text, "html.parser")
+                table = None
+                for tb in soup.find_all("table"):
+                    if "获得的憨豆" in tb.get_text() and "结算时间" in tb.get_text():
+                        table = tb
+                        break
+                if not table:
+                    break
+                new_rows = 0
+                page_best = None
+                page_best_date = ""
+                for tr in table.select("tr"):
+                    tds = tr.find_all(["td", "th"])
+                    if len(tds) < 8:
                         continue
-                    d = dmatch.group(0)
-                    if d >= best_date:
-                        best_date = d
-                        best = (bean, pt)
-                except (ValueError, IndexError):
-                    continue
+                    cells = [c.get_text(strip=True) for c in tds]
+                    try:
+                        bean = float(re.sub(r'[^\d.]', '', cells[4]) or 0)
+                        pt = float(re.sub(r'[^\d.]', '', cells[5]) or 0)
+                        dstr = cells[7]
+                        dmatch = re.search(r'\d{4}-\d{2}-\d{2}', dstr)
+                        if not dmatch:
+                            continue
+                        d = dmatch.group(0)
+                        new_rows += 1
+                        if d >= page_best_date:
+                            page_best_date = d
+                            page_best = (bean, pt)
+                    except (ValueError, IndexError):
+                        continue
+                if new_rows == 0:
+                    break
+                if page_best and page_best_date >= best_date:
+                    best_date = page_best_date
+                    best = page_best
+                page += 1
             if best:
                 return best[0], best[1], best_date
         except Exception as e:
@@ -1580,25 +1785,54 @@ buildHead();load();
             return None
 
     def _load_monthly_stats(self) -> dict:
+        self._load_error = ""
         p = self._monthly_stats_path()
         if not p or not p.exists():
             return {"last_fetch_date": "", "updated_at": "", "records": []}
         try:
+            size = p.stat().st_size
+            if size == 0:
+                self._load_error = f"文件为空（0 字节）"
+                logger.warning(f"读取结算统计表本地数据失败：文件为空（0 字节）：{p}")
+                return {"last_fetch_date": "", "updated_at": "", "records": []}
             with open(p, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
+            self._load_error = str(e)
             logger.warning(f"读取结算统计表本地数据失败：{e}")
             return {"last_fetch_date": "", "updated_at": "", "records": []}
 
     def _save_monthly_stats(self, data: dict):
+        """原子写入结算统计表本地数据：先写临时文件再替换，杜绝 0 字节空文件"""
+        self._save_error = ""
         p = self._monthly_stats_path()
         if not p:
+            self._save_error = "数据目录不可用"
             return
         try:
-            with open(p, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=1)
+            s = json.dumps(data, ensure_ascii=False, indent=1)
         except Exception as e:
-            logger.error(f"保存结算统计表本地数据失败：{e}")
+            self._save_error = f"序列化失败：{e}"
+            logger.error(f"保存结算统计表本地数据失败（序列化）：{e}")
+            return
+        tmp = p.with_suffix(".tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(s)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+            os.replace(tmp, p)
+        except Exception as e:
+            self._save_error = f"写入失败：{e}"
+            logger.error(f"保存结算统计表本地数据失败（写入）：{e}")
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
 
     def _fetch_settlement_history(self) -> List[Tuple[str, float, float]]:
         """翻页拉取保种结算日志：第1页无page参数，之后 page=1,2,...（0基），直至无更多数据"""
@@ -1652,12 +1886,26 @@ buildHead();load();
         return [(d, v[0], v[1]) for d, v in out.items()]
 
     def _ensure_monthly_stats(self, force: bool = False) -> dict:
-        """返回本地历史；当日已成功拉取过则直接使用，不再请求站点"""
+        """返回本地历史；当日已成功获取（本地已含当日记录或当日拉取成功）则直接使用。
+        拉取失败或未拉取到当日数据时，按 retry_at 时间戳（5 分钟间隔）自动重试，当日累计最多 3 次。
+        结算日志按时间正序分页，最新一条在最后一页；本地按日期全量聚合，取最新=max(date)，与页序无关。"""
         data = self._load_monthly_stats()
         records = data.get("records") or []
         tz = pytz.timezone(settings.TZ)
-        today = datetime.now(tz).strftime("%Y-%m-%d")
-        if not force and data.get("last_fetch_date") == today:
+        now = datetime.now(tz)
+        today = now.strftime("%Y-%m-%d")
+        has_today = any(str(r.get("date")) == today for r in records)
+        if not force and (data.get("last_fetch_date") == today or has_today):
+            self._fetch_state = "ok_cached"
+            return data
+        attempt_date = str(data.get("last_attempt_date") or "")
+        attempts = int(data.get("attempt_count") or 0)
+        retry_at = float(data.get("retry_at") or 0)
+        if not force and attempt_date == today and attempts >= 3:
+            self._fetch_state = "failed_limited"
+            return data
+        if not force and attempt_date == today and attempts > 0 and now.timestamp() < retry_at:
+            self._fetch_state = "pending_retry"
             return data
         fetched = self._fetch_settlement_history()
         if fetched:
@@ -1671,14 +1919,31 @@ buildHead();load();
             for d, b, p in fetched:
                 merged[d] = {"date": d, "bean": float(b or 0), "pt": float(p or 0)}
             data["records"] = sorted(merged.values(), key=lambda x: x["date"])
-            data["last_fetch_date"] = today
-            data["updated_at"] = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
-            self._save_monthly_stats(data)
-        else:
-            if not records:
-                logger.warning("结算日志拉取失败（或站点无记录），暂无本地历史")
+            data["last_attempt_date"] = today
+            if today in merged:
+                data["last_fetch_date"] = today
+                data["attempt_count"] = 0
+                data["retry_at"] = 0
+                data["updated_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                self._save_monthly_stats(data)
+                self._fetch_state = "ok"
             else:
-                logger.warning("结算日志拉取失败，保留本地历史数据（当日可重试）")
+                # 拉取成功但站点当日记录尚未生成（如当日尚未实结），按 5 分钟间隔重试
+                data["attempt_count"] = attempts + 1
+                data["retry_at"] = now.timestamp() + 300
+                self._save_monthly_stats(data)
+                self._fetch_state = "no_today_data"
+                logger.warning(f"结算日志未包含今日数据（今日已尝试 {attempts + 1} 次），5 分钟后自动重试")
+        else:
+            data["last_attempt_date"] = today
+            data["attempt_count"] = attempts + 1
+            data["retry_at"] = now.timestamp() + 300
+            self._save_monthly_stats(data)
+            self._fetch_state = "failed"
+            if not records:
+                logger.warning("结算日志拉取失败（或站点无记录），5 分钟后自动重试")
+            else:
+                logger.warning(f"结算日志拉取失败，保留本地历史数据（今日已尝试 {attempts + 1} 次），5 分钟后自动重试")
         return data
 
     def _monthly_agg(self, data: dict) -> dict:
@@ -1724,7 +1989,10 @@ buildHead();load();
                     except Exception:
                         total = 31
                     notes[i] = f"仅{days[i]}天" if days[i] < total else "完整"
+        total_bean = sum(float(r.get("bean") or 0) for r in records)
+        total_pt = sum(float(r.get("pt") or 0) for r in records)
         return {"labels": labels, "bean": bean, "pt": pt, "days": days, "notes": notes,
+                "total_bean": round(total_bean, 1), "total_pt": round(total_pt, 1),
                 "updated_at": data.get("updated_at", ""),
                 "last_fetch_date": data.get("last_fetch_date", "")}
 
@@ -1732,20 +2000,36 @@ buildHead();load();
         apikey = getattr(settings, "API_TOKEN", "") or ""
         return HTMLResponse(content=self._build_monthly_stats_html(apikey))
 
-    def api_monthly_stats_data(self):
+    def api_monthly_stats_data(self, refresh: int = 0):
         try:
-            data = self._ensure_monthly_stats()
+            data = self._ensure_monthly_stats(force=bool(refresh))
             agg = self._monthly_agg(data)
             records = data.get("records") or []
             recent = sorted(records, key=lambda x: str(x.get("date", "")))[-40:]
+            p = self._monthly_stats_path()
+            try:
+                file_size = p.stat().st_size if p and p.exists() else 0
+            except Exception:
+                file_size = -1
             return {
                 "labels": agg["labels"], "bean": agg["bean"], "pt": agg["pt"],
                 "days": agg["days"], "notes": agg["notes"],
+                "total_bean": agg["total_bean"], "total_pt": agg["total_pt"],
                 "updated_at": agg["updated_at"], "last_fetch_date": agg["last_fetch_date"],
                 "records_total": len(records),
                 "records": [{"date": str(r.get("date", "")),
                              "bean": float(r.get("bean") or 0),
                              "pt": float(r.get("pt") or 0)} for r in recent],
+                "fetch_state": getattr(self, "_fetch_state", ""),
+                "attempt_count": int(data.get("attempt_count") or 0),
+                "diag": {
+                    "data_path": str(p or ""),
+                    "file_size": file_size,
+                    "save_error": getattr(self, "_save_error", ""),
+                    "load_error": getattr(self, "_load_error", ""),
+                    "last_fetch_date": str(data.get("last_fetch_date") or ""),
+                    "last_attempt_date": str(data.get("last_attempt_date") or ""),
+                },
             }
         except Exception as e:
             logger.error(f"获取结算统计表数据失败：{e}")
@@ -1762,7 +2046,7 @@ buildHead();load();
 body{font-family:"Segoe UI","PingFang SC",Arial,sans-serif;color:#F0ECFF;
 background:radial-gradient(800px 420px at 6% -8%,rgba(255,64,160,.13),transparent 55%),
 radial-gradient(900px 460px at 94% -6%,rgba(64,200,255,.15),transparent 55%),#0B0714;
-min-height:100vh;height:100vh;display:flex;flex-direction:column;overflow:hidden;font-size:12px}
+min-height:100vh;height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidden;font-size:12px}
 .wrap{width:100%;margin:0 auto;flex:1;overflow:auto;padding:20px 28px 16px;display:flex;flex-direction:column}
 .head{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}
 .head .t{font-size:22px;font-weight:700}
@@ -1794,12 +2078,28 @@ td.pt{color:#38D9FF;font-weight:600}
 .scroll30::-webkit-scrollbar{width:8px}.scroll30::-webkit-scrollbar-thumb{background:#4A3A78;border-radius:4px}
 .status{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;font-size:14px;color:#F0ECFF;text-align:center;max-width:460px;padding:28px 36px;border-radius:14px;border:1px solid rgba(255,64,160,.25);background:rgba(16,10,28,.85);box-shadow:0 0 30px rgba(255,64,160,.12)}
 .status .bar{width:260px;height:4px;background:rgba(120,90,220,.18);border-radius:2px;overflow:hidden;position:relative}
-.status .bar i{position:absolute;top:0;left:0;height:100%;width:38%;background:linear-gradient(90deg,#FF8A3C,#38D9FF);border-radius:2px;animation:hhslide 1.1s ease-in-out infinite;box-shadow:0 0 8px rgba(255,138,60,.6)}
+.status .bar i{position:absolute;top:0;left:0;height:100%;width:38%;background:linear-gradient(90deg,#FF8A3C,#38D9FF);border-radius:2px;animation:hhslide 1s linear infinite;box-shadow:0 0 8px rgba(255,138,60,.6)}
 @keyframes hhslide{0%{left:-38%}100%{left:100%}}
 .status .err{color:#FF6B6B;font-size:13px;max-width:80%;text-align:center;line-height:1.6}
 .status .retrybtn{background:linear-gradient(90deg,#FF8A3C,#38D9FF);color:#0B0714;border:none;padding:8px 26px;border-radius:8px;cursor:pointer;font-size:13px;margin-top:4px;font-weight:600}
+.warnbar{display:none;margin-bottom:14px;padding:10px 16px;border-radius:12px;background:rgba(255,107,107,.10);border:1px solid rgba(255,107,107,.45);color:#FFB3A0;font-size:12.5px;line-height:1.6;align-items:center}
+.warnbar b{font-weight:700;color:#FF8A6B}
+.warnbar .wbtn{margin-left:14px;background:rgba(255,107,107,.18);border:1px solid rgba(255,107,107,.55);color:#FFD0C0;padding:5px 16px;border-radius:8px;cursor:pointer;font-size:12px;font-family:inherit;flex-shrink:0}
+.warnbar .wbtn:hover{background:rgba(255,107,107,.32)}
 .bodywrap{position:relative;flex:1;display:flex;flex-direction:column}
 .footer{margin-top:16px;font-size:11.5px;color:#9A8FC0;line-height:1.7;text-align:center}
+@media (max-width:720px){
+.wrap{padding:14px 12px 12px}
+.head .t{font-size:18px}
+.head .src{font-size:11px}
+.low{grid-template-columns:1fr}
+.scroll30{overflow-x:auto}
+.chart{height:272px}
+.duals{height:280px}
+.duals .g{height:280px}
+.status{max-width:88vw;padding:22px 16px}
+.status .bar{width:200px}
+}
 </style></head><body>
 <div class="wrap">
 <div class="head">
@@ -1808,75 +2108,104 @@ td.pt{color:#38D9FF;font-weight:600}
 <button class="exit" title="关闭页面" onclick="window.close()">退出</button>
 </div>
 <div class="bodywrap">
+<div id="warn" class="warnbar"></div>
 <div id="status" class="status"><span>正在获取每月结算数据，请稍候…</span><div class="bar"><i></i></div></div>
 <div id="main" style="display:none">
-<div class="topcard"><div class="ct"><span class="nm">近12个月收益</span><span class="sb">橙柱 = 憨豆 · 青柱 = 积分 · 带 * 的月份为部分数据（未满整月）</span></div>
+<div class="topcard"><div class="ct"><span class="nm">近30日收益</span><span class="sb">橙柱 = 憨豆 · 青柱 = 积分 · 按结算日志每日实结</span></div>
 <div class="chart" id="mb"></div></div>
 <div class="low">
-<div class="card"><div class="ct"><span class="nm">累计统计</span><span class="sb">左环 = 憨豆 · 右环 = 积分</span></div>
+<div class="card"><div class="ct"><span class="nm">保种历史累计统计</span><span class="sb">左环 = 憨豆 · 右环 = 积分</span></div>
 <div class="duals"><div class="dbox"><div class="g" id="dg1"></div><div class="dlab"><div class="r">憨豆累计</div><div class="v" id="cvb" style="color:#FF8A3C">—</div></div></div>
 <div class="dbox"><div class="g" id="dg2"></div><div class="dlab"><div class="r">积分累计</div><div class="v" id="cvp" style="color:#38D9FF">—</div></div></div></div></div>
-<div class="card"><div class="ct"><span class="nm">近 30 日收益</span><span class="sb">按结算日志每日实结填充</span></div>
+<div class="card"><div class="ct"><span class="nm">近12个月收益</span><span class="sb">带 * 的月份为部分数据（未满整月）· 最新月份在最上方</span></div>
 <div class="scroll30" id="tbl"></div></div>
 </div>
 </div>
 </div>
-<div class="footer">灰显月份暂无历史记录 · 统计结算表数据来自憨憨站保种结算日志</div>
+<div class="footer" id="foot">灰显月份暂无历史记录 · 统计结算表数据来自憨憨站保种结算日志</div>
 </div>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
 <script>
 var APIKEY=__APIKEY__;
-var data=null,chb=null,chd=null;
+var data=null,chb=null,chd1=null,chd2=null;
 function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;")}
 function fmtBig(n){if(n===null||n===undefined)return "—";return Number(n).toLocaleString()}
 function showErr(msg){var st=document.getElementById('status');st.innerHTML='<span class="err">'+esc(msg)+'</span><button class="retrybtn" onclick="location.reload()">重试</button>';}
+function showWarn(msg){var w=document.getElementById('warn');w.style.display='flex';w.innerHTML='<b>⚠ '+esc(msg)+'</b><button class="wbtn" onclick="loadData(true)">立即重试</button>';}
+function clearWarn(){var w=document.getElementById('warn');w.style.display='none';w.innerHTML='';}
+function loadData(refresh){
+var t0=Date.now(),tmr=null;
+document.getElementById('status').innerHTML='<span>正在获取每月结算数据，请稍候… <b id="el">0</b> 秒</span><div class="bar"><i></i></div>';
+function tick(){var el=document.getElementById("el");if(el)el.textContent=Math.floor((Date.now()-t0)/1000);}
+tick();tmr=setInterval(tick,250);
+var url='/api/v1/plugin/HHClubButler/monthly_stats_data?apikey='+encodeURIComponent(APIKEY)+(refresh?'&refresh=1':'');
+fetch(url).then(function(r){return r.json();}).then(function(j){
+if(j&&j.error){if(tmr)clearInterval(tmr);showErr(j.error);return;}
+data=j;
+var st=document.getElementById('status');if(tmr)clearInterval(tmr);st.style.display='none';
+document.getElementById('main').style.display='block';
+clearWarn();
+if(data.fetch_state==='failed'||data.fetch_state==='failed_limited'){
+var n=data.attempt_count||0;
+showWarn('今日结算数据获取失败（已尝试 '+n+' 次），当前展示为历史数据，非当日数据！');
+}else if(data.fetch_state==='no_today_data'){
+showWarn('站点当日结算记录尚未生成，正在自动重试（每5分钟一次，已尝试 '+(data.attempt_count||0)+' 次）…');
+}else if(data.fetch_state==='pending_retry'){
+showWarn('今日结算数据拉取未成功，等待自动重试中（每5分钟一次）…');
+}
+var ft=document.getElementById('foot');
+ft.textContent='数据更新于 '+(data.updated_at||'—')+' · 灰显月份暂无历史记录 · 统计结算表数据来自憨憨站保种结算日志';
+if(typeof echarts==='undefined'){renderTable();return;}
+renderChart();renderTable();
+}).catch(function(e){if(tmr)clearInterval(tmr);showErr('获取数据失败：'+e.message);});
+}
+loadData(false);
 function renderChart(){
 chb=echarts.init(document.getElementById('mb'));
-var months=data.labels,bean=data.bean,pt=data.pt;
+var rec=(data.records||[]).slice(-30);
+var x=[],b=[],p=[];
+for(var i=0;i<rec.length;i++){var r=rec[i];x.push(String(r.date||'').slice(5));b.push(r.bean);p.push(r.pt);}
+var isM=window.innerWidth<560;
 chb.setOption({backgroundColor:'transparent',
 tooltip:{trigger:'axis',triggerOn:'click',renderMode:'richText',confine:true,textStyle:{fontSize:11,color:'#F0ECFF',lineHeight:15},backgroundColor:'rgba(21,13,36,.95)',borderColor:'rgba(64,200,255,.3)',padding:[6,8]},
-grid:{left:8,right:14,top:36,bottom:28,containLabel:true},
+grid:{left:8,right:14,top:30,bottom:24,containLabel:true},
 legend:{top:0,itemWidth:14,itemHeight:8,textStyle:{fontSize:11,color:'#A79BC9'}},
-xAxis:{type:'category',data:months,axisLabel:{fontSize:11,color:'#9A8FC0',interval:0}},
+xAxis:{type:'category',data:x,axisLabel:{fontSize:isM?7:9,color:'#9A8FC0',interval:0,formatter:function(v,i){var d=String((rec[i]&&rec[i].date)||'');return d?d.slice(5).replace('-','/'):''}}},
 yAxis:{type:'value',axisLabel:{fontSize:10,color:'#9A8FC0',formatter:function(v){return v>=10000?(v/10000).toFixed(1).replace('.0','')+'万':v}},splitLine:{lineStyle:{color:'rgba(64,200,255,.12)'}}},
 series:[
-{name:'憨豆',type:'bar',barWidth:22,data:bean,itemStyle:{color:'#FF8A3C',borderRadius:[6,6,0,0],shadowColor:'#FF8A3C',shadowBlur:10},
-label:{show:true,position:'top',fontSize:10,color:'#FF8A3C',distance:6,formatter:function(p){return (p.value===null||p.value===undefined)?'':fmtBig(p.value)}},labelLayout:{hideOverlap:true}},
-{name:'积分',type:'bar',barWidth:22,data:pt,itemStyle:{color:'#38D9FF',borderRadius:[6,6,0,0],shadowColor:'#38D9FF',shadowBlur:10},
-label:{show:true,position:'top',fontSize:10,color:'#38D9FF',distance:6,formatter:function(p){return (p.value===null||p.value===undefined)?'':fmtBig(p.value)}},labelLayout:{hideOverlap:true}}]});
+{name:'憨豆',type:'bar',data:b,itemStyle:{color:'#FF8A3C',borderRadius:[4,4,0,0]},
+label:{show:true,position:'top',fontSize:9,color:'#FF8A3C',distance:2,formatter:function(p){return (p.value===null||p.value===undefined)?'':fmtBig(p.value)}},labelLayout:{hideOverlap:true}},
+{name:'积分',type:'bar',data:p,itemStyle:{color:'#38D9FF',borderRadius:[4,4,0,0]},
+label:{show:true,position:'top',fontSize:9,color:'#38D9FF',distance:2,formatter:function(p){return (p.value===null||p.value===undefined)?'':fmtBig(p.value)}},labelLayout:{hideOverlap:true}}]});
 chd1=echarts.init(document.getElementById('dg1'));
 chd2=echarts.init(document.getElementById('dg2'));
-var tb=0,tp=0;
-for(var i=0;i<bean.length;i++){if(bean[i]!==null&&bean[i]!==undefined){tb+=bean[i];tp+=pt[i];}}
+var tb=(data.total_bean===undefined||data.total_bean===null)?0:Number(data.total_bean);
+var tp=(data.total_pt===undefined||data.total_pt===null)?0:Number(data.total_pt);
 document.getElementById('cvb').textContent=fmtBig(tb);
 document.getElementById('cvp').textContent=fmtBig(tp);
 chd1.setOption({backgroundColor:'transparent',series:[
-{type:'gauge',startAngle:210,endAngle:-30,min:0,max:Math.max(tb,1),radius:'84%',center:['50%','52%'],
-progress:{show:true,width:14,itemStyle:{color:'#FF8A3C',shadowColor:'#FF8A3C',shadowBlur:16}},
-axisLine:{lineStyle:{width:14,color:[[1,'rgba(255,138,60,.10)']]}},
+{type:'gauge',startAngle:210,endAngle:-30,min:0,max:Math.max(tb,1),radius:'78%',center:['50%','52%'],
+progress:{show:true,width:22,itemStyle:{color:'#FF8A3C',shadowColor:'#FF8A3C',shadowBlur:16}},
+axisLine:{lineStyle:{width:22,color:[[1,'rgba(255,138,60,.10)']]}},
 axisTick:{show:false},splitLine:{show:false},axisLabel:{show:false},pointer:{show:false},detail:{show:false},data:[{value:tb}]}]});
 chd2.setOption({backgroundColor:'transparent',series:[
-{type:'gauge',startAngle:210,endAngle:-30,min:0,max:Math.max(tp,1),radius:'84%',center:['50%','52%'],
-progress:{show:true,width:14,itemStyle:{color:'#38D9FF',shadowColor:'#38D9FF',shadowBlur:16}},
-axisLine:{lineStyle:{width:14,color:[[1,'rgba(56,217,255,.10)']]}},
+{type:'gauge',startAngle:210,endAngle:-30,min:0,max:Math.max(tp,1),radius:'78%',center:['50%','52%'],
+progress:{show:true,width:22,itemStyle:{color:'#38D9FF',shadowColor:'#38D9FF',shadowBlur:16}},
+axisLine:{lineStyle:{width:22,color:[[1,'rgba(56,217,255,.10)']]}},
 axisTick:{show:false},splitLine:{show:false},axisLabel:{show:false},pointer:{show:false},detail:{show:false},data:[{value:tp}]}]});
 window.addEventListener('resize',function(){if(chb)chb.resize();if(chd1)chd1.resize();if(chd2)chd2.resize();});
 }
 function renderTable(){
-var rec=(data.records||[]).slice(-30).reverse();
-var rows='',cb=0;
-for(var i=0;i<rec.length;i++){var r=rec[i];cb+=Number(r.bean||0);
-rows+='<tr><td class="d">'+esc(r.date||'')+'</td><td class="bean">'+fmtBig(r.bean)+'</td><td class="pt">'+fmtBig(r.pt)+'</td><td>'+fmtBig(cb)+'</td></tr>';}
-document.getElementById('tbl').innerHTML='<table><thead><tr><th>日期</th><th>憨豆</th><th>积分</th><th>累计憨豆</th></tr></thead><tbody>'+rows+'</tbody></table>';
+var labs=data.labels,bean=data.bean,pt=data.pt,notes=data.notes||[];
+var cumB=[],cumP=[],cb=0,cp=0;
+for(var i=0;i<labs.length;i++){cb+=bean[i]||0;cp+=(pt[i]||0);cumB.push(cb);cumP.push(cp);}
+var rows='';
+for(var j=labs.length-1;j>=0;j--){var v=bean[j];
+if(v===null||v===undefined){rows+='<tr><td class="d">'+esc(labs[j])+'</td><td class="d">-</td><td class="d">-</td><td class="d">-</td><td class="d">-</td></tr>';continue;}
+var star=(notes[j]&&notes[j].indexOf('仅')===0)?' *':'';
+rows+='<tr><td class="d">'+esc(labs[j])+star+'</td><td class="bean">'+fmtBig(v)+'</td><td class="pt">'+fmtBig(pt[j])+'</td><td>'+fmtBig(cumB[j])+'</td><td>'+fmtBig(cumP[j])+'</td></tr>';}
+document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>憨豆</th><th>积分</th><th>累计憨豆</th><th>累计积分</th></tr></thead><tbody>'+rows+'</tbody></table>';
 }
-fetch('/api/v1/plugin/HHClubButler/monthly_stats_data?apikey='+encodeURIComponent(APIKEY)).then(function(r){return r.json();}).then(function(j){
-if(j&&j.error){showErr(j.error);return;}
-data=j;
-var st=document.getElementById('status');st.style.display='none';
-document.getElementById('main').style.display='block';
-if(typeof echarts==='undefined'){renderTable();return;}
-renderChart();renderTable();
-}).catch(function(e){showErr('获取数据失败：'+e.message);});
 </script></body></html>"""
         return html.replace("__APIKEY__", ak)
 
@@ -2039,7 +2368,11 @@ renderChart();renderTable();
             dist[TIER_NAMES[t]]["count"] += 1
             dist[TIER_NAMES[t]]["gb"] += s.get("size", 0.0)
         total_gb = cur.get("total_gb", 0.0)
-        last_bean, last_pt, last_date = self._fetch_last_settlement()
+        # 优先从结算统计表本地聚合数据取最新一条（全量翻页聚合，最新=max(日期)，与页序无关），
+        # 与[统计结算表]页面同源一致；本地为空时才回退到翻页兜底抓取
+        last_bean, last_pt, last_date = self._last_settlement_from_stats()
+        if last_bean is None:
+            last_bean, last_pt, last_date = self._fetch_last_settlement()
         if last_bean is None and self._last_overview:
             last_bean = self._last_overview.get("last_bean")
             last_pt = self._last_overview.get("last_pt")
