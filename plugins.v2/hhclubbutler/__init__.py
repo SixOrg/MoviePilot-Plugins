@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 HHCLUB 憨憨保种区管家插件（MoviePilot V2）
-v1.4：
-1. 移除全部积分/憨豆预估与公式，只保留目标体积模式
-2. 优选逻辑：高倍率档优先（0-1人 > 2-3人 > 4-5人）
-3. 面板"达标可得"改为"上次憨豆/上次积分"（rescuesettleinfo 实结值）
-4. 新增仿QB风格保种管理页：列出在保种子，支持手动删除（同步删下载器任务+文件）
+v2.5.2：
+1. 保种匹配改用站点种子ID（seed_id）精确匹配：下载器种子 comment 里即含憨憨详情页链接，
+   直接从 TR（一次请求）与 QB（定向查询）提取 {种子ID: 种子}，零详情页请求、秒级完成
+2. 种子ID 缺失时自动回退 Hash（infoHash）精确匹配，再回退标题匹配，三层保障不漏报
+3. 匹配速度：首次安装从分钟级降至秒级，不再批量请求站点详情页（降低反爬风险）
 """
 
 import json
@@ -78,7 +78,7 @@ class HHClubButler(_PluginBase):
     plugin_name = "憨憨保种区管家"
     plugin_desc = "自动优选添加及换种工具\n保种管理器/Hosts加速"
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
-    plugin_version = "2.5"
+    plugin_version = "2.6"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "hhclubbutler_"
@@ -111,6 +111,8 @@ class HHClubButler(_PluginBase):
     _last_result: str = "尚未运行"
     _last_overview: dict = None
     _last_overview_ts: float = 0.0
+    _last_in_flight_gb: float = 0.0
+    _last_vol_ts: float = 0.0
     _overview_hours: float = 6.0
     _overview_thread: Optional[threading.Thread] = None
     _overview_stop: Optional[threading.Event] = None
@@ -163,7 +165,12 @@ class HHClubButler(_PluginBase):
 
         if self._onlyonce:
             self._onlyonce = False
-            self.update_config({
+            # 读改写整段配置：只改本次需要的字段，其余字段（含 hosts_enabled/hosts_config）原样保留。
+            # 注意 MP v3 的 update_config 为整段替换语义，手写字段子集会把未列出的配置（如 Hosts）抹掉。
+            _cfg = self.get_config() or {}
+            if not isinstance(_cfg, dict):
+                _cfg = {}
+            _cfg.update({
                 "enabled": self._enabled,
                 "onlyonce": False,
                 "notify": self._notify,
@@ -181,7 +188,10 @@ class HHClubButler(_PluginBase):
                 "save_path": self._save_path,
                 "tag": self._tag,
                 "auto_clean_days": self._auto_clean_days,
+                "hosts_enabled": self._hosts_enabled,
+                "hosts_config": self._hosts_config,
             })
+            self.update_config(_cfg)
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
             self._scheduler.add_job(
                 func=self.run,
@@ -249,6 +259,14 @@ class HHClubButler(_PluginBase):
                 downloaders.append({"title": config.name, "value": config.name})
         except Exception as e:
             logger.warning(f"获取下载器列表失败：{e}")
+        # 目标体积 hint 实时数值：憨憨在保来自最近一次概况（_last_overview），
+        # 在途体积来自最近一次概况/运行同步的 _last_in_flight_gb
+        hh_gb = (self._last_overview or {}).get("total_gb")
+        infl_gb = getattr(self, "_last_in_flight_gb", 0.0)
+        if hh_gb is not None:
+            target_hint = f"含已做种 {hh_gb:.1f} GB + 在途 {infl_gb:.1f} GB，0=不限"
+        else:
+            target_hint = "含已做种 + 在途总体积，0=不限（运行或刷新概况后显示实时数值）"
         form = [
             {
                 'component': 'VForm',
@@ -281,7 +299,7 @@ class HHClubButler(_PluginBase):
                                  'no-resize': False,
                                  'hint': '开启并填写可加速站点（支持配置其他站）',
                                  'persistent-hint': True,
-                                 'placeholder': '格式：IP 域名，每行一条；留空不生效，关闭自动还原，适用其他站点加速\n示例：104.17.141.143 hhanclub.net'}}]},
+                                 'placeholder': '格式：IP 域名，每行一条；留空不生效，关闭自动还原，适用其他站点加速\n示例：\n104.17.141.143 hhanclub.net'}}]},
                             {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
                              'content': [{'component': 'VSelect', 'props': {
                                  'model': 'downloaders', 'label': '管理下载器（多选）', 'items': downloaders,
@@ -323,7 +341,7 @@ class HHClubButler(_PluginBase):
                                  'model': 'target_volume',
                                  'label': '目标体积（GB，总保种上限）',
                                  'type': 'number',
-                                 'hint': '含已做种总体积，0=不限',
+                                 'hint': target_hint,
                                  'persistent-hint': True}}]},
                         ]
                     },
@@ -334,7 +352,7 @@ class HHClubButler(_PluginBase):
                              'content': [{'component': 'VTextField', 'props': {
                                  'model': 'seeder_cond',
                                  'label': '做种人数',
-                                 'hint': '支持单值或区间，例如 1 或 1-5，留空=系统自行优选',
+                                 'hint': '按保种区列表「当前做种人数」筛选（如 0-3）；憨憨按下载时人数结算，未下载种子该值无法提前获取，留空=不限',
                                  'persistent-hint': True}}]},
                             {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
                              'content': [{'component': 'VTextField', 'props': {
@@ -836,12 +854,32 @@ class HHClubButler(_PluginBase):
                 return
             self._last_overview = self._build_overview_from_current(cur)
             self._last_overview_ts = time.time()
+            self._sync_last_volume()
             logger.info(f"憨憨保种区管家概况已{'手动' if manual else '自动'}刷新："
                         f"{cur.get('count', 0)} 个 / {cur.get('total_gb', 0.0):.1f} GB"
                         f" / 上次憨豆 {self._last_overview.get('last_bean', '—')}"
                         f" / 上次积分 {self._last_overview.get('last_pt', '—')}")
         except Exception as e:
             logger.error(f"概况{'手动' if manual else '自动'}刷新失败：{e}")
+
+    def _sync_last_volume(self):
+        """同步最新在途体积到实例属性（供设置页目标体积 hint 实时显示），失败保留上次值"""
+        try:
+            seeds = self._fetch_rescue_all([])
+            if not seeds:
+                return
+            gb_map = {HHClubButler._norm_title(s.get("title") or ""): s.get("size", 0.0) for s in seeds}
+            dl_all = self._get_downloader_seeds([], only_completed=False, any_tracker=True)
+            if dl_all is None:
+                return
+            dl_done = self._get_downloader_seeds([], only_completed=True, any_tracker=True) or set()
+            in_flight_norms = {HHClubButler._norm_title(n) for n in dl_all} \
+                - {HHClubButler._norm_title(n) for n in dl_done}
+            infl = sum(gb_map.get(nm, 0.0) for nm in in_flight_norms)
+            self._last_in_flight_gb = infl
+            self._last_vol_ts = time.time()
+        except Exception as e:
+            logger.warning(f"在途体积同步失败（保留上次值 {self._last_in_flight_gb:.1f} GB）：{e}")
 
     def _get_overview_cached_or_refresh(self) -> dict:
         try:
@@ -897,6 +935,7 @@ class HHClubButler(_PluginBase):
                 logger.warning(f"下载器详情合并失败：{e}")
                 detail = {}
             dl_norm_map = {}
+            dl_hash_dl = {}
             for dl_name, t in (torrents or []):
                 try:
                     tname = t.get("name") if isinstance(t, dict) else getattr(t, "name", "")
@@ -905,22 +944,34 @@ class HHClubButler(_PluginBase):
                 nt = HHClubButler._norm_title(tname)
                 if nt and nt not in dl_norm_map:
                     dl_norm_map[nt] = dl_name
+                th = HHClubButler._extract_torrent_hash(t)
+                if th and th not in dl_hash_dl:
+                    dl_hash_dl[th] = dl_name
             for s in seeds:
-                nm = HHClubButler._norm_title(s.get("title") or "")
-                dl_hit = dl_norm_map.get(nm)
-                if dl_hit is None and len(nm) >= 15:
-                    for dk, dn in dl_norm_map.items():
-                        if len(dk) >= 15 and (nm in dk or dk in nm):
-                            dl_hit = dn
-                            break
+                s_hash = s.get("hash") or ""
+                # 种子ID 主匹配已赋值 downloader，优先复用；否则按 hash / 标题归属
+                dl_hit = s.get("downloader")
+                if not dl_hit:
+                    dl_hit = dl_hash_dl.get(s_hash) if s_hash else None
+                if dl_hit is None:
+                    nm = HHClubButler._norm_title(s.get("title") or "")
+                    dl_hit = dl_norm_map.get(nm)
+                    if dl_hit is None and len(nm) >= 15:
+                        for dk, dn in dl_norm_map.items():
+                            if len(dk) >= 15 and (nm in dk or dk in nm):
+                                dl_hit = dn
+                                break
                 if dl_hit:
                     s["downloader"] = dl_hit
-                d = detail.get(nm) or {}
-                if not d and len(nm) >= 15:
-                    for dk, dv in detail.items():
-                        if len(dk) >= 15 and (nm in dk or dk in nm):
-                            d = dv
-                            break
+                d = detail.get(s_hash) if s_hash else None
+                if not d:
+                    nm = HHClubButler._norm_title(s.get("title") or "")
+                    d = detail.get(nm) or {}
+                    if not d and len(nm) >= 15:
+                        for dk, dv in detail.items():
+                            if len(dk) >= 15 and (nm in dk or dk in nm):
+                                d = dv
+                                break
                 for k in ("upspeed", "dlspeed", "eta", "ratio", "path",
                           "cur_seeders", "cur_leechers", "tracker", "added",
                           "progress", "hash", "downloader"):
@@ -1006,6 +1057,9 @@ class HHClubButler(_PluginBase):
                     "progress": progress,
                     "downloader": dl_name,
                 }
+                th = HHClubButler._extract_torrent_hash(t)
+                if th:
+                    out.setdefault(th, out[HHClubButler._norm_title(name)])
             except Exception:
                 continue
         return out
@@ -1390,10 +1444,11 @@ buildHead();load();
 
         if self._exclude_zero:
             before = len(seeds)
-            seeds = [s for s in seeds if s.get("seeders", 0) > 0]
+            seeds = [s for s in seeds if s.get("cur_seeders", s.get("seeders", 0)) > 0]
             logs.append(f"已排除0做种种子 {before - len(seeds)} 个，剩 {len(seeds)} 个")
 
-        current = self._get_current_seeding(logs)
+        torrents_all = self._prefetch_downloader_torrents()
+        current = self._get_current_seeding(logs, torrents=torrents_all)
         if current.get("error") or current.get("degraded"):
             reason = current.get("error") or current.get("degraded")
             msg = f"无法获取完整当前保种情况（{reason}），为防止误推送已停止运行"
@@ -1425,11 +1480,32 @@ buildHead();load();
                     gb_map[HHClubButler._norm_title(s.get("title") or "")] = s.get("size", 0.0)
                 in_flight_gb = sum(gb_map.get(nm, 0.0) for nm in in_flight_norms)
             logs.append(f"在途（下载中未完成）{len(in_flight_norms)} 个，体积 {in_flight_gb:.1f} GB")
+            self._last_in_flight_gb = in_flight_gb
+            self._last_vol_ts = time.time()
             before = len(seeds)
-            seeds = [s for s in seeds if HHClubButler._norm_title(s.get("title") or "") not in dl_norm_all]
+            # 剔除已在下载器中的候选：种子ID 精确优先（comment 提取，零站点请求），
+            # 无种子ID 时回退标题。候选均为未做种/在途种子，Hash 必然不在下载器中，
+            # 无需为其抓详情页（避免每次运行拖慢）
+            try:
+                dl_seed_map = self._get_downloader_seed_map(logs=logs, only_completed=False)
+                dl_hash_all = self._get_downloader_hash_map(only_completed=False)
+                cand_hash_map = {}
+            except Exception as e:
+                logger.warning(f"剔除候选时构建种子ID映射失败，回退标题匹配：{e}")
+                dl_seed_map = {}
+                dl_hash_all = {}
+                cand_hash_map = {}
+            def _in_dl(s):
+                if s.get("seed_id") and dl_seed_map.get(str(s.get("seed_id"))):
+                    return True
+                h = cand_hash_map.get(str(s.get("seed_id")), "") if s.get("seed_id") else ""
+                if h and dl_hash_all and h in dl_hash_all:
+                    return True
+                return HHClubButler._norm_title(s.get("title") or "") in dl_norm_all
+            seeds = [s for s in seeds if not _in_dl(s)]
             removed = before - len(seeds)
             if removed:
-                logs.append(f"已剔除 {removed} 个已在下载器中的候选（含下载中），剩 {len(seeds)} 个")
+                logs.append(f"已剔除 {removed} 个已在下载器中的候选（含下载中，种子ID优先），剩 {len(seeds)} 个")
 
         if not current.get("degraded"):
             try:
@@ -1460,11 +1536,13 @@ buildHead();load();
                 logs.append(f"做种人数条件无法解析：{self._seeder_cond!r}，按不限处理")
             else:
                 before = len(seeds)
-                seeds = [s for s in seeds if rng[0] <= s.get("seeders", 0) <= rng[1]]
-                logs.append(f"做种人数条件 {rng[0]}~{rng[1]}：候选 {before} → {len(seeds)} 个")
+                # 保种区列表仅提供「当前做种人数」，候选种子未下载、憨憨不提供其「下载时(初始)人数」，
+                # 故按当前做种人数筛选（下载完成后以完成页初始人数为准，可能与当前不同）
+                seeds = [s for s in seeds if rng[0] <= s.get("cur_seeders", s.get("seeders", 0)) <= rng[1]]
+                logs.append(f"做种人数条件 {rng[0]}~{rng[1]}（按当前做种人数）：候选 {before} → {len(seeds)} 个")
 
         if self._mode == "wash" and current.get("seeds"):
-            result = self._optimize_wash(seeds, current.get("seeds"), eff_target, logs)
+            result = self._optimize_wash(seeds, current.get("seeds"), eff_target, in_flight_gb, logs)
         else:
             result = self._optimize_incremental(seeds, eff_target, current_gb, logs)
             result["del_seeds"] = []
@@ -1490,7 +1568,7 @@ buildHead();load();
             ok_count, fail_count, fail_list = self._push_seeds(picked, logs)
             for s in picked:
                 logger.info(f"优选新增种子: {s.get('title','')} | {s.get('size',0.0):.1f} GB | "
-                            f"初始做种 {s.get('seeders','?')} 人")
+                            f"当前做种 {s.get('cur_seeders', s.get('seeders','?'))} 人")
         else:
             logs.append("无需新增下载")
 
@@ -1562,7 +1640,8 @@ buildHead();load();
                 "2-3人": {"count": 0, "gb": 0.0},
                 "4-5人": {"count": 0, "gb": 0.0}}
         for s in final_seeds:
-            t = tier_of(s.get("seeders", 0))
+            # current 种子无 cur_seeders → 回退 seeders（下载时人数）；新增候选用当前人数
+            t = tier_of(s.get("cur_seeders", s.get("seeders", 0)))
             if t > 2:
                 t = 2
             dist[TIER_NAMES[t]]["count"] += 1
@@ -1946,14 +2025,15 @@ buildHead();load();
                 logger.warning(f"结算日志拉取失败，保留本地历史数据（今日已尝试 {attempts + 1} 次），5 分钟后自动重试")
         return data
 
-    def _monthly_agg(self, data: dict) -> dict:
-        """聚合近12个月（含当月）月度憨豆/积分"""
+    def _monthly_agg(self, data: dict, months: int = 12) -> dict:
+        """聚合近N个月（含当月）月度憨豆/积分，N 由页面可调（1-30，默认12）"""
+        months = max(1, min(30, int(months)))
         records = data.get("records") or []
         tz = pytz.timezone(settings.TZ)
         now = datetime.now(tz)
         ym_now = now.year * 12 + (now.month - 1)
         labels, bean, pt, days, notes = [], [], [], [], []
-        for i in range(11, -1, -1):
+        for i in range(months - 1, -1, -1):
             t = ym_now - i
             ty, tm = divmod(t, 12)
             tm += 1
@@ -2000,12 +2080,30 @@ buildHead();load();
         apikey = getattr(settings, "API_TOKEN", "") or ""
         return HTMLResponse(content=self._build_monthly_stats_html(apikey))
 
-    def api_monthly_stats_data(self, refresh: int = 0):
+    def api_monthly_stats_data(self, refresh: int = 0, days: int = None, months: int = None):
         try:
+            # 页面可调范围：近N日 1-30（默认15）、近N个月 1-30（默认12），本地持久化。
+            # days/months 仅当用户在页面点击 − / ＋ 时传入（同时保存）；
+            # 普通打开页面不带参数，只读持久化值，避免把默认值覆盖回写
+            rng = self.get_data("monthly_stats_range") or {}
+            if not isinstance(rng, dict):
+                rng = {}
+            try:
+                d = int(days) if days is not None else int(rng.get("days") or 15)
+            except (TypeError, ValueError):
+                d = 15
+            try:
+                m = int(months) if months is not None else int(rng.get("months") or 12)
+            except (TypeError, ValueError):
+                m = 12
+            d = max(1, min(30, d))
+            m = max(1, min(30, m))
+            if days is not None and months is not None:
+                self.save_data("monthly_stats_range", {"days": d, "months": m})
             data = self._ensure_monthly_stats(force=bool(refresh))
-            agg = self._monthly_agg(data)
+            agg = self._monthly_agg(data, m)
             records = data.get("records") or []
-            recent = sorted(records, key=lambda x: str(x.get("date", "")))[-40:]
+            recent = sorted(records, key=lambda x: str(x.get("date", "")))[-max(d + 2, 40):]
             p = self._monthly_stats_path()
             try:
                 file_size = p.stat().st_size if p and p.exists() else 0
@@ -2016,6 +2114,7 @@ buildHead();load();
                 "days": agg["days"], "notes": agg["notes"],
                 "total_bean": agg["total_bean"], "total_pt": agg["total_pt"],
                 "updated_at": agg["updated_at"], "last_fetch_date": agg["last_fetch_date"],
+                "range": {"days": d, "months": m},
                 "records_total": len(records),
                 "records": [{"date": str(r.get("date", "")),
                              "bean": float(r.get("bean") or 0),
@@ -2040,7 +2139,7 @@ buildHead();load();
         ak = _json.dumps(apikey)
         html = r"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>统计结算表</title>
+<title>结算统计表</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:"Segoe UI","PingFang SC",Arial,sans-serif;color:#F0ECFF;
@@ -2058,6 +2157,10 @@ min-height:100vh;height:100vh;height:100dvh;display:flex;flex-direction:column;o
 box-shadow:0 0 30px rgba(64,200,255,.07);margin-bottom:18px}
 .ct{display:flex;align-items:baseline;gap:10px;margin-bottom:8px}
 .ct .nm{font-size:16px;font-weight:700}.ct .sb{font-size:11px;color:#9A8FC0}
+.stp{display:inline-flex;align-items:center;gap:4px;margin:0 2px;vertical-align:1px}
+.stp button{width:20px;height:20px;line-height:1;border-radius:6px;border:1px solid rgba(64,200,255,.35);background:rgba(64,200,255,.08);color:#38D9FF;cursor:pointer;font-size:13px;padding:0;font-family:inherit}
+.stp button:hover{background:rgba(64,200,255,.22)}
+.stp b{min-width:22px;text-align:center;font-size:14px;color:#F0ECFF}
 .chart{width:100%;height:300px}
 .low{display:grid;grid-template-columns:1fr 1.15fr;gap:18px}
 .card{background:rgba(16,10,28,.72);border:1px solid rgba(255,64,160,.28);border-radius:18px;padding:16px 18px;
@@ -2103,7 +2206,7 @@ td.pt{color:#38D9FF;font-weight:600}
 </style></head><body>
 <div class="wrap">
 <div class="head">
-<div><div class="t">统计<b>结算表</b></div>
+<div><div class="t">结算<b>统计表</b></div>
 <div class="src">憨憨站保种结算日志 · 每日 0 点憨豆/积分实结</div></div>
 <button class="exit" title="关闭页面" onclick="window.close()">退出</button>
 </div>
@@ -2111,37 +2214,41 @@ td.pt{color:#38D9FF;font-weight:600}
 <div id="warn" class="warnbar"></div>
 <div id="status" class="status"><span>正在获取每月结算数据，请稍候…</span><div class="bar"><i></i></div></div>
 <div id="main" style="display:none">
-<div class="topcard"><div class="ct"><span class="nm">近30日收益</span><span class="sb">橙柱 = 憨豆 · 青柱 = 积分 · 按结算日志每日实结</span></div>
+<div class="topcard"><div class="ct"><span class="nm">近<span id="dvl">30</span>日收益</span><span class="stp"><button onclick="adjD(-1)">−</button><button onclick="adjD(1)">＋</button></span><span class="sb">橙柱 = 憨豆 · 青柱 = 积分 · 按结算日志每日实结</span></div>
 <div class="chart" id="mb"></div></div>
 <div class="low">
 <div class="card"><div class="ct"><span class="nm">保种历史累计统计</span><span class="sb">左环 = 憨豆 · 右环 = 积分</span></div>
 <div class="duals"><div class="dbox"><div class="g" id="dg1"></div><div class="dlab"><div class="r">憨豆累计</div><div class="v" id="cvb" style="color:#FF8A3C">—</div></div></div>
 <div class="dbox"><div class="g" id="dg2"></div><div class="dlab"><div class="r">积分累计</div><div class="v" id="cvp" style="color:#38D9FF">—</div></div></div></div></div>
-<div class="card"><div class="ct"><span class="nm">近12个月收益</span><span class="sb">带 * 的月份为部分数据（未满整月）· 最新月份在最上方</span></div>
+<div class="card"><div class="ct"><span class="nm">近<span id="mvl">12</span>个月收益</span><span class="stp"><button onclick="adjM(-1)">−</button><button onclick="adjM(1)">＋</button></span><span class="sb">带 * 的月份为部分数据（未满整月）· 最新月份在最上方</span></div>
 <div class="scroll30" id="tbl"></div></div>
 </div>
 </div>
 </div>
-<div class="footer" id="foot">灰显月份暂无历史记录 · 统计结算表数据来自憨憨站保种结算日志</div>
+<div class="footer" id="foot">灰显月份暂无历史记录 · 结算统计表数据来自憨憨站保种结算日志</div>
 </div>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
 <script>
 var APIKEY=__APIKEY__;
-var data=null,chb=null,chd1=null,chd2=null;
+var data=null,chb=null,chd1=null,chd2=null,R={days:15,months:12};
 function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;")}
 function fmtBig(n){if(n===null||n===undefined)return "—";return Number(n).toLocaleString()}
 function showErr(msg){var st=document.getElementById('status');st.innerHTML='<span class="err">'+esc(msg)+'</span><button class="retrybtn" onclick="location.reload()">重试</button>';}
 function showWarn(msg){var w=document.getElementById('warn');w.style.display='flex';w.innerHTML='<b>⚠ '+esc(msg)+'</b><button class="wbtn" onclick="loadData(true)">立即重试</button>';}
+function adjD(d){R.days=Math.min(30,Math.max(1,(R.days||15)+d));loadData(false,true);}
+function adjM(m){R.months=Math.min(30,Math.max(1,(R.months||12)+m));loadData(false,true);}
 function clearWarn(){var w=document.getElementById('warn');w.style.display='none';w.innerHTML='';}
-function loadData(refresh){
+function loadData(refresh,useRange){
 var t0=Date.now(),tmr=null;
 document.getElementById('status').innerHTML='<span>正在获取每月结算数据，请稍候… <b id="el">0</b> 秒</span><div class="bar"><i></i></div>';
 function tick(){var el=document.getElementById("el");if(el)el.textContent=Math.floor((Date.now()-t0)/1000);}
 tick();tmr=setInterval(tick,250);
 var url='/api/v1/plugin/HHClubButler/monthly_stats_data?apikey='+encodeURIComponent(APIKEY)+(refresh?'&refresh=1':'');
+if(useRange)url+='&days='+R.days+'&months='+R.months;
 fetch(url).then(function(r){return r.json();}).then(function(j){
 if(j&&j.error){if(tmr)clearInterval(tmr);showErr(j.error);return;}
 data=j;
+if(j.range){R=j.range;var dv=document.getElementById('dvl'),mv=document.getElementById('mvl');if(dv)dv.textContent=R.days;if(mv)mv.textContent=R.months;}
 var st=document.getElementById('status');if(tmr)clearInterval(tmr);st.style.display='none';
 document.getElementById('main').style.display='block';
 clearWarn();
@@ -2154,7 +2261,7 @@ showWarn('站点当日结算记录尚未生成，正在自动重试（每5分钟
 showWarn('今日结算数据拉取未成功，等待自动重试中（每5分钟一次）…');
 }
 var ft=document.getElementById('foot');
-ft.textContent='数据更新于 '+(data.updated_at||'—')+' · 灰显月份暂无历史记录 · 统计结算表数据来自憨憨站保种结算日志';
+ft.textContent='数据更新于 '+(data.updated_at||'—')+' · 灰显月份暂无历史记录 · 结算统计表数据来自憨憨站保种结算日志';
 if(typeof echarts==='undefined'){renderTable();return;}
 renderChart();renderTable();
 }).catch(function(e){if(tmr)clearInterval(tmr);showErr('获取数据失败：'+e.message);});
@@ -2162,7 +2269,7 @@ renderChart();renderTable();
 loadData(false);
 function renderChart(){
 chb=echarts.init(document.getElementById('mb'));
-var rec=(data.records||[]).slice(-30);
+var rec=(data.records||[]).slice(-R.days);
 var x=[],b=[],p=[];
 for(var i=0;i<rec.length;i++){var r=rec[i];x.push(String(r.date||'').slice(5));b.push(r.bean);p.push(r.pt);}
 var isM=window.innerWidth<560;
@@ -2309,12 +2416,17 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
         m_id = re.search(r'details\.php\?id=(\d+)', str(a_title.get("href") if a_title else ""))
         if m_id:
             seed_id = int(m_id.group(1))
+        # 注意：保种区列表页的数字列为「当前做种人数/当前下载人数」（#seeders/#leechers），
+        # 站点不提供未下载种子的「下载时(初始)做种人数」。
+        # seeders/now_seeders 为向后兼容保留，实际语义即当前人数；推荐使用 cur_seeders/cur_leechers
         return {
             "title": title,
             "href": href,
             "size": size,
             "seeders": seeders,
             "now_seeders": now_seeders,
+            "cur_seeders": seeders,
+            "cur_leechers": now_seeders,
             "seed_id": seed_id,
         }
 
@@ -2325,35 +2437,100 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
             logs.append("完成页未获取到数据，本次按空保种降级处理")
             result["degraded"] = "完成页未获取到数据"
             return result
-        dl_seeds = self._get_downloader_seeds(logs, torrents=torrents)
-        if dl_seeds is None:
-            logs.append("下载器未获取到种子，按站点完成页全量显示")
-            result["count"] = len(completed)
-            result["total_gb"] = sum(x.get("size", 0.0) for x in completed)
-            result["seeds"] = completed
+        # 下载器侧：种子ID 主匹配（comment 提取，零站点请求、秒级）
+        seed_map = self._get_downloader_seed_map(logs=logs)
+        # 下载器侧 hash → 名称（兜底用）
+        dl_hash_map = self._get_downloader_hash_map(torrents=torrents, only_completed=True)
+        if not dl_hash_map:
+            dl_seeds = self._get_downloader_seeds(logs, torrents=torrents)
+            if dl_seeds is None:
+                logs.append("下载器未获取到种子，按站点完成页全量显示")
+                result["count"] = len(completed)
+                result["total_gb"] = sum(x.get("size", 0.0) for x in completed)
+                result["seeds"] = completed
+                return result
+            dl_names = set(dl_seeds)
+            norm_map = {}
+            for x in completed:
+                norm_map.setdefault(HHClubButler._norm_title(x["title"]), x)
+            matched_map = {}
+            for dn in dl_names:
+                nd = HHClubButler._norm_title(dn)
+                hit = None
+                if nd in norm_map:
+                    hit = norm_map[nd]
+                elif len(nd) >= 15:
+                    for nd_key, x in norm_map.items():
+                        if len(nd_key) >= 15 and (nd in nd_key or nd_key in nd):
+                            hit = x
+                            break
+                if hit is not None:
+                    matched_map.setdefault(hit["title"], hit)
+            matched = list(matched_map.values())
+            result["count"] = len(matched)
+            result["total_gb"] = sum(x["size"] for x in matched)
+            result["seeds"] = matched
+            logs.append(f"[标题兜底-下载器无Hash] 完成页 {len(completed)} 个 ∩ 下载器做种 {len(dl_names)} 个 = 当前保种 {len(matched)} 个")
             return result
-        dl_names = set(dl_seeds)
-        norm_map = {}
+        # 下载器标题归一化（用于疑似匹配预筛 + 标题兜底）
+        dl_norm = {}
+        for dn in set(dl_hash_map.values()):
+            ndn = HHClubButler._norm_title(dn)
+            if ndn:
+                dl_norm.setdefault(ndn, dn)
+        # 种子ID 未命中的站点种子，仅对标题疑似对应下载器者补 hash（详情页兜底）。
+        # 未做种种子 hash 永远匹配不上下载器，一律不抓详情页——首次安装不再逐个请求站点
+        need_ids = []
         for x in completed:
-            norm_map.setdefault(HHClubButler._norm_title(x["title"]), x)
-        matched_map = {}
-        for dn in dl_names:
-            nd = HHClubButler._norm_title(dn)
-            hit = None
-            if nd in norm_map:
-                hit = norm_map[nd]
+            if not x.get("seed_id") or str(x.get("seed_id")) in seed_map:
+                continue
+            nd = HHClubButler._norm_title(x.get("title") or "")
+            hit_t = nd in dl_norm or (len(nd) >= 15 and any(
+                len(ndn) >= 15 and (nd in ndn or ndn in nd) for ndn in dl_norm))
+            if hit_t:
+                need_ids.append(x.get("seed_id"))
+        hash_map = {}
+        if need_ids:
+            hash_map = self._ensure_seed_hash_map(need_ids, logs)
+        matched = []
+        matched_titles = set()
+        seed_hit = 0
+        hash_hit = 0
+        for x in completed:
+            sid = str(x.get("seed_id")) if x.get("seed_id") else ""
+            hit = seed_map.get(sid)
+            if hit:
+                x["hash"] = hit.get("hash", "")
+                x["downloader"] = hit.get("downloader", "")
+                matched.append(x)
+                matched_titles.add(x["title"])
+                seed_hit += 1
+                continue
+            # Hash 兜底：详情页已补的 hash 与下载器 hash 精确比对
+            h = hash_map.get(sid, "") or x.get("hash") or ""
+            x["hash"] = h
+            if h and h in dl_hash_map:
+                matched.append(x)
+                matched_titles.add(x["title"])
+                hash_hit += 1
+                continue
+            # 标题兜底：互相包含
+            nd = HHClubButler._norm_title(x["title"])
+            hit_t = False
+            if nd in dl_norm:
+                hit_t = True
             elif len(nd) >= 15:
-                for nd_key, x in norm_map.items():
-                    if len(nd_key) >= 15 and (nd in nd_key or nd_key in nd):
-                        hit = x
+                for ndn in dl_norm:
+                    if len(ndn) >= 15 and (nd in ndn or ndn in nd):
+                        hit_t = True
                         break
-            if hit is not None:
-                matched_map.setdefault(hit["title"], hit)
-        matched = list(matched_map.values())
+            if hit_t and x["title"] not in matched_titles:
+                matched.append(x)
+                matched_titles.add(x["title"])
         result["count"] = len(matched)
         result["total_gb"] = sum(x["size"] for x in matched)
         result["seeds"] = matched
-        logs.append(f"完成页 {len(completed)} 个 ∩ 下载器做种 {len(dl_names)} 个 = 当前保种 {len(matched)} 个")
+        logs.append(f"完成页 {len(completed)} 个 ∩ 下载器做种 {len(dl_hash_map)} 个 = 当前保种 {len(matched)} 个（种子ID {seed_hit} / Hash {hash_hit} / 标题 {len(matched) - seed_hit - hash_hit}）")
         return result
 
     def _build_overview_from_current(self, cur: dict) -> dict:
@@ -2369,7 +2546,7 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
             dist[TIER_NAMES[t]]["gb"] += s.get("size", 0.0)
         total_gb = cur.get("total_gb", 0.0)
         # 优先从结算统计表本地聚合数据取最新一条（全量翻页聚合，最新=max(日期)，与页序无关），
-        # 与[统计结算表]页面同源一致；本地为空时才回退到翻页兜底抓取
+        # 与[结算统计表]页面同源一致；本地为空时才回退到翻页兜底抓取
         last_bean, last_pt, last_date = self._last_settlement_from_stats()
         if last_bean is None:
             last_bean, last_pt, last_date = self._fetch_last_settlement()
@@ -2387,6 +2564,284 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
             "dist": dist,
             "ok": not cur.get("error") and not cur.get("degraded"),
         }
+
+    # ---------- 种子 Hash 映射（本地存储 + 详情页补齐，只增不删） ----------
+
+    def _seed_hash_path(self):
+        try:
+            path = self.get_data_path()
+            if not path.exists():
+                path.mkdir(parents=True, exist_ok=True)
+            return path / "seed_hash_map.json"
+        except Exception as e:
+            logger.error(f"获取插件数据目录失败：{e}")
+            return None
+
+    def _load_seed_hash_map(self) -> dict:
+        """读取种子 Hash 映射：{updated_at, map: {seed_id: hash}}，损坏/缺失时返回空表"""
+        p = self._seed_hash_path()
+        if not p or not p.exists():
+            return {"updated_at": "", "map": {}}
+        try:
+            if p.stat().st_size == 0:
+                return {"updated_at": "", "map": {}}
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get("map"), dict):
+                return data
+            return {"updated_at": "", "map": {}}
+        except Exception as e:
+            logger.warning(f"读取种子Hash映射失败：{e}")
+            return {"updated_at": "", "map": {}}
+
+    def _save_seed_hash_map(self, data: dict):
+        """原子写入种子 Hash 映射：先写临时文件再替换，杜绝 0 字节空文件"""
+        p = self._seed_hash_path()
+        if not p:
+            return
+        try:
+            s = json.dumps(data, ensure_ascii=False, indent=1)
+        except Exception as e:
+            logger.error(f"保存种子Hash映射失败（序列化）：{e}")
+            return
+        tmp = p.with_suffix(".tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(s)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+            os.replace(tmp, p)
+        except Exception as e:
+            logger.error(f"保存种子Hash映射失败（写入）：{e}")
+
+    def _fetch_seed_hash(self, seed_id, session=None) -> str:
+        """抓取种子详情页提取 Hash 码（infoHash），失败返回空串"""
+        try:
+            if session is None:
+                session = self._session()
+            site_url = self._get_site_url()
+            r = self._get_with_retry(session, f"{site_url}/details.php?id={seed_id}",
+                                     timeout=30, retries=1, backoff=(2,))
+            # 详情页公开展示：Hash码：xxxxxxxx（40位hex）
+            m = re.search(r'Hash码[：:]\s*</[^>]*>\s*<[^>]*>\s*([0-9a-fA-F]{40})', r.text)
+            if m:
+                return m.group(1).lower()
+            m2 = re.search(r'([0-9a-fA-F]{40})', r.text)
+            if m2:
+                return m2.group(1).lower()
+        except Exception as e:
+            logger.warning(f"获取种子 {seed_id} Hash 失败：{e}")
+        return ""
+
+    def _ensure_seed_hash_map(self, seed_ids, logs=None, session=None) -> dict:
+        """对映射缺失的种子ID抓详情页补齐 Hash，增量写回，只增不删；返回映射 dict"""
+        data = self._load_seed_hash_map()
+        mp = data.get("map") or {}
+        need = []
+        for sid in seed_ids:
+            if not sid:
+                continue
+            k = str(sid)
+            if not mp.get(k):
+                need.append(k)
+        if not need:
+            return mp
+        if logs is not None:
+            logs.append(f"种子Hash映射缺失 {len(need)} 个，正在抓取详情页补齐（并发3线程）")
+        added = 0
+        if len(need) <= 6:
+            session = session or self._session()
+            for k in need:
+                h = self._fetch_seed_hash(k, session=session)
+                if h:
+                    mp[k] = h
+                    added += 1
+                time.sleep(0.2)
+        else:
+            try:
+                from concurrent.futures import ThreadPoolExecutor
+
+                def _one(k):
+                    s = self._session()
+                    try:
+                        h = self._fetch_seed_hash(k, session=s)
+                    finally:
+                        try:
+                            s.close()
+                        except Exception:
+                            pass
+                    time.sleep(0.2)
+                    return k, h
+
+                with ThreadPoolExecutor(max_workers=3) as ex:
+                    for k, h in ex.map(_one, need):
+                        if h:
+                            mp[k] = h
+                            added += 1
+            except Exception as e:
+                logger.warning(f"并发补齐Hash失败，回退串行：{e}")
+                session = session or self._session()
+                for k in need:
+                    if mp.get(k):
+                        continue
+                    h = self._fetch_seed_hash(k, session=session)
+                    if h:
+                        mp[k] = h
+                        added += 1
+                    time.sleep(0.2)
+        if added:
+            data["map"] = mp
+            data["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self._save_seed_hash_map(data)
+        if logs is not None:
+            logs.append(f"种子Hash补齐完成：新增 {added} 个，失败 {len(need) - added} 个")
+        return mp
+
+    # ---------- 下载器种子 comment 提取站点种子ID（seed_id 主匹配） ----------
+
+    @staticmethod
+    def _extract_seed_id_from_comment(comment: str) -> str:
+        """从下载器种子 comment 提取憨憨站点种子ID，形如 https://hhanclub.net/details.php?id=57488"""
+        try:
+            m = re.search(r'hhanclub\.net/details\.php\?id=(\d+)', comment or "", re.I)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+        return ""
+
+    def _get_downloader_seed_map(self, torrents: Optional[list] = None,
+                                 logs: Optional[list] = None,
+                                 only_completed: bool = True) -> dict:
+        """从下载器种子 comment 提取 {种子ID: 种子信息}，作为匹配主键（零站点请求）
+        TR：一次 RPC 请求带 comment 字段；QB：先按 tracker 筛憨憨种子，再定向查 properties 的 comment
+        only_completed=True 时仅计入 100% 完成的种子（保种统计用）；
+        候选剔除场景传 False 以包含下载中的种子（避免重复添加）
+        返回 {seed_id(str): {"hash": ..., "name": ..., "downloader": ...}}
+        """
+        out = {}
+        svcs = self._get_manage_services()
+        if not svcs:
+            return out
+        sv_types = {}
+        for name, sv in svcs.items():
+            try:
+                sv_types[name] = str(sv.type or sv.config.type or "").lower()
+            except Exception:
+                sv_types[name] = ""
+        for dl_name, sv in svcs.items():
+            dl_type = sv_types.get(dl_name, "")
+            try:
+                if "transmission" in dl_type:
+                    trc = getattr(sv.instance, "trc", None)
+                    if trc is None:
+                        continue
+                    tts = trc.get_torrents(arguments=["id", "name", "hashString", "comment",
+                                                      "trackers", "trackerList", "percentDone"])
+                    for t in tts or []:
+                        try:
+                            # 仅计入 100% 完成的种子（下载中的不算保种）
+                            if only_completed:
+                                done = t.get("percentDone")
+                                if done is not None and float(done) < 1.0:
+                                    continue
+                            sid = HHClubButler._extract_seed_id_from_comment(str(t.get("comment") or ""))
+                            if not sid:
+                                continue
+                            out.setdefault(sid, {
+                                "hash": str(t.get("hashString") or ""),
+                                "name": str(t.get("name") or ""),
+                                "downloader": dl_name,
+                            })
+                        except Exception:
+                            continue
+                elif "qbittorrent" in dl_type:
+                    qbc = getattr(sv.instance, "qbc", None)
+                    if qbc is None:
+                        continue
+                    infos = qbc.torrents_info()
+                    for it in infos or []:
+                        try:
+                            tracker = str(it.get("tracker") or "")
+                            if "hhanclub" not in tracker.lower():
+                                continue
+                            h = str(it.get("hash") or "")
+                            if not h:
+                                continue
+                            # 仅计入 100% 完成的种子（下载中的不算保种）
+                            if only_completed:
+                                progress = it.get("progress")
+                                if progress is not None and float(progress) < 1.0:
+                                    continue
+                            comment = ""
+                            try:
+                                p = qbc.torrents_properties(torrent_hash=h)
+                                comment = str(p.get("comment") or "") if isinstance(p, dict) \
+                                    else str(getattr(p, "comment", "") or "")
+                            except Exception:
+                                comment = ""
+                            sid = HHClubButler._extract_seed_id_from_comment(comment)
+                            if not sid:
+                                continue
+                            out.setdefault(sid, {
+                                "hash": h,
+                                "name": str(it.get("name") or ""),
+                                "downloader": dl_name,
+                            })
+                        except Exception:
+                            continue
+            except Exception as e:
+                logger.warning(f"下载器 {dl_name} comment 提取种子ID失败：{e}")
+                continue
+        if logs is not None:
+            logs.append(f"下载器 comment 提取憨憨种子ID映射 {len(out)} 个（种子ID主匹配）")
+        return out
+
+    @staticmethod
+    def _extract_torrent_hash(t) -> str:
+        """从下载器种子对象/dict 提取 infoHash，兼容 Transmission（hashString）与 qBittorrent（hash）"""
+        try:
+            if isinstance(t, dict):
+                return str(t.get("hash") or t.get("hashString") or "")
+            return str(getattr(t, "hash", None) or getattr(t, "hashString", None) or "")
+        except Exception:
+            return ""
+
+    def _get_downloader_hash_map(self, torrents=None, only_completed=True) -> dict:
+        """返回 {hash: 名称}：仅按完成度过滤；不按 tracker 强滤（与 _get_downloader_seeds 语义对齐，
+        hash 精确匹配本身不会误配非本站种子，避免 TR 适配器 tracker 字段提取差异导致漏收）"""
+        out = {}
+        if torrents is None:
+            try:
+                torrents = self._fetch_all_downloader_torrents() or []
+            except Exception as e:
+                logger.warning(f"预取下载器种子失败：{e}")
+                torrents = []
+        if not torrents:
+            return out
+        svcs = self._get_manage_services()
+        sv_types = {}
+        for name, sv in svcs.items():
+            try:
+                sv_types[name] = str(sv.type or sv.config.type or "").lower()
+            except Exception:
+                sv_types[name] = ""
+        for dl_name, t in torrents:
+            try:
+                if only_completed:
+                    progress = HHClubButler._get_progress_ratio(t, sv_types.get(dl_name, ""))
+                    if progress is not None and progress < 1.0:
+                        continue
+                h = self._extract_torrent_hash(t)
+                nm = t.get("name") if isinstance(t, dict) else getattr(t, "name", "")
+                if h and nm and h not in out:
+                    out[h] = nm
+            except Exception:
+                continue
+        return out
 
     def _fetch_completed(self, logs: list) -> List[dict]:
         uid = self._get_site_uid()
@@ -2756,12 +3211,16 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
                 return 0
         except Exception:
             return 0
+        del_hashes = set()
         del_norms = set()
         for s in seeds:
+            h = s.get("hash") or ""
+            if h:
+                del_hashes.add(str(h).lower())
             n = HHClubButler._norm_title(s.get("title") or "")
             if n:
                 del_norms.add(n)
-        if not del_norms:
+        if not del_hashes and not del_norms:
             return 0
         del_ids = []
         for t in torrents:
@@ -2771,7 +3230,11 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
                          else getattr(t, "hash", None) or getattr(t, "hashString", ""))
             except Exception:
                 continue
-            if HHClubButler._norm_match(tname, del_norms):
+            # Hash 精确优先（根治标题差异误删），无 Hash 时标题兜底
+            if thash and str(thash).lower() in del_hashes:
+                del_ids.append(thash)
+                continue
+            if del_norms and HHClubButler._norm_match(tname, del_norms):
                 del_ids.append(thash)
         if del_ids:
             try:
@@ -2924,7 +3387,9 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
 
     @staticmethod
     def _tier_sort_key(s: dict):
-        return (tier_of(s.get("seeders", 1)), -s.get("size", 0.0))
+        # 候选池种子来自保种区列表（仅当前人数），档位按当前做种人数近似；
+        # 完成页种子（current）用 seeders=下载时人数，见 _optimize_wash
+        return (tier_of(s.get("cur_seeders", s.get("seeders", 1))), -s.get("size", 0.0))
 
     def _optimize_incremental(self, seeds: list, eff_target: float,
                               current_gb: float, logs: list) -> dict:
@@ -2942,24 +3407,27 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
         logs.append(f"增量优选：剩余可增 {cap:.1f} GB，按档位高→低补 {len(picked)} 个，新增 {used:.1f} GB")
         for s in picked[:8]:
             logs.append(f"  + {s.get('title','')} | {s.get('size',0.0):.1f} GB | "
-                        f"初始做种 {s.get('seeders','?')} 人")
+                        f"当前做种 {s.get('cur_seeders', s.get('seeders','?'))} 人")
         if len(picked) > 8:
             logs.append(f"  …等共 {len(picked)} 个")
         return {"picked": picked, "total_gb": used, "del_seeds": []}
 
     def _optimize_wash(self, candidates: list, current: list,
-                       eff_target: float, logs: list) -> dict:
+                       eff_target: float, in_flight_gb: float, logs: list) -> dict:
         cap = self._target_volume
         if not cap or cap <= 0:
             logs.append("目标体积为0（不限），换种模式不删除任何种子")
             return {"picked": [], "del_seeds": [], "total_gb": 0.0, "keep_count": len(current)}
         cur_titles = {s["title"] for s in current}
-        # 从当前在保种子开始，默认全部保留
+        # 从当前在保种子开始，默认全部保留；体积基准含在途（下载中未完成）种子，
+        # 保证「憨憨在保 + 在途 + 新增 - 删除」的总占用不超过目标体积
         final = list(current)
-        total_gb = sum(s.get("size", 0.0) for s in final)
+        total_gb = sum(s.get("size", 0.0) for s in final) + in_flight_gb
         # 新候选按档位优先级排序（高档位先处理，同档位大体积先）
+        # 候选为保种区列表种子，档位按其「当前做种人数」近似；
+        # final（已完成种子）的档位用完成页「下载时人数」（seeders），两者语义不同
         new_cands = [s for s in candidates if s["title"] not in cur_titles]
-        new_cands.sort(key=lambda s: (tier_of(s.get("seeders", 1)), -s.get("size", 0.0)))
+        new_cands.sort(key=lambda s: (tier_of(s.get("cur_seeders", s.get("seeders", 1))), -s.get("size", 0.0)))
         del_map = {}
         for cand in new_cands:
             csize = cand.get("size", 0.0)
@@ -2971,7 +3439,7 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
                 total_gb += csize
                 continue
             # 放不下：只踢比候选档位更低的种子（低档优先、小体积优先）
-            cand_tier = tier_of(cand.get("seeders", 1))
+            cand_tier = tier_of(cand.get("cur_seeders", cand.get("seeders", 1)))
             victims = [s for s in final
                        if tier_of(s.get("seeders", 1)) > cand_tier
                        and s["title"] not in del_map]
@@ -2997,12 +3465,12 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
         del_seeds = list(del_map.values())
         add_seeds = [s for s in final if s["title"] not in cur_titles]
         keep_count = len(final) - len(add_seeds)
-        logs.append(f"换种优选（体积上限 {cap:g} GB）：构建 {len(final)} 个"
+        logs.append(f"换种优选（体积上限 {cap:g} GB，含在途 {in_flight_gb:.1f} GB）：构建 {len(final)} 个"
                     f"（保留当前 {keep_count} + 新增 {len(add_seeds)}），"
-                    f"删除低档位 {len(del_seeds)} 个，最终体积 {total_gb:.1f} GB")
+                    f"删除低档位 {len(del_seeds)} 个，最终占用 {total_gb:.1f} GB")
         for s in add_seeds[:8]:
             logs.append(f"  + 新增: {s.get('title','')} | {s.get('size',0.0):.1f} GB | "
-                        f"初始做种 {s.get('seeders','?')} 人")
+                        f"当前做种 {s.get('cur_seeders', s.get('seeders','?'))} 人")
         if len(add_seeds) > 8:
             logs.append(f"  …等共 {len(add_seeds)} 个新增")
         for s in del_seeds[:8]:
