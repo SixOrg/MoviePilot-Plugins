@@ -15,7 +15,7 @@ class CleanUninstall(_PluginBase):
     # 插件描述
     plugin_desc = "无痕卸载插件"
     # 插件图标
-    plugin_icon = "cleanuninstall.png"
+    plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/cleanuninstall/cleanuninstall.png"
     # 插件版本
     plugin_version = "1.0"
     # 插件作者
