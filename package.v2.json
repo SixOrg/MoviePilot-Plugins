@@ -4,7 +4,7 @@
     "description": "无痕卸载插件",
     "labels": "工具,卸载,清理",
     "version": "1.0",
-    "icon": "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/cleanuninstall/cleanuninstall.png",
+    "icon": "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/cleanuninstall/uninstall.png",
     "author": "六个橙子",
     "author_url": "https://github.com/SixOrg",
     "level": 1,
