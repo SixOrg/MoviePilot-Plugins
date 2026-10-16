@@ -9,7 +9,7 @@
     "author_url": "https://github.com/SixOrg",
     "level": 1,
     "v3": true,
-    "release": false,
+    "release": true,
     "history": {
       "1.0": "首次发布：彻底卸载其他插件，删除配置、数据、代码和备份无残留"
     }
