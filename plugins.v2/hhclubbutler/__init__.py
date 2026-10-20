@@ -30,6 +30,7 @@ from app.schemas.types import NotificationType
 from fastapi.responses import HTMLResponse
 
 import requests
+import base64
 
 lock = threading.Lock()
 
@@ -73,12 +74,26 @@ TIER_BADGE = {
 HOSTS_MARK_START = '# >>> HHClubButler Hosts >>>'
 HOSTS_MARK_END = '# <<< HHClubButler Hosts <<<'
 
+# 账号等级规则（来源 wiki.hhanclub.net/zh/站点规则/账号规则）
+# 字段：name=中文名 en=英文名 weeks=注册周数(≥) points=做种积分(>) down=下载量GB(≥) ratio=分享率(>)
+LEVEL_RULES = (
+    {"name": "憨头憨脑", "en": "User",          "weeks": 0,   "points": 0,        "down": 0,    "ratio": 0.0},
+    {"name": "憨声憨气", "en": "Power User",    "weeks": 0,   "points": 80000,    "down": 50,   "ratio": 1.05},
+    {"name": "憨态可掬", "en": "Elite User",    "weeks": 8,   "points": 150000,   "down": 120,  "ratio": 1.55},
+    {"name": "明姿憨憨", "en": "Crazy User",    "weeks": 15,  "points": 300000,   "down": 300,  "ratio": 2.05},
+    {"name": "裝憨打呆", "en": "Insane User",   "weeks": 25,  "points": 500000,   "down": 500,  "ratio": 2.55},
+    {"name": "憨状可掬", "en": "Veteran User",  "weeks": 40,  "points": 900000,   "down": 750,  "ratio": 3.05},
+    {"name": "憨痴可人", "en": "Extreme User",  "weeks": 60,  "points": 1100000,  "down": 1000, "ratio": 3.55},
+    {"name": "憨笑如花", "en": "Ultimate User", "weeks": 80,  "points": 1300000,  "down": 1500, "ratio": 4.05},
+    {"name": "满面娇憨", "en": "Nexus Master",  "weeks": 100, "points": 1500000,  "down": 3000, "ratio": 4.55},
+)
+
 
 class HHClubButler(_PluginBase):
     plugin_name = "憨憨保种区管家"
-    plugin_desc = "自动优选添加及换种工具\n保种管理器/Hosts加速"
+    plugin_desc = "自动优选添加及换种工具\n保种管理器/数据与等级/结算统计/Hosts加速"
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
-    plugin_version = "2.6"
+    plugin_version = "2.7"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "hhclubbutler_"
@@ -239,6 +254,9 @@ class HHClubButler(_PluginBase):
         }, {
             "path": "/monthly_stats_data", "endpoint": self.api_monthly_stats_data,
             "methods": ["GET"], "auth": "apikey", "summary": "结算统计表数据",
+        }, {
+            "path": "/level", "endpoint": self.api_level_page,
+            "methods": ["GET"], "auth": "apikey", "summary": "数据与等级独立页",
         }]
 
     def get_service(self) -> List[Dict[str, Any]]:
@@ -249,6 +267,18 @@ class HHClubButler(_PluginBase):
             "name": "憨憨保种区管家保种优选服务",
             "trigger": CronTrigger.from_crontab(self._cron),
             "func": self.run,
+            "kwargs": {}
+        }, {
+            "id": "HHClubButlerProfileSnap",
+            "name": "憨憨管家·每日个人页快照(0:02)",
+            "trigger": CronTrigger.from_crontab("2 0 * * *"),
+            "func": self.job_profile_snapshot,
+            "kwargs": {}
+        }, {
+            "id": "HHClubButlerQualifiedSnap",
+            "name": "憨憨管家·每日达标统计(23:55)",
+            "trigger": CronTrigger.from_crontab("55 23 * * *"),
+            "func": self.job_qualified_snapshot,
             "kwargs": {}
         }]
 
@@ -724,6 +754,10 @@ class HHClubButler(_PluginBase):
             'style="display:inline-flex;align-items:center;gap:6px;padding:7px 18px;background:rgba(66,165,245,.12);'
             'color:#42A5F5;text-decoration:none;border-radius:4px;font-size:13px;font-weight:500;border:1px solid rgba(66,165,245,.3);">'
             '📊 结算统计表</a>'
+            '<a href="/api/v1/plugin/HHClubButler/level?apikey=' + getattr(settings, 'API_TOKEN', '') + '" target="_blank" '
+            'style="display:inline-flex;align-items:center;gap:6px;padding:7px 18px;background:rgba(66,165,245,.12);'
+            'color:#42A5F5;text-decoration:none;border-radius:4px;font-size:13px;font-weight:500;border:1px solid rgba(66,165,245,.3);">'
+            '📈 数据与等级</a>'
             '<a href="/api/v1/plugin/HHClubButler/rescue_panel?apikey=' + getattr(settings, 'API_TOKEN', '') + '" target="_blank"'
             'style="display:inline-flex;align-items:center;gap:6px;padding:7px 18px;background:rgba(66,165,245,.12);'
             'color:#42A5F5;text-decoration:none;border-radius:4px;font-size:13px;font-weight:500;border:1px solid rgba(66,165,245,.3);">'
@@ -2104,6 +2138,17 @@ buildHead();load();
             agg = self._monthly_agg(data, m)
             records = data.get("records") or []
             recent = sorted(records, key=lambda x: str(x.get("date", "")))[-max(d + 2, 40):]
+            qmap = (self._load_daily().get("qualified") or {})
+
+            def _qrec(r):
+                q = qmap.get(str(r.get("date", ""))) or {}
+                return {
+                    "date": str(r.get("date", "")),
+                    "bean": float(r.get("bean") or 0),
+                    "pt": float(r.get("pt") or 0),
+                    "qcount": q.get("count"),
+                    "qsize": q.get("size_gb"),
+                }
             p = self._monthly_stats_path()
             try:
                 file_size = p.stat().st_size if p and p.exists() else 0
@@ -2116,9 +2161,7 @@ buildHead();load();
                 "updated_at": agg["updated_at"], "last_fetch_date": agg["last_fetch_date"],
                 "range": {"days": d, "months": m},
                 "records_total": len(records),
-                "records": [{"date": str(r.get("date", "")),
-                             "bean": float(r.get("bean") or 0),
-                             "pt": float(r.get("pt") or 0)} for r in recent],
+                "records": [_qrec(r) for r in recent],
                 "fetch_state": getattr(self, "_fetch_state", ""),
                 "attempt_count": int(data.get("attempt_count") or 0),
                 "diag": {
@@ -2162,6 +2205,19 @@ box-shadow:0 0 30px rgba(64,200,255,.07);margin-bottom:18px}
 .stp button:hover{background:rgba(64,200,255,.22)}
 .stp b{min-width:22px;text-align:center;font-size:14px;color:#F0ECFF}
 .chart{width:100%;height:300px}
+/* 柱状图下方达标三行对齐表格（列与柱严格对齐；窄屏整体横滑） */
+.qwrap{overflow-x:auto;overflow-y:hidden}
+.qinner{min-width:920px}
+.qtbl{display:grid;grid-template-columns:40px 80px repeat(10,minmax(56px,1fr));
+padding-right:14px;border-top:1px solid rgba(64,200,255,.22);margin-top:2px}
+.qc{display:flex;align-items:center;justify-content:center;text-align:center;white-space:nowrap;overflow:hidden;
+padding:5px 1px;border-right:1px solid rgba(64,200,255,.10);border-bottom:1px solid rgba(64,200,255,.10);font-size:11px}
+.qc.ax{border-right:none}
+.qc.rl{justify-content:flex-end;padding-right:8px;font-size:10px;color:#9A8FC0;font-weight:600;letter-spacing:.3px}
+.qc.q{color:#34D399;font-weight:700;font-size:13px}
+.qc.s{color:#38D9FF;font-weight:600;font-size:12px}
+.qc.d{color:#9A8FC0;font-size:10.5px;border-bottom:1px solid rgba(64,200,255,.30)}
+.qc.mute{color:#5d5478}
 .low{display:grid;grid-template-columns:1fr 1.15fr;gap:18px}
 .card{background:rgba(16,10,28,.72);border:1px solid rgba(255,64,160,.28);border-radius:18px;padding:16px 18px;
 box-shadow:0 0 24px rgba(255,64,160,.07)}
@@ -2214,8 +2270,11 @@ td.pt{color:#38D9FF;font-weight:600}
 <div id="warn" class="warnbar"></div>
 <div id="status" class="status"><span>正在获取每月结算数据，请稍候…</span><div class="bar"><i></i></div></div>
 <div id="main" style="display:none">
-<div class="topcard"><div class="ct"><span class="nm">近<span id="dvl">30</span>日收益</span><span class="stp"><button onclick="adjD(-1)">−</button><button onclick="adjD(1)">＋</button></span><span class="sb">橙柱 = 憨豆 · 青柱 = 积分 · 按结算日志每日实结</span></div>
-<div class="chart" id="mb"></div></div>
+<div class="topcard"><div class="ct"><span class="nm">近<span id="dvl">30</span>日收益</span><span class="stp"><button onclick="adjD(-1)">−</button><button onclick="adjD(1)">＋</button></span><span class="sb">橙柱 = 憨豆 · 青柱 = 积分 · 按结算日志每日实结 · 下方表格为每日 23:55 记录的达标数量(绿)/体积(青)</span></div>
+<div class="qwrap"><div class="qinner">
+<div class="chart" id="mb"></div>
+<div class="qtbl" id="qtbl"></div>
+</div></div></div>
 <div class="low">
 <div class="card"><div class="ct"><span class="nm">保种历史累计统计</span><span class="sb">左环 = 憨豆 · 右环 = 积分</span></div>
 <div class="duals"><div class="dbox"><div class="g" id="dg1"></div><div class="dlab"><div class="r">憨豆累计</div><div class="v" id="cvb" style="color:#FF8A3C">—</div></div></div>
@@ -2267,6 +2326,18 @@ renderChart();renderTable();
 }).catch(function(e){if(tmr)clearInterval(tmr);showErr('获取数据失败：'+e.message);});
 }
 loadData(false);
+function fmtSizeTB(gb){if(gb===null||gb===undefined)return null;return (Number(gb)/1024).toFixed(2);}
+function buildQTable(rec){
+var tb=document.getElementById('qtbl');if(!tb)return;
+var n=rec.length;
+tb.style.gridTemplateColumns='40px 80px repeat('+n+',minmax(56px,1fr))';
+var inner=document.querySelector('.qinner');if(inner)inner.style.minWidth=Math.max(920,134+n*60)+'px';
+function row(lab,cls,fn){var h='<div class="qc ax"></div><div class="qc rl">'+lab+'</div>';for(var i=0;i<n;i++){h+='<div class="qc '+cls+'">'+fn(rec[i])+'</div>';}return h;}
+tb.innerHTML=
+row('达标数量(个)','q',function(r){return (r.qcount===null||r.qcount===undefined)?'<span class="mute">—</span>':String(r.qcount);})+
+row('达标体积(TB)','s',function(r){var v=fmtSizeTB(r.qsize);return v===null?'<span class="mute">—</span>':v;})+
+row('日期','d',function(r){var d=String(r.date||'');return d?d.slice(5).replace('-','/'):'';});
+}
 function renderChart(){
 chb=echarts.init(document.getElementById('mb'));
 var rec=(data.records||[]).slice(-R.days);
@@ -2274,16 +2345,19 @@ var x=[],b=[],p=[];
 for(var i=0;i<rec.length;i++){var r=rec[i];x.push(String(r.date||'').slice(5));b.push(r.bean);p.push(r.pt);}
 var isM=window.innerWidth<560;
 chb.setOption({backgroundColor:'transparent',
-tooltip:{trigger:'axis',triggerOn:'click',renderMode:'richText',confine:true,textStyle:{fontSize:11,color:'#F0ECFF',lineHeight:15},backgroundColor:'rgba(21,13,36,.95)',borderColor:'rgba(64,200,255,.3)',padding:[6,8]},
-grid:{left:8,right:14,top:30,bottom:24,containLabel:true},
+tooltip:{trigger:'axis',triggerOn:'click',renderMode:'richText',confine:true,textStyle:{fontSize:11,color:'#F0ECFF',lineHeight:15},backgroundColor:'rgba(21,13,36,.95)',borderColor:'rgba(64,200,255,.3)',padding:[6,8],
+formatter:function(ps){var r=rec[ps[0].dataIndex];var d=String((r&&r.date)||'').slice(5).replace('-','/');var h='<b>'+d+'</b><br/>憨豆：'+fmtBig(r.bean)+'<br/>积分：'+fmtBig(r.pt);if(r.qcount!==null&&r.qcount!==undefined){h+='<br/>达标数量：<span style="color:#34D399">'+r.qcount+' 个</span><br/>达标体积：<span style="color:#38D9FF">'+fmtSizeTB(r.qsize)+' TB</span>';}return h;}},
+grid:{left:120,right:14,top:30,bottom:8},
 legend:{top:0,itemWidth:14,itemHeight:8,textStyle:{fontSize:11,color:'#A79BC9'}},
-xAxis:{type:'category',data:x,axisLabel:{fontSize:isM?7:9,color:'#9A8FC0',interval:0,formatter:function(v,i){var d=String((rec[i]&&rec[i].date)||'');return d?d.slice(5).replace('-','/'):''}}},
+xAxis:{type:'category',data:x,axisTick:{show:false},axisLine:{show:false},axisLabel:{show:false}},
 yAxis:{type:'value',axisLabel:{fontSize:10,color:'#9A8FC0',formatter:function(v){return v>=10000?(v/10000).toFixed(1).replace('.0','')+'万':v}},splitLine:{lineStyle:{color:'rgba(64,200,255,.12)'}}},
 series:[
 {name:'憨豆',type:'bar',data:b,itemStyle:{color:'#FF8A3C',borderRadius:[4,4,0,0]},
 label:{show:true,position:'top',fontSize:9,color:'#FF8A3C',distance:2,formatter:function(p){return (p.value===null||p.value===undefined)?'':fmtBig(p.value)}},labelLayout:{hideOverlap:true}},
 {name:'积分',type:'bar',data:p,itemStyle:{color:'#38D9FF',borderRadius:[4,4,0,0]},
 label:{show:true,position:'top',fontSize:9,color:'#38D9FF',distance:2,formatter:function(p){return (p.value===null||p.value===undefined)?'':fmtBig(p.value)}},labelLayout:{hideOverlap:true}}]});
+buildQTable(rec);
+if(chb)chb.resize();
 chd1=echarts.init(document.getElementById('dg1'));
 chd2=echarts.init(document.getElementById('dg2'));
 var tb=(data.total_bean===undefined||data.total_bean===null)?0:Number(data.total_bean);
@@ -2315,6 +2389,651 @@ document.getElementById('tbl').innerHTML='<table><thead><tr><th>月份</th><th>�
 }
 </script></body></html>"""
         return html.replace("__APIKEY__", ak)
+
+    # ================= 数据与等级 =================
+    def _level_cache_path(self):
+        try:
+            path = self.get_data_path()
+            if not path.exists():
+                path.mkdir(parents=True, exist_ok=True)
+            return path / "level_cache.json"
+        except Exception as e:
+            logger.error(f"获取插件数据目录失败：{e}")
+            return None
+
+    def _load_level_cache(self) -> dict:
+        p = self._level_cache_path()
+        if not p or not p.exists():
+            return {}
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"读取等级缓存失败：{e}")
+            return {}
+
+    def _save_level_cache(self, data: dict):
+        p = self._level_cache_path()
+        if not p:
+            return
+        try:
+            tmp = p.with_name(p.name + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            tmp.replace(p)
+        except Exception as e:
+            logger.error(f"保存等级缓存失败：{e}")
+
+    # ================= 每日本地存档（昨日全站增量 / 保种达标统计） =================
+    def _daily_path(self):
+        try:
+            path = self.get_data_path()
+            if not path.exists():
+                path.mkdir(parents=True, exist_ok=True)
+            return path / "daily_snapshots.json"
+        except Exception as e:
+            logger.error(f"获取插件数据目录失败：{e}")
+            return None
+
+    def _load_daily(self) -> dict:
+        p = self._daily_path()
+        empty = {"snap": {}, "qualified": {}}
+        if not p or not p.exists():
+            return empty
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            if not isinstance(d, dict):
+                return empty
+            if not isinstance(d.get("snap"), dict):
+                d["snap"] = {}
+            if not isinstance(d.get("qualified"), dict):
+                d["qualified"] = {}
+            return d
+        except Exception as e:
+            logger.warning(f"读取每日存档失败：{e}")
+            return empty
+
+    def _save_daily(self, data: dict):
+        p = self._daily_path()
+        if not p:
+            return
+        try:
+            # 仅保留最近 60 天，避免文件无限膨胀
+            for key in ("snap", "qualified"):
+                m = data.get(key)
+                if isinstance(m, dict):
+                    keep = sorted(m.keys())[-60:]
+                    data[key] = {k: m[k] for k in keep}
+            tmp = p.with_name(p.name + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+            tmp.replace(p)
+        except Exception as e:
+            logger.error(f"保存每日存档失败：{e}")
+
+    @staticmethod
+    def _is_qualified(text) -> bool:
+        """与保种管理器「今日达标」列同一判定规则"""
+        q = str(text or "").strip()
+        return ("已达" in q) or q == "是" or q == "Y" or q == "✓" \
+            or ("✔" in q) or ("OK" in q)
+
+    def job_profile_snapshot(self):
+        """每日 0:02：抓个人页，按日期记录憨豆/做种积分/上传量快照（权威覆盖当日）"""
+        try:
+            prof = self._fetch_user_profile()
+            today = datetime.now().strftime("%Y-%m-%d")
+            data = self._load_daily()
+            data["snap"][today] = {
+                "bean": prof.get("bean"),
+                "points": prof.get("points"),
+                "upload_gb": prof.get("upload_gb"),
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            self._save_daily(data)
+            logger.info(f"每日个人页快照已记录：{today}")
+        except Exception as e:
+            logger.error(f"每日个人页快照失败：{e}")
+
+    def job_qualified_snapshot(self):
+        """每日 23:55：抓完成页，统计当日保种区达标种子数量与总体积"""
+        try:
+            logs = []
+            items = self._fetch_completed(logs)
+            if not items:
+                logger.warning("每日达标统计：完成页为空或抓取失败，本次不记录")
+                return
+            count = 0
+            size_gb = 0.0
+            for it in items:
+                if self._is_qualified(it.get("qualified")):
+                    count += 1
+                    try:
+                        size_gb += float(it.get("size") or 0)
+                    except (TypeError, ValueError):
+                        pass
+            today = datetime.now().strftime("%Y-%m-%d")
+            data = self._load_daily()
+            data["qualified"][today] = {
+                "count": count,
+                "size_gb": round(size_gb, 2),
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            self._save_daily(data)
+            logger.info(f"每日达标统计已记录：{today} 数量={count} 体积={size_gb:.1f}GB")
+        except Exception as e:
+            logger.error(f"每日达标统计失败：{e}")
+
+    def _ensure_today_snap(self, prof: dict):
+        """页面打开兜底：当天 0:02 快照缺失时补记当前值（仅缺失时，绝不覆盖定时记录）"""
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            data = self._load_daily()
+            if today not in data["snap"]:
+                data["snap"][today] = {
+                    "bean": prof.get("bean"),
+                    "points": prof.get("points"),
+                    "upload_gb": prof.get("upload_gb"),
+                    "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "(补)",
+                }
+                self._save_daily(data)
+        except Exception as e:
+            logger.warning(f"补记当日快照失败：{e}")
+
+    def _daily_inc(self) -> dict:
+        """昨日全站增量 = 最近两个相邻日期 0:02 快照之差（只读本地记录，不临时抓取）"""
+        inc = {"bean": None, "points": None, "upload": None}
+        snap = self._load_daily().get("snap") or {}
+        keys = sorted(snap.keys())
+        if len(keys) < 2:
+            return inc
+        a = snap[keys[-2]]
+        b = snap[keys[-1]]
+        for field, out, nd in (("bean", "bean", 1), ("points", "points", 1),
+                               ("upload_gb", "upload", 2)):
+            va, vb = a.get(field), b.get(field)
+            if isinstance(va, (int, float)) and isinstance(vb, (int, float)):
+                inc[out] = round(float(vb) - float(va), nd)
+        return inc
+
+    @staticmethod
+    def _fmt_wan(v: float) -> str:
+        if v >= 100000000:
+            return f"{v / 100000000:.2f} 亿"
+        if v >= 10000:
+            return f"{v / 10000:.1f} 万"
+        return f"{v:,.0f}"
+
+    @staticmethod
+    def _fmt_comma(v: float) -> str:
+        return f"{v:,.1f}".rstrip("0").rstrip(".")
+
+    @staticmethod
+    def _fmt_inc(v) -> str:
+        """增量显示：+8,650 / +120.5 GB"""
+        if v is None:
+            return "积累中"
+        return f"{v:+,.1f}".rstrip("0").rstrip(".")
+
+    def _fetch_user_profile(self) -> dict:
+        """抓取 userdetails 个人数据（UID 从主页自动识别，不写死）"""
+        session = self._session()
+        uid = self._get_site_uid()
+        base = self._get_site_url().rstrip("/")
+        url = f"{base}/userdetails.php?id={uid}" if uid else f"{base}/userdetails.php"
+        r = HHClubButler._get_with_retry(session, url, timeout=30)
+        soup = BeautifulSoup(r.text, "html.parser")
+        txt = soup.get_text(" ", strip=True)
+
+        def num(label):
+            m = re.search(re.escape(label) + r'\s*[:：]?\s*([\d,]+\.?\d*)', txt)
+            return float(m.group(1).replace(",", "")) if m else None
+
+        def size(label):
+            m = re.search(re.escape(label) + r'\s*[:：]?\s*([\d.,]+\s*(?:TB|GB|MB|KB))', txt, re.I)
+            return size_to_gb(m.group(1)) if m else None
+
+        def raw(label):
+            m = re.search(re.escape(label) + r'\s*[:：]?\s*([\d.,]+\s*(?:TB|GB|MB|KB))', txt, re.I)
+            return m.group(1) if m else ""
+
+        def str_of(label):
+            m = re.search(re.escape(label) + r'\s*[:：]?\s*([^\s]+)', txt)
+            return m.group(1) if m else ""
+
+        # 先取“实际”值，再临时改名避免误匹配主字段
+        real_ratio = num("实际分享率")
+        real_upload_gb = size("实际上传量")
+        real_down_gb = size("实际下载量")
+        txt2 = txt.replace("实际分享率", "实分").replace("实际上传量", "实传").replace("实际下载量", "实载")
+        upload_gb = size("上传量")
+        download_gb = size("下载量")
+        ratio = num("分享率")
+        bean = num("憨豆")
+        points = num("做种积分")
+        invite = num("邀请")
+        hr_m = re.search(r'H&?R\s*[:：]?\s*(\d+)\s*/\s*(\d+)\s*/\s*(\d+)', txt)
+        hr = "/".join(hr_m.groups()) if hr_m else ""
+        reg_m = re.search(r'加入日期\s*[:：]?\s*(\d{4}-\d{1,2}-\d{1,2})', txt)
+        reg_date = reg_m.group(1) if reg_m else ""
+        weeks = 0
+        if reg_date:
+            try:
+                weeks = max(0, (datetime.now() - datetime.strptime(reg_date, "%Y-%m-%d")).days // 7)
+            except Exception:
+                weeks = 0
+        return {
+            "username": str_of("用户名"),
+            "upload_raw": raw("上传量"), "download_raw": raw("下载量"),
+            "upload_gb": upload_gb, "download_gb": download_gb,
+            "real_upload_gb": real_upload_gb, "real_down_gb": real_down_gb,
+            "ratio": ratio, "real_ratio": real_ratio,
+            "bean": bean, "points": points,
+            "invite": invite, "hr": hr,
+            "reg_date": reg_date, "weeks": weeks,
+            "special_level": str_of("等级"),
+        }
+
+    def _compute_level(self, prof: dict) -> dict:
+        weeks = prof["weeks"]
+        points = prof["points"] or 0
+        down = prof["download_gb"] or 0
+        ratio = prof["ratio"] or 0
+        cur = 0
+        for i, rule in enumerate(LEVEL_RULES):
+            if weeks >= rule["weeks"] and points > rule["points"] \
+                    and down >= rule["down"] and ratio > rule["ratio"]:
+                cur = i
+        cur_rule = LEVEL_RULES[cur]
+        nxt = LEVEL_RULES[cur + 1] if cur + 1 < len(LEVEL_RULES) else None
+        radar = {"weeks": 100.0, "points": 100.0, "down": 100.0, "ratio": 100.0}
+        gaps = {"points": 0.0, "down": 0.0, "ratio": 0.0, "weeks": 0}
+        if nxt:
+            radar["weeks"] = min(100.0, weeks / nxt["weeks"] * 100) if nxt["weeks"] else 100.0
+            radar["points"] = min(100.0, points / nxt["points"] * 100) if nxt["points"] else 100.0
+            radar["down"] = min(100.0, down / nxt["down"] * 100) if nxt["down"] else 100.0
+            radar["ratio"] = min(100.0, ratio / nxt["ratio"] * 100) if nxt["ratio"] else 100.0
+            gaps["points"] = max(0.0, nxt["points"] - points)
+            gaps["down"] = max(0.0, nxt["down"] - down)
+            gaps["ratio"] = max(0.0, nxt["ratio"] - ratio)
+            gaps["weeks"] = max(0, nxt["weeks"] - weeks)
+        up_pct = round(min(radar.values()))
+        return {"cur": cur, "rule": cur_rule, "next": nxt, "radar": radar,
+                "gaps": gaps, "up_pct": up_pct}
+
+    def _update_level_inc(self, prof: dict) -> dict:
+        """昨日全站增量：读每日 0:02 本地存档，相邻两天快照相减；不做临时抓取对比。
+        页面打开时若当天快照缺失（如 0:02 插件未运行），仅补记当前值，不覆盖定时记录。"""
+        self._ensure_today_snap(prof)
+        return self._daily_inc()
+
+    def _level_icon_b64(self) -> str:
+        try:
+            p = os.path.join(os.path.dirname(__file__), "icon_level.png")
+            if os.path.exists(p):
+                with open(p, "rb") as f:
+                    return base64.b64encode(f.read()).decode()
+        except Exception as e:
+            logger.error(f"读取等级图标失败：{e}")
+        return ""
+
+    def _build_level_html(self, apikey: str) -> str:
+        import math as _math
+        try:
+            prof = self._fetch_user_profile()
+        except Exception as e:
+            logger.error(f"数据与等级抓取失败：{e}")
+            return (f'<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">'
+                    f'<title>数据与等级</title></head><body style="background:#0d1321;color:#e8edf7;'
+                    f'font-family:PingFang SC,Microsoft YaHei,sans-serif;padding:40px;text-align:center;">'
+                    f'<div style="max-width:520px;margin:0 auto;background:#111c33;border:1px solid #1e3357;'
+                    f'border-radius:14px;padding:30px;">'
+                    f'<div style="font-size:16px;font-weight:700;margin-bottom:10px;">数据与等级 · 获取失败</div>'
+                    f'<div style="font-size:13px;color:#f87171;line-height:1.8;">{str(e)}</div>'
+                    f'<div style="margin-top:14px;font-size:12px;color:#7d8db1;">请检查站点 Cookie / UA 是否有效（插件会自动从 MP 站点管理读取憨憨站配置）</div>'
+                    f'</div></body></html>')
+        lv = self._compute_level(prof)
+        inc = self._update_level_inc(prof)
+        cur_rule = lv["rule"]
+        nxt = lv["next"]
+        uid = self._uid or ""
+        icon_tag = self._level_icon_b64() or ''
+        std_lv_line = (f"{cur_rule['name']} {cur_rule['en']} · 下一级 {nxt['name']} {nxt['en']}"
+                       if nxt else f"{cur_rule['en']} · 已满级")
+        meta = f"UID {uid} · 注册 {prof['reg_date'] or '—'}（约{prof['weeks']}周）· 邀请 {int(prof['invite']) if prof['invite'] is not None else '—'} · H&R {prof['hr'] or '—'}"
+        # 分组数据（流量概况 / 资产余额 / 昨日动态）
+        def inc_val(v):
+            if v is None:
+                return "积累中"
+            return HHClubButler._fmt_inc(v)
+        upload_inc_val = (f'+{inc["upload"]:.1f} GB'
+                          if inc["upload"] is not None else '积累中')
+        real_upload_str = "—"
+        if prof.get("real_upload_gb"):
+            real_upload_str = f'{prof["real_upload_gb"] / 1024:.3f} TB'
+        real_down_str = "—"
+        if prof.get("real_down_gb"):
+            real_down_str = f'{prof["real_down_gb"] / 1024:.3f} TB'
+        _IC_UP = '<svg viewBox="0 0 24 24" fill="none" stroke="#2ee6a8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>'
+        _IC_DOWN = '<svg viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12l7 7 7-7"/></svg>'
+        _IC_RATIO = '<svg viewBox="0 0 24 24" fill="none" stroke="#fbbf24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17L17 7M9 7h8v8"/></svg>'
+        _IC_PTS = '<svg viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l2.4 7.4H22l-6 4.4 2.3 7.2L12 16.7 5.7 21l2.3-7.2-6-4.4h7.6z"/></svg>'
+        _IC_BEAN = '<svg viewBox="0 0 24 24" fill="none" stroke="#FF8A3C" stroke-width="2"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3.5"/></svg>'
+        _IC_INVITE = '<svg viewBox="0 0 24 24" fill="none" stroke="#c084fc" stroke-width="2"><circle cx="9" cy="8" r="3.5"/><path d="M3 20c0-3.3 2.7-5.5 6-5.5s6 2.2 6 5.5M17 8a3 3 0 100 6M21 20c0-2.6-1.6-4.4-4-5"/></svg>'
+        _IC_ZAP_BEAN = '<svg viewBox="0 0 24 24" fill="none" stroke="#FF8A3C" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L4 14h6l-1 8 9-12h-6z"/></svg>'
+        _IC_ZAP_BLUE = '<svg viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L4 14h6l-1 8 9-12h-6z"/></svg>'
+        _IC_TREND = '<svg viewBox="0 0 24 24" fill="none" stroke="#2ee6a8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l6-6 4 4 8-8M15 7h6v6"/></svg>'
+
+        def _kpi(k, v, s, ic_svg, v_cls=""):
+            vc = f' {v_cls}' if v_cls else ''
+            return (f'<div class="kpi"><div class="ic">{ic_svg}</div>'
+                    f'<div class="k">{k}</div><div class="v{vc}">{v}</div>'
+                    f'<div class="s">{s}</div></div>')
+
+        inv_v = f'{int(prof["invite"]) if prof["invite"] is not None else "—"}'
+        kpis = (
+            _kpi("上传量", prof["upload_raw"] or "—", f"实际上传 {real_upload_str}", _IC_UP, "green")
+            + _kpi("下载量", prof["download_raw"] or "—", f"实际下载 {real_down_str}", _IC_DOWN)
+            + _kpi("分享率", prof["ratio"] if prof["ratio"] is not None else "—",
+                   f"实际分享率 {prof['real_ratio'] if prof['real_ratio'] is not None else '—'}", _IC_RATIO, "green")
+            + _kpi("憨豆", HHClubButler._fmt_wan(prof["bean"]) if prof["bean"] is not None else "—",
+                   f"余额 {HHClubButler._fmt_comma(prof['bean']) if prof['bean'] is not None else '—'}",
+                   _IC_BEAN, "bean")
+            + _kpi("做种积分", HHClubButler._fmt_wan(prof["points"]) if prof["points"] is not None else "—",
+                   f"累计 {HHClubButler._fmt_comma(prof['points']) if prof['points'] is not None else '—'}",
+                   _IC_PTS, "blue")
+            + _kpi("邀请", inv_v, "邀请数", _IC_INVITE)
+            + _kpi("昨日全站憨豆增量", inc_val(inc["bean"]), "每日0:02记录相减", _IC_ZAP_BEAN, "bean")
+            + _kpi("昨日全站积分增量", inc_val(inc["points"]), "每日0:02记录相减", _IC_ZAP_BLUE, "blue")
+            + _kpi("昨日全站上传增量", upload_inc_val, "每日0:02记录相减", _IC_TREND, "green")
+        )
+        radar = lv["radar"]
+        up_pct = lv["up_pct"]
+        _CX, _CY, _R = 115.0, 112.0, 78.0
+        _AXES = (("weeks", 0, -1, "l1", "注册"),
+                 ("points", 1, 0, "l2", "积分"),
+                 ("down", 0, 1, "l3", "下载"),
+                 ("ratio", -1, 0, "l4", "分享率"))
+
+        def _rp(key, dx, dy):
+            p = max(0.0, min(100.0, float(radar[key]))) / 100.0
+            return f"{_CX + dx * _R * p:.1f},{_CY + dy * _R * p:.1f}"
+
+        def _pct_txt(p):
+            v = float(p)
+            return f"{v:.0f}%" if abs(v - round(v)) < 0.05 else f"{v:.1f}%"
+
+        radar_svg = ""
+        for f in (0.25, 0.5, 0.75, 1.0):
+            _pts = " ".join(
+                f"{_CX + dx * _R * f:.1f},{_CY + dy * _R * f:.1f}"
+                for _, dx, dy, _, _ in _AXES)
+            radar_svg += (f'<polygon class="grid-in" points="{_pts}" '
+                          f'fill="none" stroke="#1d2d4e" stroke-width="1"/>')
+        for key, dx, dy, _, _ in _AXES:
+            radar_svg += (f'<line class="axis-in" x1="{_CX:.1f}" y1="{_CY:.1f}" '
+                          f'x2="{_CX + dx * _R:.1f}" y2="{_CY + dy * _R:.1f}" '
+                          f'stroke="#1d2d4e" stroke-width="1"/>')
+        data_pts = " ".join(_rp(k, dx, dy) for k, dx, dy, _, _ in _AXES)
+        radar_svg += (f'<polygon class="poly-data" points="{data_pts}" '
+                      f'fill="rgba(46,230,168,0.16)" stroke="#2ee6a8" stroke-width="2" '
+                      f'stroke-linejoin="round"/>')
+        for key, dx, dy, _, _ in _AXES:
+            radar_svg += (f'<circle cx="{_rp(key, dx, dy).split(",")[0]}" '
+                          f'cy="{_rp(key, dx, dy).split(",")[1]}" r="3" fill="#2ee6a8"/>')
+        # 上：注册
+        radar_svg += (f'<text class="label-in l1" x="{_CX:.1f}" y="{_CY - _R - 18:.1f}" text-anchor="middle" font-size="11" fill="#9fb3d8">注册</text>'
+                      f'<text class="label-in l1" x="{_CX:.1f}" y="{_CY - _R - 5:.1f}" text-anchor="middle" font-size="11" font-weight="700" fill="{("#2ee6a8" if radar["weeks"]>=100 else "#fbbf24")}">{_pct_txt(radar["weeks"])}</text>')
+        # 右：积分
+        radar_svg += (f'<text class="label-in l2" x="{_CX + _R + 22:.1f}" y="{_CY + 4:.1f}" text-anchor="start" font-size="11" fill="#9fb3d8">积分</text>'
+                      f'<text class="label-in l2" x="{_CX + _R + 22:.1f}" y="{_CY + 17:.1f}" text-anchor="start" font-size="11" font-weight="700" fill="{("#2ee6a8" if radar["points"]>=100 else "#fbbf24")}">{_pct_txt(radar["points"])}</text>')
+        # 下：下载
+        radar_svg += (f'<text class="label-in l3" x="{_CX:.1f}" y="{_CY + _R + 20:.1f}" text-anchor="middle" font-size="11" fill="#9fb3d8">下载</text>'
+                      f'<text class="label-in l3" x="{_CX:.1f}" y="{_CY + _R + 33:.1f}" text-anchor="middle" font-size="11" font-weight="700" fill="{("#2ee6a8" if radar["down"]>=100 else "#fbbf24")}">{_pct_txt(radar["down"])}</text>')
+        # 左：分享率
+        radar_svg += (f'<text class="label-in l4" x="{_CX - _R - 22:.1f}" y="{_CY + 4:.1f}" text-anchor="end" font-size="11" fill="#9fb3d8">分享率</text>'
+                      f'<text class="label-in l4" x="{_CX - _R - 22:.1f}" y="{_CY + 17:.1f}" text-anchor="end" font-size="11" font-weight="700" fill="{("#2ee6a8" if radar["ratio"]>=100 else "#fbbf24")}">{_pct_txt(radar["ratio"])}</text>')
+        steps = ""
+        for i, rule in enumerate(LEVEL_RULES):
+            if i < lv["cur"]:
+                cls = "done"
+            elif i == lv["cur"]:
+                cls = "cur"
+            else:
+                cls = "todo"
+            tag_cur = '<span class="tagcur">当前等级</span>' if i == lv["cur"] else ""
+            steps += (f'<div class="step {cls}">{tag_cur}'
+                      f'<div class="en">{rule["en"]}</div><div class="cn">{rule["name"]}</div></div>')
+        ladder_title = f"等级阶梯 · 当前：{cur_rule['name']} {cur_rule['en']}"
+        bars = ""
+        if nxt:
+            def bar(label, need_txt, val_txt, pct, ok):
+                fill = ("linear-gradient(90deg,#0ea5e9,#2ee6a8)" if ok
+                        else "linear-gradient(90deg,#f59e0b,#fbbf24)")
+                return (f'<div class="bar"><div class="r"><span class="need">{label}（需要 {need_txt}）</span>'
+                        f'<span class="val">{val_txt}</span></div>'
+                        f'<div class="track"><div class="fill" style="width:{min(100.0, pct):.1f}%;background:{fill}"></div></div></div>')
+            pts_ok = prof["points"] is not None and prof["points"] > nxt["points"]
+            down_ok = prof["download_gb"] is not None and prof["download_gb"] >= nxt["down"]
+            ratio_ok = prof["ratio"] is not None and prof["ratio"] > nxt["ratio"]
+            weeks_ok = prof["weeks"] >= nxt["weeks"]
+            pts_txt = HHClubButler._fmt_comma(prof["points"]) if prof["points"] is not None else "—"
+            down_need = f"≥ {nxt['down'] / 1024:.1f} TB" if nxt["down"] >= 1024 else f"≥ {nxt['down']} GB"
+            bars += bar("做种积分", f"&gt; {nxt['points']:,}",
+                        (f"{pts_txt} / {nxt['points']:,} · 差 <span class=\"miss\">{HHClubButler._fmt_comma(lv['gaps']['points'])}</span>"
+                         if not pts_ok else f"{pts_txt} / {nxt['points']:,} ✓ <span class=\"ok\">达标</span>"),
+                        radar["points"], pts_ok)
+            bars += bar("下载量", down_need,
+                        (f"{prof['download_raw'] or '—'} · <span class=\"miss\">差 {lv['gaps']['down'] / 1024:.2f} TB</span>"
+                         if not down_ok else f"{prof['download_raw'] or '—'} ✓ <span class=\"ok\">达标</span>"),
+                        radar["down"], down_ok)
+            bars += bar("分享率", f"&gt; {nxt['ratio']:.2f}",
+                        (f"{prof['ratio'] if prof['ratio'] is not None else '—'} · <span class=\"miss\">差 {lv['gaps']['ratio']:.2f}</span>"
+                         if not ratio_ok else f"{prof['ratio'] if prof['ratio'] is not None else '—'} ✓ <span class=\"ok\">达标</span>"),
+                        radar["ratio"], ratio_ok)
+            bars += bar("注册周数", f"≥ {nxt['weeks']} 周",
+                        (f"约 {prof['weeks']} 周 · <span class=\"miss\">差 {lv['gaps']['weeks']} 周</span>"
+                         if not weeks_ok else f"约 {prof['weeks']} 周 ✓ <span class=\"ok\">达标</span>"),
+                        radar["weeks"], weeks_ok)
+        else:
+            bars = ('<div class="bar" style="justify-content:center"><div class="r">'
+                    '<span class="need" style="color:#fbbf24;font-size:13px">恭喜，已达成最高等级 Nexus Master</span>'
+                    '</div></div>')
+        def days_txt(gap, inc_v):
+            if gap <= 0:
+                return "已达标"
+            if inc_v is None or inc_v <= 0:
+                return "积累中（缓存对比需先跑一天）"
+            return f"约 {_math.ceil(gap / inc_v)} 天"
+        next_cards = ""
+        if nxt:
+            pts_gap = lv["gaps"]["points"]
+            inc_pts_txt = HHClubButler._fmt_inc(inc["points"])
+            next_cards += (f'<div class="ncard"><div class="tt">'
+                           f'<div class="t1 bean">下一级 · {nxt["name"]} {nxt["en"]}</div>'
+                           f'<div class="t2">按昨日积分增量 {inc_pts_txt} 计算</div></div>'
+                           f'<div class="dd">做种积分差 <b>{HHClubButler._fmt_comma(pts_gap)}</b><br>'
+                           f'预计用时：<b>{days_txt(pts_gap, inc["points"])}</b></div></div>')
+            nxt2 = LEVEL_RULES[lv["cur"] + 2] if lv["cur"] + 2 < len(LEVEL_RULES) else None
+            if nxt2:
+                gap2 = max(0.0, nxt2["points"] - (prof["points"] or 0))
+                next_cards += (f'<div class="ncard"><div class="tt">'
+                               f'<div class="t1" style="color:#fbbf24">再下一级 · {nxt2["name"]} {nxt2["en"]}</div>'
+                               f'<div class="t2">按昨日积分增量 {inc_pts_txt} 计算</div></div>'
+                               f'<div class="dd">做种积分差 <b>{HHClubButler._fmt_comma(gap2)}</b><br>'
+                               f'预计用时：<b>{days_txt(gap2, inc["points"])}</b></div></div>')
+        else:
+            next_cards = ('<div class="ncard"><div class="tt"><div class="t1">已满级</div>'
+                          '<div class="t2">恭喜达成最高等级</div></div>'
+                          '<div class="dd">Nexus <b>Master</b></div></div>')
+        next_title = f"{nxt['name']} {nxt['en']}" if nxt else "—"
+        html = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>数据与等级</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#0d1321; color:#e8edf7; font-family:"PingFang SC","Microsoft YaHei",sans-serif; padding:10px; }
+  .card { background:#111c33; border:1px solid #1e3357; border-radius:12px; }
+  .head { display:flex; align-items:center; gap:14px; height:64px; padding:0 20px; background:linear-gradient(135deg,#12203a,#0f1830); border-radius:12px; margin-bottom:10px; }
+  .avatar { width:44px; height:44px; border-radius:10px; background:#fff; display:flex; align-items:center; justify-content:center; overflow:hidden; flex-shrink:0; }
+  .avatar img { width:100%; height:100%; }
+  .head .nm { font-size:20px; font-weight:700; }
+  .head .meta { font-size:10px; color:#7d8db1; margin-top:2px; }
+  .head .right { margin-left:auto; text-align:right; }
+  .badge { display:inline-block; background:linear-gradient(135deg,#f59e0b,#d97706); color:#1a1205; font-size:12px; font-weight:700; padding:5px 14px; border-radius:14px; margin-bottom:5px; }
+  .lvline { font-size:10px; color:#9fb3d8; }
+  .band { display:flex; gap:10px; margin-bottom:10px; }
+  .kpi { flex:1 1 0; min-width:0; background:#111c33; border:1px solid #1e3357; border-radius:11px; padding:10px 8px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:3px; text-align:center; min-height:120px; }
+  .kpi .ic { width:34px; height:34px; border-radius:9px; background:#16233f; display:flex; align-items:center; justify-content:center; margin-bottom:2px; }
+  .kpi .ic svg { width:18px; height:18px; }
+  .kpi .k { font-size:10px; color:#7d8db1; line-height:1.25; }
+  .kpi .v { font-size:16px; font-weight:700; white-space:nowrap; line-height:1.15; }
+  .kpi .s { font-size:8.5px; color:#5a6b8c; white-space:nowrap; }
+  .green { color:#2ee6a8; } .blue { color:#38bdf8; } .bean { color:#FF8A3C; }
+  .main { display:flex; gap:10px; margin-bottom:10px; }
+  .progCard { flex:1 1 0; min-width:0; padding:14px 20px; display:flex; flex-direction:column; }
+  .progCard h3 { font-size:13px; color:#9fb3d8; letter-spacing:1px; margin-bottom:12px; }
+  .bar { margin-bottom:16px; flex:1; display:flex; flex-direction:column; justify-content:center; }
+  .bar:last-child { margin-bottom:0; }
+  .bar .r { display:flex; justify-content:space-between; align-items:baseline; gap:10px; font-size:11px; margin-bottom:6px; }
+  .bar .r .need { color:#7d8db1; white-space:nowrap; }
+  .bar .r .val { color:#c6d3ec; font-weight:600; text-align:right; }
+  .miss { color:#f87171; font-weight:700; } .ok { color:#2ee6a8; }
+  .track { height:9px; background:#0a1326; border-radius:5px; overflow:hidden; }
+  .fill { height:100%; border-radius:5px; }
+  .radarCard { width:380px; flex-shrink:0; padding:14px; display:flex; flex-direction:column; }
+  .radarCard h3 { font-size:13px; color:#9fb3d8; letter-spacing:1px; margin-bottom:2px; }
+  .radarWrap { position:relative; flex:1; display:flex; align-items:center; justify-content:center; }
+  .radarWrap svg { width:285px; height:285px; max-width:100%; }
+  .rcenter { position:absolute; left:50%; top:48.5%; transform:translate(-50%,-50%); text-align:center; pointer-events:none; }
+  .rcenter .lv { font-size:26px; font-weight:800; color:#fbbf24; }
+  .rcenter .sub { font-size:10px; color:#7d8db1; }
+  .rextra { text-align:center; font-size:11px; color:#9fb3d8; border-top:1px solid #1e2d4e; padding-top:8px; }
+  .rextra b { color:#f87171; }
+  .ladderCard { padding:12px 20px; margin-bottom:10px; }
+  .ladderCard h3 { font-size:13px; color:#9fb3d8; letter-spacing:1px; margin-bottom:8px; }
+  .ladder { display:flex; align-items:flex-start; }
+  .step { flex:1; text-align:center; position:relative; padding-top:16px; }
+  .step::before { content:''; position:absolute; top:0; left:50%; width:12px; height:12px; border-radius:50%; background:#27334d; z-index:2; transform:translateX(-50%); }
+  .step::after { content:''; position:absolute; top:5px; left:-50%; width:100%; height:2px; background:#1e3357; }
+  .step:first-child::after { display:none; }
+  .step.done::before { background:#2ee6a8; }
+  .step.done::after { background:#2ee6a8; }
+  .step.cur::before { background:#fbbf24; box-shadow:0 0 0 4px rgba(251,191,36,.2); }
+  .step.cur::after { background:linear-gradient(to right,#2ee6a8,#fbbf24); }
+  .step.done .en { color:#2ee6a8; }
+  .step .en { font-size:10.5px; color:#c6d3ec; }
+  .step .cn { font-size:9.5px; color:#5a6b8c; }
+  .step.cur .en { color:#fbbf24; font-weight:700; }
+  .tagcur { position:absolute; top:-16px; left:50%; transform:translateX(-50%); background:#fbbf24; color:#1a1205; font-size:9px; font-weight:700; padding:2px 8px; border-radius:8px; white-space:nowrap; }
+  .next { display:flex; gap:10px; }
+  .ncard { flex:1 1 0; min-width:0; background:#0f1a30; border:1px solid #24355a; border-radius:11px; padding:12px 18px; display:flex; align-items:center; gap:14px; min-height:100px; }
+  .ncard .tt { flex:1; min-width:0; }
+  .ncard .t1 { font-size:13px; font-weight:700; }
+  .ncard .t2 { font-size:10px; color:#7d8db1; margin-top:4px; }
+  .ncard .dd { text-align:right; font-size:11px; color:#c6d3ec; white-space:nowrap; }
+  .ncard .dd b { color:#f87171; }
+  .foot { text-align:center; font-size:9px; color:#44567a; margin-top:10px; line-height:1.6; }
+  @keyframes radarExpand { from { transform:scale(0); opacity:0; } to { transform:scale(1); opacity:1; } }
+  @keyframes fadeIn { from { opacity:0; } to { opacity:1; } }
+  @keyframes fadeUp { from { opacity:0; transform:translateY(5px); } to { opacity:1; transform:none; } }
+  .poly-data { transform-box:view-box; transform-origin:115px 112px; animation:radarExpand .9s cubic-bezier(.22,.61,.36,1) .12s; }
+  .grid-in { animation:fadeIn .5s ease-out; }
+  .axis-in { animation:fadeIn .45s ease-out; }
+  .label-in { animation:fadeUp .5s ease-out; }
+  .l1 { animation-delay:.5s; } .l2 { animation-delay:.6s; } .l3 { animation-delay:.7s; } .l4 { animation-delay:.8s; }
+  @media (max-width:1100px){
+    .band { flex-wrap:wrap; }
+    .kpi { flex:1 1 30%; min-height:100px; }
+    .main { flex-direction:column; }
+    .radarCard { width:auto; }
+    .radarWrap { height:300px; }
+    .ladderCard { overflow-x:auto; } .ladder { min-width:760px; }
+    .next { flex-direction:column; }
+  }
+  @media (max-width:560px){
+    .kpi { flex:1 1 45%; }
+    .head { flex-wrap:wrap; height:auto; padding:10px 14px; }
+    .head .right { margin-left:0; text-align:left; }
+  }
+</style>
+<script>try{var _z=Math.min(window.innerWidth/1560,window.innerHeight/830);if(_z>1.001){document.documentElement.style.zoom=_z;}}catch(e){}</script>
+</head>
+<body>
+<div class="panel">
+  <div class="head card">
+    <div class="avatar">__ICON__</div>
+    <div>
+      <div class="nm">__USERNAME__</div>
+      <div class="meta">__META__</div>
+    </div>
+    <div class="right">
+      <div class="badge">__SPECIAL_LV__</div>
+      <div class="lvline">__STD_LV__</div>
+    </div>
+  </div>
+  <div class="band">__KPIS__</div>
+  <div class="main">
+    <div class="card progCard">
+      <h3>下一级达标进度 · __NEXT_TITLE__</h3>
+      __BARS__
+    </div>
+    <div class="card radarCard">
+      <h3>四维达标雷达</h3>
+      <div class="radarWrap">
+        <svg viewBox="-30 -16 290 262">__RADAR_SVG__</svg>
+        <div class="rcenter"><div class="lv">__UP_PCT__%</div><div class="sub">升级进度</div></div>
+      </div>
+      <div class="rextra">__RADAR_EXTRA__</div>
+    </div>
+  </div>
+  <div class="card ladderCard">
+    <h3>__LADDER_TITLE__</h3>
+    <div class="ladder">__STEPS__</div>
+  </div>
+  <div class="next">__NEXT_CARDS__</div>
+  <div class="foot">数据来源：hhanclub.net/userdetails · 等级规则：wiki.hhanclub.net/账号规则<br>昨日全站增量由插件每日 0:02 自动记录个人页、相邻两日记录相减（首次运行需积累一天数据）· 预计用时 = 积分差 ÷ 昨日积分增量</div>
+<script>
+(function(){var el=document.querySelector('.rcenter .lv');if(!el)return;var end=parseFloat(el.textContent)||0;var dur=1400,st=performance.now();el.textContent='0%';var timer=setInterval(function(){var p=Math.min((performance.now()-st)/dur,1);el.textContent=Math.round(end*(1-Math.pow(1-p,3)))+'%';if(p>=1)clearInterval(timer);},16);})();
+</script>
+</div>
+</body>
+</html>"""
+        radar_extra = "已达最高等级"
+        if nxt and lv.get("gaps"):
+            _gp = lv["gaps"]["points"]
+            _dtxt = days_txt(_gp, inc.get("points") or 0)
+            radar_extra = (f'积分差 <b>{HHClubButler._fmt_comma(_gp)}</b>'
+                           f' · 按昨日积分增量 {_dtxt}')
+        html = (html.replace("__RADAR_EXTRA__", radar_extra)
+                    .replace("__ICON__", f'<img src="data:image/png;base64,{icon_tag}" onerror="this.src=\'https://hhanclub.net/favicon.ico\'" alt="">')
+                    .replace("__USERNAME__", prof["username"] or "—")
+                    .replace("__META__", meta)
+                    .replace("__SPECIAL_LV__", prof["special_level"] or "—")
+                    .replace("__STD_LV__", std_lv_line)
+                    .replace("__KPIS__", kpis)
+                    .replace("__UP_PCT__", str(up_pct))
+                    .replace("__RADAR_SVG__", radar_svg)
+                    .replace("__LADDER_TITLE__", ladder_title)
+                    .replace("__STEPS__", steps)
+                    .replace("__NEXT_TITLE__", next_title)
+                    .replace("__BARS__", bars)
+                    .replace("__NEXT_CARDS__", next_cards))
+        return html
+
+    def api_level_page(self):
+        apikey = getattr(settings, "API_TOKEN", "")
+        return HTMLResponse(self._build_level_html(apikey),
+                            headers={"Content-Type": "text/html; charset=utf-8"})
 
     def _fetch_rescue_all(self, logs: list) -> List[dict]:
         seeds = []
