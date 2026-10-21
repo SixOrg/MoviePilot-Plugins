@@ -92,7 +92,7 @@ LEVEL_RULES = (
 class HHClubButler(_PluginBase):
     plugin_name = "憨憨保种区管家"
     plugin_desc = "自动优选添加及换种工具\n保种管理器/数据与等级/结算统计/Hosts加速"
-    plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon.png"
+    plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/hhclubbutler/icon_small.png"
     plugin_version = "2.7"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
