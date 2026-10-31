@@ -29,7 +29,7 @@ FEISHU_ADMINS / FEISHU_OPEN_ID 配置做白名单校验，仅白名单用户可�
 MP 升级或渠道实例重建后挂接可能失效；插件每 60 秒自动校验并补挂，且
 保留 UserMessage 兜底，最大限度降低失效窗口。
 
-映射策略：配置页「中文菜单映射表」默认列出全部 16 条推荐映射（每行一条
+映射策略：配置页「中文菜单映射表」默认列出全部 14 条推荐映射（每行一条
 「菜单名=命令」），可直接增删改；# 开头为注释行；清空后保存恢复默认内置。
 """
 from __future__ import annotations
@@ -45,30 +45,27 @@ from app.runtime.events import Event, eventmanager
 from app.schemas.types import EventType, NotificationChannel
 
 # 默认映射：中文菜单文本 -> MP 标准命令（完整命令文本，含斜杠与参数）。
-# 与推荐分组菜单方案对齐：订阅与下载 / 站点与智能 / 系统与媒体 / 更新。
+# 与推荐分组菜单方案对齐：订阅与下载 / 站点与智能 / 系统与媒体。
 # 菜单名保持简洁中文（与飞书后台已配置的菜单名一致）：渠道挂接会在
 # 消息链把中文当影视标题搜索之前拦截，无需在菜单名上加任何前缀。
 DEFAULT_MAPPING: Dict[str, str] = {
     # 订阅与下载
     "订阅列表": "/subscribes 列表",
-    "刷新订阅": "/subscribes 刷新列表",
     "正在下载": "/downloading 正在下载",
     "下载整理": "/transfer 下载整理",
-    "重新下载": "/redo",
     # 站点与智能
     "站点列表": "/sites 列表",
     "同步站点": "/cookiecloud 同步站点",
-    "同步媒体库": "/mediaserver_sync 同步媒体库",
     "技能管理": "/skills",
+    "会话状态": "/session_status 会话状态",
+    "清除会话": "/clear_session 清除会话",
+    "停止推理": "/stop_agent 停止推理",
     # 系统与媒体
     "当前版本": "/version 当前版本",
     "清理缓存": "/clear_cache 清理缓存",
     "重启系统": "/restart 重启系统",
-    "会话状态": "/session_status 会话状态",
-    "清除会话": "/clear_session 清除会话",
-    "停止推理": "/stop_agent 停止推理",
-    # 更新
     "系统更新": "/update",
+    "同步媒体库": "/mediaserver_sync 同步媒体库",
 }
 
 # 配置页映射表的默认文本：每行一条「菜单名=命令」，用户可自行增删改。
@@ -461,7 +458,7 @@ class feishuzhcmd(_PluginBase):
         return []
 
     def get_form(self) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        """返回插件配置表单与默认配置：启用开关 + 全量映射表（默认列出 16 条）。"""
+        """返回插件配置表单与默认配置：启用开关 + 全量映射表（默认列出 14 条）。"""
         return [
             {
                 "component": "VForm",
@@ -499,7 +496,7 @@ class feishuzhcmd(_PluginBase):
                                                 "每行一条：菜单名=命令\n例如：正在下载=/downloading"
                                             ),
                                             "hint": (
-                                                "默认已列出全部 16 条推荐映射，可自行增删改；"
+                                                "默认已列出全部 14 条推荐映射，可自行增删改；"
                                                 "# 开头为注释行；清空后保存将恢复默认内置映射"
                                             ),
                                             "persistent-hint": True,
