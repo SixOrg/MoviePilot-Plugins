@@ -1,0 +1,17 @@
+{
+  "feishuzhcmd": {
+    "name": "飞书中文命令",
+    "description": "将飞书自定义菜单发出的中文文本翻译为 MP 标准命令并执行（复用自带飞书渠道）",
+    "icon": "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/feishuzhcmd/icon.png",
+    "labels": "飞书,菜单,中文,命令,翻译",
+    "version": "1.0",
+    "author": "六个橙子",
+    "author_url": "https://github.com/SixOrg",
+    "level": 1,
+    "v3": true,
+    "release": true,
+    "history": {
+      "1.0": "首次发布：飞书机器人自定义菜单「发送文字消息」发出的是菜单名称本身，而 MP 只认 / 开头命令、纯中文文本会被消息链当影视标题搜索提前消费。插件运行时挂接 MP 飞书渠道实例入站消息入口（_on_message）：中文菜单名命中「中文菜单名→命令」映射表且通过管理员白名单校验时，直接触发 MP 标准命令并拦截消息（不再转发消息链，不会被当搜索）；未命中一律放行，不影响订阅/搜索/洗版等原生自然语言交互。配置页默认列出 16 条简洁中文映射（每行一条 菜单名=命令，可增删改，# 注释行，清空恢复默认）；白名单读取飞书渠道配置的 FEISHU_ADMINS / FEISHU_OPEN_ID，两者未配置时拒绝执行；每 60 秒自动校验补挂渠道实例，插件停用时还原挂接；保留 UserMessage 事件兜底"
+    }
+  }
+}
