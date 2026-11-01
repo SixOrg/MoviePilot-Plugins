@@ -73,7 +73,7 @@ class feishuzhcmd(_PluginBase):
     """
 
     plugin_name = "飞书中文命令"
-    plugin_desc = "将飞书自定义菜单发出的中文文本翻译为 MP 标准命令并执行（复用自带飞书渠道）"
+    plugin_desc = "实现飞书自定义中文菜单，使用中文代替MP标准命令并执行（复用自带飞书渠道）"
     plugin_label = "飞书,菜单,中文,命令"
     plugin_version = "1.0"
     plugin_author = "六个橙子"
