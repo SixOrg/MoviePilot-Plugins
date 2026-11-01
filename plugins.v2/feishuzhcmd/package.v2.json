@@ -1,7 +1,7 @@
 {
   "feishuzhcmd": {
     "name": "飞书中文命令",
-    "description": "实现飞书自定义中文菜单，使用中文代替标准命令并执行（复用自带飞书渠道）",
+    "description": "实现飞书自定义中文菜单，使用中文代MP替标准命令并执行（复用自带飞书渠道）",
     "icon": "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/feishuzhcmd/icon.png",
     "labels": "飞书,中文菜单,中文命令",
     "version": "1.0",
@@ -11,7 +11,7 @@
     "v3": true,
     "release": true,
     "history": {
-      "1.0": "实现飞书自定义中文菜单，使用中文代替标准命令并执行（复用自带飞书渠道）"
+      "1.0": "实现飞书自定义中文菜单，使用中文代替MP标准命令并执行（复用自带飞书渠道）"
     }
   }
 }
