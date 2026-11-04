@@ -4,7 +4,7 @@
     "description": "CloudflareSpeedTest全局优选后将所需站点写入hosts/支持手动自定义",
     "labels": "站点,优选,hosts,网络",
     "version": "1.0",
-    "icon": "yijianhosts.png",
+    "icon": "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/icons/yijianhosts.png",
     "author": "六个橙子",
     "author_url": "https://github.com/SixOrg",
     "level": 1,
