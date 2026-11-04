@@ -1,0 +1,24 @@
+
+.yh-site[data-v-7915fe8d] {
+  max-width: 100%;
+}
+.yh-state-card[data-v-7915fe8d] {
+  background: rgba(25, 118, 210, 0.05) !important;
+}
+.yh-state-item[data-v-7915fe8d]:hover {
+  background: rgba(25, 118, 210, 0.12);
+}
+.yh-state-off[data-v-7915fe8d] {
+  opacity: 0.55;
+}
+.yh-sub-card[data-v-7915fe8d] {
+  background: rgba(25, 118, 210, 0.04) !important;
+}
+.yh-cron-btn[data-v-7915fe8d] {
+  min-width: 84px;
+  padding: 0 16px !important;
+  font-size: 12px;
+}
+.yh-panel[data-v-7915fe8d] {
+  background: rgba(25, 118, 210, 0.06) !important;
+}

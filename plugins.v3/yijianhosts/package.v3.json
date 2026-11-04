@@ -1,0 +1,17 @@
+{
+  "YijianHosts": {
+    "name": "一键优选hosts",
+    "description": "CloudflareSpeedTest全局优选后将所需站点写入hosts/支持手动自定义",
+    "labels": "站点,优选,hosts,网络",
+    "version": "1.0",
+    "icon": "icon.png",
+    "author": "六个橙子",
+    "author_url": "https://github.com/SixOrg",
+    "level": 1,
+    "system_version": ">=3.0.0",
+    "release": true,
+    "history": {
+      "1.0": "全局优选：对全部Cloudflare IP段测速取全局最优IP写入所选站点hosts；支持自定义站点直写、定时/立即运行、通知推送；关闭插件hosts不生效（恢复原始内容），重新开启即恢复生效；高级设置支持下载速度下限、未达标重试、hosts覆盖逻辑（有结果即覆盖/结果更优覆盖）；写入查看按IP分组并支持一键清空写入"
+    }
+  }
+}
