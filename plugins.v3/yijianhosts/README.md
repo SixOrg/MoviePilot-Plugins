@@ -36,8 +36,7 @@
 
 - cfst 由插件在首次运行（或首次触发优选）时自动从 GitHub Releases 下载，无需手工放置。
 - 下载地址：`https://github.com/XIU2/CloudflareSpeedTest/releases/latest/download/`，按当前系统/架构自动选择（linux/windows/darwin × amd64/arm64/arm）。
-- 国内网络下载失败或过慢时，在「高级设置 → cfst 下载镜像」填写镜像前缀（自动拼接到官方下载地址前）。推荐镜像依次尝试：
-  `https://gh-proxy.com/`；`https://ghproxy.net/`（未一一列举，可自行前往 https://xiake.pro/github/ 获取更多）
+- 国内网络下载失败或过慢时，在「高级设置 → cfst 下载镜像」填写镜像前缀（自动拼接到官方下载地址前）。推荐镜像依次尝试：`https://gh-proxy.com/`；`https://ghproxy.net/`（未一一列举，可自行前往 https://xiake.pro/github/ 获取更多）
   > 2026-11-03 实测：gh-proxy.com 最快、官方直连可用、ghproxy.net 可用但慢；其余常见镜像实测均不可用（证书错误/超时/错误页），若首选失效可切回官方直连。
 
 ## 注意事项

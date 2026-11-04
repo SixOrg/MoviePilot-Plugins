@@ -888,9 +888,7 @@ return (_ctx, _cache) => {
                           default: _withCtx(() => [...(_cache[50] || (_cache[50] = [
                             _createElementVNode("div", { style: {"font-size":"13px","line-height":"1.8"} }, " cfst 首次运行会自动从 GitHub Releases 下载（失败自动重试 3 次）；国内网络下载失败或过慢时，可填写镜像前缀，插件会自动拼接到官方下载地址前。推荐镜像依次尝试： ", -1),
                             _createElementVNode("div", { style: {"font-size":"12px","color":"rgba(128,128,128,0.9)","line-height":"1.9","margin-top":"4px"} }, [
-                              _createTextVNode(" https://gh-proxy.com/；https://ghproxy.net/"),
-                              _createElementVNode("br"),
-                              _createTextVNode(" （未一一列举，可自行前往 "),
+                              _createTextVNode(" https://gh-proxy.com/；https://ghproxy.net/（未一一列举，可自行前往 "),
                               _createElementVNode("span", { style: {"color":"#1565c0"} }, "https://xiake.pro/github/"),
                               _createTextVNode(" 获取更多） ")
                             ], -1)
@@ -1042,6 +1040,6 @@ return (_ctx, _cache) => {
 }
 
 };
-const Page = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-7915fe8d"]]);
+const Page = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-34242064"]]);
 
 export { Page as default };
