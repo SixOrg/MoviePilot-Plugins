@@ -69,7 +69,7 @@ class YijianHosts(_PluginBase):
     plugin_name = "一键优选hosts"
     plugin_desc = "CloudflareSpeedTest全局优选后将所需站点写入hosts/支持手动自定义"
     plugin_version = "1.0"
-    plugin_icon = "icon.png"
+    plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/icons/yijianhosts.png"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "yijianhosts_"
@@ -105,6 +105,16 @@ class YijianHosts(_PluginBase):
         关闭插件 = hosts 不生效：恢复备份的原始 hosts（无备份则删除管理区块）；
         开启插件 = hosts 生效：若管理区块不存在，用上次写入明细重建（保证开启即有优选生效）。
         """
+        # 启动时自动修正数据库里残留的旧版图标字段（相对文件名 → 完整 URL）
+        try:
+            from app.db.oper.plugininstance import PluginInstanceOper
+            _NEW_ICON = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/icons/yijianhosts.png"
+            for _inst in PluginInstanceOper().list_by_source("YijianHosts"):
+                if _inst.plugin_icon != _NEW_ICON:
+                    PluginInstanceOper().save(instance_id=_inst.instance_id, plugin_icon=_NEW_ICON)
+        except Exception:
+            pass
+
         self.stop_service()
         config = config or {}
         self._config = config
