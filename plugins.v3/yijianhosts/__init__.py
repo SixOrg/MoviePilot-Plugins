@@ -48,6 +48,9 @@ LAST_SUMMARY_KEY = "last_summary_v1"
 LAST_BEST_KEY = "last_best_v1"
 # 写入明细数据键（站点名称/域名/IP 结构化记录，供「写入查看」展示）
 WRITE_LOG_KEY = "write_log_v1"
+# 当前生效明细数据键（容器重启后重建 hosts 管理区块用）
+# 与 WRITE_LOG_KEY 分离：「写入 0 条」的保留型运行不得覆盖真正生效的明细
+ACTIVE_LOG_KEY = "active_log_v1"
 # CloudflareSpeedTest 官方下载地址（releases/latest/download 命名）
 CFST_RELEASE_URL = "https://github.com/XIU2/CloudflareSpeedTest/releases/latest/download/"
 # cfst 默认测速参数
@@ -68,7 +71,7 @@ class YijianHosts(_PluginBase):
 
     plugin_name = "一键优选hosts"
     plugin_desc = "CloudflareSpeedTest全局优选后将所需站点写入hosts/支持手动自定义"
-    plugin_version = "1.0"
+    plugin_version = "1.1"
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/icons/yijianhosts.png"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
@@ -414,17 +417,19 @@ class YijianHosts(_PluginBase):
                 re.escape(HOSTS_MARK_START) + r"(.*?)" + re.escape(HOSTS_MARK_END), re.S)
             m = pattern.search(text)
             block = m.group(1).strip("\r\n \t") if m else ""
-            # 结构化写入明细（最近一次运行）
-            logs_raw = self.get_data(WRITE_LOG_KEY) or ""
-            try:
-                logs = json.loads(logs_raw) if isinstance(logs_raw, str) and logs_raw else []
-            except Exception:
-                logs = []
-            if not isinstance(logs, list):
-                logs = []
+            # 结构化写入明细（当前生效记录，容器重启后仍可展示并用于重建）
+            logs = self._active_logs()
             count = len(logs) or len([ln for ln in block.splitlines() if ln.strip()])
+            block_present = bool(block.strip())
+            if block_present:
+                msg = f"已写入 {count} 条"
+            elif count:
+                msg = (f"hosts 中暂无插件管理区块（容器重启后常见），"
+                       f"已保留 {count} 条生效明细，插件启用状态下会自动重建")
+            else:
+                msg = "暂无写入记录"
             return {"success": True, "block": block, "logs": logs,
-                    "message": f"已写入 {count} 条"}
+                    "block_present": block_present, "message": msg}
         except Exception as err:
             logger.warning(f"一键优选hosts 读取 hosts 失败：{err}")
             return {"success": False, "message": f"读取 hosts 失败：{err}"}
@@ -438,6 +443,7 @@ class YijianHosts(_PluginBase):
                 # 无备份时直接删除管理区块（保留其余内容）
                 self._apply_entries([])
             self.save_data(WRITE_LOG_KEY, json.dumps([], ensure_ascii=False))
+            self.save_data(ACTIVE_LOG_KEY, json.dumps([], ensure_ascii=False))
             self._site_names = []
             return {"success": True, "message": "已清空写入，hosts 已恢复为原始内容"}
         except Exception as err:
@@ -607,11 +613,14 @@ class YijianHosts(_PluginBase):
             lines.append("本次无成功条目，保留此前写入的 hosts 记录")
         self._last_result = "\n".join(lines)
         self.save_data(LAST_RESULT_KEY, self._last_result)
-        # 保存本次写入明细（站点/域名/IP），供「写入查看」结构化展示
-        write_log = getattr(self, "_write_log", None)
-        if write_log is None:
-            write_log = []
-        self.save_data(WRITE_LOG_KEY, json.dumps(write_log, ensure_ascii=False))
+        # 保存写入明细（站点/域名/IP），供「写入查看」结构化展示。
+        # 仅在本次确实写入 hosts 成功时更新：写入 0 条的保留型运行若覆盖明细，
+        # 容器重启后就没有任何数据可用于重建管理区块，页面会显示为空
+        write_log = getattr(self, "_write_log", None) or []
+        if applied and write_log:
+            payload = json.dumps(write_log, ensure_ascii=False)
+            self.save_data(WRITE_LOG_KEY, payload)
+            self.save_data(ACTIVE_LOG_KEY, payload)
         # 单行摘要：仅保留核心信息（IP/参数/写入条数/来源），供前端「最近运行」精简展示
         summary = self._build_summary(entries, applied, source)
         self.save_data(LAST_SUMMARY_KEY, summary)
@@ -932,20 +941,31 @@ class YijianHosts(_PluginBase):
             except Exception as err:
                 logger.warning(f"一键优选hosts 删除管理区块失败：{err}")
 
+    def _active_logs(self) -> List[Dict[str, Any]]:
+        """返回当前实际生效的写入明细（优先 active_log_v1，1.0 老数据回退 write_log_v1）。"""
+        for key in (ACTIVE_LOG_KEY, WRITE_LOG_KEY):
+            raw = self.get_data(key) or ""
+            if not raw:
+                continue
+            try:
+                logs = json.loads(raw) if isinstance(raw, str) else raw
+            except Exception:
+                continue
+            if not isinstance(logs, list):
+                continue
+            rows = [r for r in logs if isinstance(r, dict) and r.get("ip") and r.get("domain")]
+            if rows:
+                return rows
+        return []
+
     def _ensure_hosts_effective(self) -> None:
-        """插件开启时确保 hosts 生效：管理区块不存在时用上次写入明细重建，使开启即生效。"""
+        """插件开启时确保 hosts 生效：管理区块不存在时用当前生效明细重建，使开启即生效。"""
         try:
             raw = self._read_hosts_bytes()
             text = raw.decode("utf-8", errors="replace")
             if HOSTS_MARK_START in text and HOSTS_MARK_END in text:
                 return
-            logs_raw = self.get_data(WRITE_LOG_KEY) or ""
-            try:
-                logs = json.loads(logs_raw) if isinstance(logs_raw, str) and logs_raw else []
-            except Exception:
-                logs = []
-            entries = [f"{r.get('ip', '')}  {r.get('domain', '')}" for r in (logs or [])
-                       if isinstance(r, dict) and r.get("ip") and r.get("domain")]
+            entries = [f"{r['ip']}  {r['domain']}" for r in self._active_logs()]
             if entries:
                 self._apply_entries(entries)
                 logger.info(f"一键优选hosts 开启后重建 hosts 管理区块（{len(entries)} 条）")
