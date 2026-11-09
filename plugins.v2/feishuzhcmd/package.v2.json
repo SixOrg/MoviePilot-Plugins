@@ -4,13 +4,14 @@
     "description": "实现飞书自定义中文菜单，使用中文代替MP标准命令并执行（复用自带飞书渠道）",
     "icon": "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/plugins.v2/feishuzhcmd/icon.png",
     "labels": "飞书,中文菜单,中文命令",
-    "version": "1.0",
+    "version": "1.1",
     "author": "六个橙子",
     "author_url": "https://github.com/SixOrg",
     "level": 1,
     "v3": true,
     "release": true,
     "history": {
+      "1.1": "新增出站清洗：屏蔽订阅列表/站点列表卡片中间的「可输入：…退出。」操作提示段",
       "1.0": "实现飞书自定义中文菜单，使用中文代替MP标准命令并执行（复用自带飞书渠道）"
     }
   }

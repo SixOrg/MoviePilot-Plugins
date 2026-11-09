@@ -9,6 +9,13 @@ feishuzhcmd - 飞书中文命令翻译插件（MoviePilot v3.2.x）
 插件在运行时找到 MP 的飞书渠道实例，在其入站消息处理入口（_on_message）之前挂一层拦截：文本命中「中文菜单名 -> 命令」映射表且通过管理员白名单校验时，直接以原生方式触发 EventType.CommandExcute 执行命令，并拦截该
 消息（不转发给消息链），MP 永远不会把它当作影视标题搜索。未命中一律放行，不影响「订阅/搜索/洗版 + 片名」等原生自然语言交互。
 
+v1.1 新增：出站清洗
+MP 的「订阅列表 / 站点列表」等命令回复里自带一段命令行操作提示
+（「可输入：搜索 <id...|all>、删除 <id...>、…、退出。」），在飞书手机端
+会被原样渲染成带 &lt; &gt; 的脏代码。插件同时挂接飞书渠道的发送方法，
+在卡片真正发出之前，用正则把这段「可输入：…退出。」整段从正文里删掉，
+让订阅/站点卡片与其他命令一样整洁。按钮、翻页输入（n/p/ID）不受影响。
+
 保留 UserMessage 事件监听作为兜底：在渠道挂接失效的窗口内，能被消息链放行到 UserMessage 的中文文本仍可翻译。
 
 安全：中文路径绕过了渠道层对 / 命令的管理员校验，插件按
@@ -21,6 +28,7 @@ FEISHU_ADMINS / FEISHU_OPEN_ID 配置做白名单校验，仅白名单用户可�
 """
 from __future__ import annotations
 
+import re
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -63,6 +71,21 @@ DEFAULT_MAPPING_TEXT: str = "\n".join(
 # 渠道挂接的轮询补挂间隔（秒）：渠道实例重建或插件先于渠道加载时自动恢复
 _PATCH_RETRY_INTERVAL = 60
 
+# v1.1 出站清洗：匹配 MP 命令回复里自带的命令行操作提示段。
+# 结构：独立一段，以「可输入：」开头，以「退出。」结尾（中文句号）。
+# 中间是各种命令占位符（<id...|all>、<username>、[2fa]、n、p 等），
+# 不同命令这段内容不一样，但首尾标记一致，用非贪婪匹配整段删掉。
+_HINT_RE = re.compile(r"可输入[：:].*?退出[`'']?\s*[。\.]", re.DOTALL)
+
+# 出站挂接：飞书 client 上名字含这些关键词的方法才视为发送方法
+_SEND_METHOD_HINTS = ("send", "reply", "push", "card", "message", "notify")
+# 这些前缀的方法一律不动（配置/解析/状态查询等，不是发送）
+_SEND_METHOD_EXCLUDE = (
+    "get_", "set_", "list_", "has_", "is_",
+    "_on_message", "_parse", "_remember", "_sender_ids",
+    "_feishuzhcmd",
+)
+
 
 class feishuzhcmd(_PluginBase):
     """飞书中文命令翻译插件。
@@ -75,7 +98,7 @@ class feishuzhcmd(_PluginBase):
     plugin_name = "飞书中文命令"
     plugin_desc = "实现飞书自定义中文菜单，使用中文代替MP标准命令并执行（复用自带飞书渠道）"
     plugin_label = "飞书,菜单,中文,命令"
-    plugin_version = "1.0"
+    plugin_version = "1.1"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "feishuzhcmd_"
@@ -122,7 +145,8 @@ class feishuzhcmd(_PluginBase):
             self._ensure_feishu_patch()
             self._start_patch_thread()
             logger.info(
-                "feishuzhcmd: 已启用，映射 %d 条，飞书渠道挂接 %d 个实例",
+                "feishuzhcmd: 已启用 v%s，映射 %d 条，飞书渠道挂接 %d 个实例",
+                self.plugin_version,
                 len(self._mapping),
                 len(self._patched),
             )
@@ -213,7 +237,8 @@ class feishuzhcmd(_PluginBase):
             self._patch_client(client, config)
 
     def _patch_client(self, client: Any, config: Dict[str, Any]) -> None:
-        """在单个飞书渠道实例的入站消息入口前挂接拦截层。"""
+        """在单个飞书渠道实例上挂接入站拦截 + 出站清洗。"""
+        # 入站挂接
         try:
             original = client._on_message
         except Exception as error:
@@ -237,6 +262,8 @@ class feishuzhcmd(_PluginBase):
             return original(event)
 
         client._on_message = _wrapped
+        # 出站挂接：清洗发送前的卡片正文
+        self._patch_outbound(client)
         client._feishuzhcmd_patched = True
         self._patched.append((client, original))
         logger.info(
@@ -251,6 +278,16 @@ class feishuzhcmd(_PluginBase):
             try:
                 if getattr(client, "_feishuzhcmd_patched", False):
                     client._on_message = original
+                # 还原出站发送方法
+                outbound = getattr(client, "_feishuzhcmd_outbound", None)
+                if isinstance(outbound, dict):
+                    for name, orig in outbound.items():
+                        try:
+                            setattr(client, name, orig)
+                        except Exception:
+                            pass
+                if hasattr(client, "_feishuzhcmd_outbound"):
+                    delattr(client, "_feishuzhcmd_outbound")
                 if hasattr(client, "_feishuzhcmd_patched"):
                     delattr(client, "_feishuzhcmd_patched")
                 if hasattr(client, "_feishuzhcmd_admin_config"):
@@ -258,6 +295,122 @@ class feishuzhcmd(_PluginBase):
             except Exception as error:
                 logger.debug("feishuzhcmd: 还原渠道挂接失败：%s", error)
         self._patched = []
+
+    # ---------------- 出站清洗（v1.1） ----------------
+
+    def _patch_outbound(self, client: Any) -> None:
+        """挂接飞书渠道的发送方法，在消息发出前清洗操作提示段。
+
+        反射遍历 client 实例方法，名字含 send/reply/push/card/message/notify
+        且不是配置/解析类方法的，全部包一层：调用前递归清洗 args/kwargs 里
+        的字符串，命中「可输入：…退出。」就整段删掉。清洗异常一律放行原方法，
+        绝不影响正常发送。
+        """
+        origin_map: Dict[str, Any] = {}
+        plugin = self
+        # 调试：列出 client 上所有名字含发送关键词的方法，便于定位
+        matched_names: List[str] = []
+        for attr_name in dir(client):
+            low = attr_name.lower()
+            if low.startswith(_SEND_METHOD_EXCLUDE):
+                continue
+            if not any(h in low for h in _SEND_METHOD_HINTS):
+                continue
+            matched_names.append(attr_name)
+            try:
+                original = getattr(client, attr_name)
+            except Exception as error:
+                logger.info(
+                    "feishuzhcmd: 出站挂接 getattr %s 失败：%s", attr_name, error
+                )
+                continue
+            if not callable(original):
+                logger.info(
+                    "feishuzhcmd: 出站挂接 %s 不可调用，跳过", attr_name
+                )
+                continue
+            if getattr(original, "_feishuzhcmd_outbound_patched", False):
+                continue
+
+            def _make_wrapper(orig: Any, name: str) -> Any:
+                def _wrapped(*args: Any, **kwargs: Any) -> Any:
+                    try:
+                        args = tuple(plugin._clean_outbound(a) for a in args)
+                        kwargs = {k: plugin._clean_outbound(v) for k, v in kwargs.items()}
+                    except Exception as error:
+                        logger.info(
+                            "feishuzhcmd: 出站清洗异常，放行原方法 %s：%s", name, error
+                        )
+                    return orig(*args, **kwargs)
+                _wrapped._feishuzhcmd_outbound_patched = True
+                return _wrapped
+
+            try:
+                setattr(client, attr_name, _make_wrapper(original, attr_name))
+                origin_map[attr_name] = original
+            except Exception as error:
+                logger.info(
+                    "feishuzhcmd: 出站挂接 setattr %s 失败：%s", attr_name, error
+                )
+        logger.info(
+            "feishuzhcmd: 出站挂接扫描完成，匹配方法 %s，实际挂接 %d 个：%s",
+            matched_names,
+            len(origin_map),
+            list(origin_map.keys()),
+        )
+        client._feishuzhcmd_outbound = origin_map
+
+    @staticmethod
+    def _clean_outbound(obj: Any) -> Any:
+        """递归清洗出站消息对象：删掉「可输入：…退出。」整段提示。
+
+        支持 str / dict / list / tuple / bytes / 自定义 SDK 对象（遍历 __dict__）。
+        list 里清洗后变空字符串的项会被移除（避免留空 div/空行）。
+        """
+        if isinstance(obj, str):
+            new = _HINT_RE.sub("", obj)
+            if new != obj:
+                logger.info(
+                    "feishuzhcmd: 出站清洗命中 str，原片段：%r", obj[:120]
+                )
+            return new
+        if isinstance(obj, bytes):
+            try:
+                text = obj.decode("utf-8")
+            except Exception:
+                return obj
+            new = _HINT_RE.sub("", text)
+            if new != text:
+                logger.info(
+                    "feishuzhcmd: 出站清洗命中 bytes，原片段：%r", text[:120]
+                )
+                return new.encode("utf-8")
+            return obj
+        if isinstance(obj, dict):
+            return {k: feishuzhcmd._clean_outbound(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            cleaned: List[Any] = []
+            for v in obj:
+                cv = feishuzhcmd._clean_outbound(v)
+                if isinstance(cv, str) and cv.strip() == "":
+                    continue
+                # 飞书卡片：markdown element 清洗后 content 变空则整个移除，
+                # 避免留下空 div/空行
+                if (
+                    isinstance(cv, dict)
+                    and cv.get("tag") == "markdown"
+                    and isinstance(cv.get("content"), str)
+                    and not cv["content"].strip()
+                ):
+                    continue
+                cleaned.append(cv)
+            return cleaned
+        if isinstance(obj, tuple):
+            return tuple(feishuzhcmd._clean_outbound(v) for v in obj)
+        # 未知对象（lark_oapi SDK 等）：不做就地修改，原样返回，避免破坏 SDK 内部状态
+        return obj
+
+    # ---------------- 入站拦截 ----------------
 
     def _consume_feishu_message(self, client: Any, event: Any) -> bool:
         """尝试消费一条飞书消息：文本命中映射且白名单通过时触发命令。
