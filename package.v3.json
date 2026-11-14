@@ -3,7 +3,7 @@
     "name": "一键优选hosts",
     "description": "CloudflareSpeedTest全局优选后将所需站点写入hosts/支持手动自定义",
     "labels": "站点,优选,hosts,网络",
-    "version": "1.1",
+    "version": "1.2",
     "icon": "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/icons/yijianhosts.png",
     "author": "六个橙子",
     "author_url": "https://github.com/SixOrg",
@@ -11,6 +11,7 @@
     "system_version": ">=3.0.0",
     "release": true,
     "history": {
+      "1.2": "修复保存配置取消勾选站点后未撤销其 hosts 写入：保存设置即按当前站点/自定义配置修剪管理区块，取消的站点立即失效，全部撤销时清空区块；修复「hosts 写入情况」手动清空后再次运行误报「本次未优于上次，保留此前记录」：清空写入同步清除优选比较缓存，且当前无生效记录时不再做「更优」比较，直接写入本次优选结果",
       "1.1": "修复容器重启后「hosts 写入情况」显示为空：写入明细仅在本次真正写入 hosts 成功时更新，写入 0 条的保留型运行不再把生效记录覆盖为空；新增当前生效明细并在插件开启时据此自动重建 hosts 管理区块；写入查看改读生效明细，区块缺失时给出说明",
       "1.0": "全局优选：对全部Cloudflare IP段测速取全局最优IP写入所选站点hosts；支持自定义站点直写、定时/立即运行、通知推送；关闭插件hosts不生效（恢复原始内容），重新开启即恢复生效；高级设置支持下载速度下限、未达标重试、hosts覆盖逻辑（有结果即覆盖/结果更优覆盖）；写入查看按IP分组并支持一键清空写入"
     }

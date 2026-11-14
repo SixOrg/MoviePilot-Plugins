@@ -71,7 +71,7 @@ class YijianHosts(_PluginBase):
 
     plugin_name = "一键优选hosts"
     plugin_desc = "CloudflareSpeedTest全局优选后将所需站点写入hosts/支持手动自定义"
-    plugin_version = "1.1"
+    plugin_version = "1.2"
     plugin_icon = "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/icons/yijianhosts.png"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
@@ -320,6 +320,9 @@ class YijianHosts(_PluginBase):
                 self.init_plugin(self.get_config())
             except Exception as err:
                 logger.error(f"一键优选hosts 保存后刷新内存失败：{err}")
+            # 撤销已取消站点：保存配置后按新站点列表修剪 hosts 管理区块，
+            # 避免取消勾选的站点仍保留在 hosts 中继续生效
+            self._prune_hosts_block()
             conflicts = self._check_conflicts(cfg)
             if conflicts:
                 return {"success": True,
@@ -435,7 +438,7 @@ class YijianHosts(_PluginBase):
             return {"success": False, "message": f"读取 hosts 失败：{err}"}
 
     async def clear_hosts_api(self, request: Request) -> Dict[str, Any]:
-        """清空插件已写入 hosts 的内容：删除管理区块并恢复备份的原始 hosts，同时清空写入明细。"""
+        """清空插件已写入 hosts 的内容：删除管理区块并恢复备份的原始 hosts，同时清空写入明细与优选缓存。"""
         try:
             if self.get_data(HOSTS_BACKUP_KEY):
                 self._restore_hosts()
@@ -444,6 +447,9 @@ class YijianHosts(_PluginBase):
                 self._apply_entries([])
             self.save_data(WRITE_LOG_KEY, json.dumps([], ensure_ascii=False))
             self.save_data(ACTIVE_LOG_KEY, json.dumps([], ensure_ascii=False))
+            # 写入已全部清空，优选比较缓存同步失效：否则下次运行会以清空前的最优记录做比较，
+            # 误判「本次未优于上次」而跳过写入
+            self._clear_best_cache()
             self._site_names = []
             return {"success": True, "message": "已清空写入，hosts 已恢复为原始内容"}
         except Exception as err:
@@ -534,7 +540,10 @@ class YijianHosts(_PluginBase):
                         prev = None
                         if self._overwrite_mode == "better":
                             prev = self._last_best()
-                            if prev and not YijianHosts._is_better(best, prev):
+                            # 当前已无生效写入（hosts 被清空或站点全部撤销）时不做「更优」比较：
+                            # 否则会拿清空前的缓存误判「未优于上次」而跳过写入
+                            if (prev and self._active_logs()
+                                    and not YijianHosts._is_better(best, prev)):
                                 skip_target = True
                         # 分区模板：[优选结果] 内列出 IP 与参数（顶格），站点名称另列 [写入站点] 分区
                         self._results.append(f"全局优选 IP：{ip}")
@@ -972,6 +981,47 @@ class YijianHosts(_PluginBase):
         except Exception as err:
             logger.warning(f"一键优选hosts 开启生效检查失败：{err}")
 
+    def _prune_hosts_block(self) -> None:
+        """按当前配置修剪 hosts 管理区块：取消勾选的站点、已删除的自定义行立即撤销写入。
+
+        保存配置时调用：仅让「当前仍被勾选/仍配置」的站点继续生效，
+        修剪后无剩余记录时同步清除优选比较缓存，避免下次运行误判「未优于上次」。
+        """
+        try:
+            if not self._enabled:
+                return
+            logs = self._active_logs()
+            if not logs:
+                return
+            config = self._config or {}
+            custom_raw = config.get("run_now_custom_sites")
+            if custom_raw is None:
+                custom_raw = config.get("custom_sites")
+            allowed: set = set()
+            for site in self._target_sites():
+                domain = (site.get("domain") or "").strip().lower()
+                if domain:
+                    allowed.add(domain)
+            for _ip, domain in self._parse_custom_sites(custom_raw):
+                allowed.add(domain)
+            kept = [r for r in logs
+                    if str(r.get("domain") or "").strip().lower() in allowed]
+            if len(kept) == len(logs):
+                return
+            entries = [f"{r['ip']}  {r['domain']}" for r in kept
+                       if r.get("ip") and r.get("domain")]
+            self._apply_entries(entries)
+            payload = json.dumps(kept, ensure_ascii=False)
+            self.save_data(WRITE_LOG_KEY, payload)
+            self.save_data(ACTIVE_LOG_KEY, payload)
+            removed = len(logs) - len(kept)
+            logger.info(f"一键优选hosts 保存配置后已撤销 {removed} 条站点写入"
+                        + ("（管理区块已清空）" if not entries else ""))
+            if not entries:
+                self._clear_best_cache()
+        except Exception as err:
+            logger.warning(f"一键优选hosts 修剪 hosts 管理区块失败：{err}")
+
     # ===================== 站点与配置解析 =====================
 
     def _site_list(self) -> List[Dict[str, str]]:
@@ -1053,6 +1103,13 @@ class YijianHosts(_PluginBase):
         except Exception:
             return None
         return data if isinstance(data, dict) else None
+
+    def _clear_best_cache(self) -> None:
+        """清除最近一次优选结果缓存：写入被清空/全部撤销后调用，避免下次比较误判「未优于上次」。"""
+        try:
+            self.del_data(LAST_BEST_KEY)
+        except Exception:
+            self.save_data(LAST_BEST_KEY, "")
 
     @staticmethod
     def _is_better(new: Dict[str, str], old: Dict[str, str]) -> bool:
