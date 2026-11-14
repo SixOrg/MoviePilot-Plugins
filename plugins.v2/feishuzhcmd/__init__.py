@@ -633,47 +633,42 @@ class feishuzhcmd(_PluginBase):
                                             "variant": "tonal",
                                             "density": "comfortable",
                                             "title": "配置教程：MP 飞书［中文菜单］交互配置（第二版）",
+                                            "text": (
+                                                "从注册飞书、建企业自建应用、开权限、配事件与回调，"
+                                                "到建中文菜单的完整流程，图文对照。"
+                                            ),
                                         },
-                                        "text": (
-                                            "从注册飞书、建企业自建应用、开权限、配事件与回调，"
-                                            "到建中文菜单的完整流程，图文对照。"
-                                        ),
                                         "content": [
                                             {
-                                                "component": "VRow",
-                                                "props": {"class": "mt-1"},
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "class": "pa-0"},
                                                 "content": [
                                                     {
-                                                        "component": "VCol",
-                                                        "props": {"cols": 12},
-                                                        "content": [
-                                                            {
-                                                                "component": "VBtn",
-                                                                "text": "打开教程 PDF",
-                                                                "props": {
-                                                                    "color": "primary",
-                                                                    "variant": "flat",
-                                                                    "size": "small",
-                                                                    "class": "me-2",
-                                                                    "prepend-icon": "mdi-file-document-outline",
-                                                                    "href": GUIDE_URL,
-                                                                    "target": "_blank",
-                                                                    "rel": "noopener noreferrer",
-                                                                },
-                                                            },
-                                                            {
-                                                                "component": "VBtn",
-                                                                "text": "备用直链",
-                                                                "props": {
-                                                                    "color": "primary",
-                                                                    "variant": "text",
-                                                                    "size": "small",
-                                                                    "href": GUIDE_URL_BACKUP,
-                                                                    "target": "_blank",
-                                                                    "rel": "noopener noreferrer",
-                                                                },
-                                                            },
-                                                        ],
+                                                        "component": "VBtn",
+                                                        "text": "打开教程 PDF",
+                                                        "props": {
+                                                            "color": "primary",
+                                                            "variant": "flat",
+                                                            "size": "small",
+                                                            "class": "me-2 mt-2",
+                                                            "prepend-icon": "mdi-file-document-outline",
+                                                            "href": GUIDE_URL,
+                                                            "target": "_blank",
+                                                            "rel": "noopener noreferrer",
+                                                        },
+                                                    },
+                                                    {
+                                                        "component": "VBtn",
+                                                        "text": "备用直链",
+                                                        "props": {
+                                                            "color": "primary",
+                                                            "variant": "text",
+                                                            "size": "small",
+                                                            "class": "mt-2",
+                                                            "href": GUIDE_URL_BACKUP,
+                                                            "target": "_blank",
+                                                            "rel": "noopener noreferrer",
+                                                        },
                                                     },
                                                 ],
                                             },
