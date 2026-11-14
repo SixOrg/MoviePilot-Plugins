@@ -16,6 +16,11 @@ MP 的「订阅列表 / 站点列表」等命令回复里自带一段命令行�
 在卡片真正发出之前，用正则把这段「可输入：…退出。」整段从正文里删掉，
 让订阅/站点卡片与其他命令一样整洁。按钮、翻页输入（n/p/ID）不受影响。
 
+v1.2 新增：配置页内置教程入口
+把《MP 飞书［中文菜单］交互配置教程（第二版）》PDF 随插件仓库一起托管在
+docs/feishu-menu-guide.pdf，配置页顶部提供一个按钮，点击即可在浏览器中
+打开该教程（主链接走 jsDelivr，并为国内网络保留 GitHub raw 备用地址）。
+
 保留 UserMessage 事件监听作为兜底：在渠道挂接失效的窗口内，能被消息链放行到 UserMessage 的中文文本仍可翻译。
 
 安全：中文路径绕过了渠道层对 / 命令的管理员校验，插件按
@@ -77,6 +82,17 @@ _PATCH_RETRY_INTERVAL = 60
 # 不同命令这段内容不一样，但首尾标记一致，用非贪婪匹配整段删掉。
 _HINT_RE = re.compile(r"可输入[：:].*?退出[`'']?\s*[。\.]", re.DOTALL)
 
+# 配置教程 PDF：随插件仓库一起托管在 docs/ 目录，配置页点按钮直接在浏览器打开。
+# 主链接走 jsDelivr（国内访问通常比 GitHub 直连快），备用为 GitHub raw 直链。
+GUIDE_URL = (
+    "https://cdn.jsdelivr.net/gh/SixOrg/MoviePilot-Plugins@main/"
+    "plugins.v2/feishuzhcmd/docs/feishu-menu-guide.pdf"
+)
+GUIDE_URL_BACKUP = (
+    "https://raw.githubusercontent.com/SixOrg/MoviePilot-Plugins/main/"
+    "plugins.v2/feishuzhcmd/docs/feishu-menu-guide.pdf"
+)
+
 # 出站挂接：飞书 client 上名字含这些关键词的方法才视为发送方法
 _SEND_METHOD_HINTS = ("send", "reply", "push", "card", "message", "notify")
 # 这些前缀的方法一律不动（配置/解析/状态查询等，不是发送）
@@ -98,7 +114,7 @@ class feishuzhcmd(_PluginBase):
     plugin_name = "飞书中文命令"
     plugin_desc = "实现飞书自定义中文菜单，使用中文代替MP标准命令并执行（复用自带飞书渠道）"
     plugin_label = "飞书,菜单,中文,命令"
-    plugin_version = "1.1"
+    plugin_version = "1.2"
     plugin_author = "六个橙子"
     author_url = "https://github.com/SixOrg"
     plugin_config_prefix = "feishuzhcmd_"
@@ -603,6 +619,48 @@ class feishuzhcmd(_PluginBase):
             {
                 "component": "VForm",
                 "content": [
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VBtn",
+                                        "props": {
+                                            "text": "打开配置教程 PDF",
+                                            "color": "primary",
+                                            "variant": "tonal",
+                                            "size": "small",
+                                            "href": GUIDE_URL,
+                                            "target": "_blank",
+                                            "rel": "noopener noreferrer",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 9},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "text": (
+                                                "《MP 飞书［中文菜单］交互配置教程（第二版）》："
+                                                "从注册飞书、建企业自建应用、开权限、配事件与回调，"
+                                                "到建中文菜单的完整流程。按钮打不开时用备用地址："
+                                                + GUIDE_URL_BACKUP
+                                            ),
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
                     {
                         "component": "VRow",
                         "content": [
